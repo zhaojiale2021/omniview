@@ -22,6 +22,7 @@ pub enum DecoderCommand {
     Stop,
 }
 
+#[allow(dead_code)]
 pub struct VideoDecoder {
     pub frame_rx: mpsc::Receiver<DecodedFrame>,
     command_tx: mpsc::Sender<DecoderCommand>,

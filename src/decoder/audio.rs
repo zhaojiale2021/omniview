@@ -17,6 +17,7 @@ const CHUNK_SIZE: usize = 2048; // samples per chunk
 
 /// Audio decoder + player. Spawns an ffmpeg process that outputs raw f32 PCM
 /// to stdout, reads it in a background thread, and feeds it to cpal.
+#[allow(dead_code)]
 pub struct AudioDecoder {
     stopped: Arc<AtomicBool>,
     thread_handle: Option<thread::JoinHandle<()>>,

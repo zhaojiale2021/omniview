@@ -14,6 +14,7 @@ pub struct CameraUniform {
     pub view_proj: [[f32; 4]; 4],
 }
 
+#[allow(dead_code)]
 impl CameraUniform {
     pub fn new() -> Self {
         Self { view_proj: glam::Mat4::IDENTITY.to_cols_array_2d() }
@@ -356,7 +357,7 @@ impl Renderer {
     /// Render the 3D sphere and an egui UI overlay on top.
     pub fn render(&mut self,
         clipped_primitives: &[egui::ClippedPrimitive],
-        textures_delta: &egui::TexturesDelta,
+        _textures_delta: &egui::TexturesDelta,
         pixels_per_point: f32) -> Result<(), wgpu::SurfaceError> {
         self.update_camera_uniform();
         let output = self.surface.get_current_texture()?;
