@@ -41,11 +41,6 @@ impl App {
                 self.decoder = Some(decoder);
                 self.command_tx = Some(cmd_tx);
                 tracing::info!("Loaded: {path}");
-
-                // Update renderer with video dimensions
-                if let Some(r) = &mut self.renderer {
-                    // video loaded, renderer will show frames when they arrive
-                }
             }
             Err(e) => {
                 tracing::error!("Failed to open video: {e}");
