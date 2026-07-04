@@ -7,7 +7,7 @@ edition = "2024"
 winit = "0.30"
 wgpu = "22"
 pollster = "0.4"
-ffmpeg-next = { version = "7", optional = true }
+# Video decoding via ffmpeg CLI process pipe (no compile-time ffmpeg bindings)
 egui = "0.29"
 egui-winit = "0.29"
 egui-wgpu = "0.29"
@@ -19,4 +19,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
 default = []
-decoder = ["dep:ffmpeg-next"]

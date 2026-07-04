@@ -1,6 +1,5 @@
 mod app;
 mod renderer;
-#[cfg(feature = "decoder")]
 mod decoder;
 mod ui;
 
