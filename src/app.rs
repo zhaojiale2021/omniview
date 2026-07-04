@@ -1,21 +1,56 @@
+use std::sync::mpsc;
 use std::sync::Arc;
 use winit::{
     application::ApplicationHandler,
-    event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent},
+    event::{DeviceEvent, ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::ActiveEventLoop,
+    keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
 };
+use crate::decoder::video::{DecoderCommand, VideoDecoder};
 use crate::renderer::Renderer;
 
 pub struct App {
     pub window: Option<Arc<Window>>,
     pub renderer: Option<Renderer>,
+    pub decoder: Option<VideoDecoder>,
+    pub command_tx: Option<mpsc::Sender<DecoderCommand>>,
     pub dragging: bool,
 }
 
 impl App {
     pub fn new() -> Self {
-        Self { window: None, renderer: None, dragging: false }
+        Self {
+            window: None,
+            renderer: None,
+            decoder: None,
+            command_tx: None,
+            dragging: false,
+        }
+    }
+
+    pub fn open_file(&mut self, path: &str) {
+        // Clean up previous decoder
+        if let Some(d) = self.decoder.take() {
+            d.stop();
+        }
+        self.command_tx.take();
+
+        match VideoDecoder::open(path) {
+            Ok((decoder, cmd_tx)) => {
+                self.decoder = Some(decoder);
+                self.command_tx = Some(cmd_tx);
+                tracing::info!("Loaded: {path}");
+
+                // Update renderer with video dimensions
+                if let Some(r) = &mut self.renderer {
+                    // video loaded, renderer will show frames when they arrive
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to open video: {e}");
+            }
+        }
     }
 }
 
@@ -63,11 +98,52 @@ impl ApplicationHandler for App {
                     r.update_camera_uniform();
                 }
             }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(key_code),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                match key_code {
+                    KeyCode::KeyO => {
+                        // Open file via rfd dialog
+                        if self.window.is_some() {
+                            let path = rfd::FileDialog::new()
+                                .add_filter("Video", &["mp4", "webm", "mkv", "avi", "mov", "m4v"])
+                                .pick_file();
+                            if let Some(p) = path {
+                                self.open_file(&p.to_string_lossy());
+                            }
+                        }
+                    }
+                    KeyCode::Space => {
+                        if let Some(tx) = &self.command_tx {
+                            if let Some(ref d) = self.decoder {
+                                if d.paused.load(std::sync::atomic::Ordering::Relaxed) {
+                                    let _ = tx.send(DecoderCommand::Resume);
+                                } else {
+                                    let _ = tx.send(DecoderCommand::Pause);
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Escape => event_loop.exit(),
+                    _ => {}
+                }
+            }
             _ => {}
         }
     }
 
-    fn device_event(&mut self, _el: &ActiveEventLoop, _id: winit::event::DeviceId, event: DeviceEvent) {
+    fn device_event(
+        &mut self,
+        _el: &ActiveEventLoop,
+        _id: winit::event::DeviceId,
+        event: DeviceEvent,
+    ) {
         if let DeviceEvent::MouseMotion { delta } = event {
             if self.dragging {
                 if let Some(r) = &mut self.renderer {
@@ -79,7 +155,23 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        let renderer = match &mut self.renderer { Some(r) => r, None => return };
+        // Drain decoder frames, keep only the latest
+        if let Some(ref decoder) = self.decoder {
+            let mut latest_frame: Option<crate::decoder::video::DecodedFrame> = None;
+            while let Ok(frame) = decoder.frame_rx.try_recv() {
+                latest_frame = Some(frame);
+            }
+            if let Some(frame) = latest_frame {
+                if let Some(r) = &mut self.renderer {
+                    r.update_video_texture(&frame.data, frame.width, frame.height);
+                }
+            }
+        }
+
+        let renderer = match &mut self.renderer {
+            Some(r) => r,
+            None => return,
+        };
         if let Err(e) = renderer.render() {
             match e {
                 wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
