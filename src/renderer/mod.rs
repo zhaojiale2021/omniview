@@ -37,13 +37,16 @@ pub struct Renderer {
     pub video_bind_group: Option<wgpu::BindGroup>,
     pub placeholder_bind_group: wgpu::BindGroup,
     pub camera: OrbitCamera,
+    // egui integration
+    pub egui_state: egui_winit::State,
+    pub egui_renderer: egui_wgpu::Renderer,
 }
 
 impl Renderer {
     pub async fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
-        let surface = instance.create_surface(window).unwrap();
+        let surface = instance.create_surface(window.clone()).unwrap();
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -236,6 +239,26 @@ impl Renderer {
 
         tracing::info!("Render pipeline created");
 
+        // Initialize egui
+        let egui_ctx = egui::Context::default();
+        let viewport_id = egui::ViewportId::ROOT;
+        let egui_state = egui_winit::State::new(
+            egui_ctx,
+            viewport_id,
+            window.as_ref(),            // &dyn HasDisplayHandle
+            Some(window.scale_factor() as f32), // native_pixels_per_point
+            window.theme(),             // Option<Theme>
+            None,                       // max_texture_side
+        );
+
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            config.format,
+            None,  // depth_format
+            1,     // msaa_samples
+            false, // depth_write_enabled
+        );
+
         Self {
             surface, device, queue, config, size: (size.width, size.height),
             sphere, render_pipeline, camera_buffer, camera_bind_group,
@@ -243,6 +266,8 @@ impl Renderer {
             video_texture: None, video_texture_view: None, video_bind_group: None,
             placeholder_bind_group,
             camera,
+            egui_state,
+            egui_renderer,
         }
     }
 
@@ -328,13 +353,29 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+    /// Render the 3D sphere and an egui UI overlay on top.
+    pub fn render(&mut self, clipped_primitives: &[egui::ClippedPrimitive],
+                  pixels_per_point: f32) -> Result<(), wgpu::SurfaceError> {
         self.update_camera_uniform();
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Encoder") });
 
+        // Upload egui vertex/index buffers (before the render passes)
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.size.0, self.size.1],
+            pixels_per_point,
+        };
+        let extra_command_buffers = self.egui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            clipped_primitives,
+            &screen_descriptor,
+        );
+
+        // --- 3D sphere pass ---
         {
             let texture_bg = self.video_bind_group.as_ref().unwrap_or(&self.placeholder_bind_group);
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -361,8 +402,39 @@ impl Renderer {
             rpass.draw_indexed(0..self.sphere.index_count, 0, 0..1);
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        // --- egui overlay pass ---
+        if !clipped_primitives.is_empty() {
+            let rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Egui Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load, // overlay on top of the 3D scene
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            // forget_lifetime() decouples the pass from the encoder lifetime,
+            // matching what egui_wgpu::Renderer::render expects.
+            self.egui_renderer.render(
+                &mut rpass.forget_lifetime(),
+                clipped_primitives,
+                &screen_descriptor,
+            );
+        }
+
+        self.queue
+            .submit(extra_command_buffers.into_iter().chain(std::iter::once(encoder.finish())));
         output.present();
         Ok(())
+    }
+
+    /// Return a cloned reference to the egui context, so callers can build UI.
+    pub fn egui_ctx(&self) -> egui::Context {
+        self.egui_state.egui_ctx().clone()
     }
 }
