@@ -80,7 +80,6 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         let renderer = match &mut self.renderer { Some(r) => r, None => return };
-        renderer.update_camera_uniform();
         if let Err(e) = renderer.render() {
             match e {
                 wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
