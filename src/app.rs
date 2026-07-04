@@ -8,7 +8,8 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
 };
-use crate::decoder::video::{DecoderCommand, VideoDecoder, DecodedFrame};
+use crate::decoder::audio::AudioDecoder;
+use crate::decoder::video::{DecodedFrame, DecoderCommand, VideoDecoder};
 use crate::renderer::Renderer;
 use crate::ui::PlayerUI;
 
@@ -16,6 +17,7 @@ pub struct App {
     pub window: Option<Arc<Window>>,
     pub renderer: Option<Renderer>,
     pub decoder: Option<VideoDecoder>,
+    pub audio: Option<AudioDecoder>,
     pub command_tx: Option<mpsc::Sender<DecoderCommand>>,
     pub dragging: bool,
     pub ui: Option<PlayerUI>,
@@ -27,6 +29,7 @@ impl App {
             window: None,
             renderer: None,
             decoder: None,
+            audio: None,
             command_tx: None,
             dragging: false,
             ui: None,
@@ -34,16 +37,27 @@ impl App {
     }
 
     pub fn open_file(&mut self, path: &str) {
-        // Clean up previous decoder
+        // Clean up previous playback
         if let Some(d) = self.decoder.take() {
             d.stop();
         }
+        drop(self.audio.take());
         self.command_tx.take();
 
         match VideoDecoder::open(path) {
             Ok((decoder, cmd_tx)) => {
                 self.decoder = Some(decoder);
                 self.command_tx = Some(cmd_tx);
+
+                // Start audio playback
+                match AudioDecoder::open(path) {
+                    Ok(audio) => {
+                        self.audio = Some(audio);
+                        tracing::info!("Audio started");
+                    }
+                    Err(e) => tracing::warn!("Audio unavailable: {e}"),
+                }
+
                 tracing::info!("Loaded: {path}");
             }
             Err(e) => {
