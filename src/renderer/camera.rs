@@ -1,1 +1,31 @@
-// TODO: Camera module - will be implemented in a later task.
+use glam::Mat4;
+
+pub struct OrbitCamera {
+    pub yaw: f32,
+    pub pitch: f32,
+    pub fov: f32,
+    pub sensitivity: f32,
+}
+
+impl OrbitCamera {
+    pub fn new() -> Self {
+        Self { yaw: 0.0, pitch: 0.0, fov: 90.0, sensitivity: 0.003 }
+    }
+
+    pub fn view_proj_matrix(&self, aspect: f32) -> [[f32; 4]; 4] {
+        let proj = Mat4::perspective_rh(self.fov.to_radians(), aspect, 0.1, 100.0);
+        let view = Mat4::from_euler(glam::EulerRot::YXZ, self.yaw.to_radians(), self.pitch.to_radians(), 0.0);
+        (proj * view).to_cols_array_2d()
+    }
+
+    pub fn handle_mouse(&mut self, delta_x: f64, delta_y: f64, window_height: f64) {
+        let factor = self.sensitivity / window_height.max(1.0) as f32;
+        self.yaw += (delta_x as f32) * factor * 180.0;
+        self.pitch += (delta_y as f32) * factor * 180.0;
+        self.pitch = self.pitch.clamp(-89.0, 89.0);
+    }
+
+    pub fn handle_scroll(&mut self, delta: f32) {
+        self.fov = (self.fov - delta * 2.0).clamp(30.0, 120.0);
+    }
+}

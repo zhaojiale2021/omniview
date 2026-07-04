@@ -5,6 +5,7 @@ use winit::window::Window;
 
 pub mod sphere;
 pub mod camera;
+use camera::OrbitCamera;
 use sphere::{Sphere, Vertex};
 
 #[repr(C)]
@@ -35,6 +36,7 @@ pub struct Renderer {
     pub video_texture_view: Option<wgpu::TextureView>,
     pub video_bind_group: Option<wgpu::BindGroup>,
     pub placeholder_bind_group: wgpu::BindGroup,
+    pub camera: OrbitCamera,
 }
 
 impl Renderer {
@@ -84,15 +86,10 @@ impl Renderer {
             source: wgpu::ShaderSource::Wgsl(include_str!("equirect.wgsl").into()),
         });
 
-        // Camera uniform buffer
+        // Camera
+        let camera = OrbitCamera::new();
         let aspect = size.width as f32 / size.height.max(1) as f32;
-        let initial_vp = glam::Mat4::perspective_rh(
-            std::f32::consts::FRAC_PI_2,
-            aspect,
-            0.1,
-            100.0,
-        )
-        .to_cols_array_2d();
+        let initial_vp = camera.view_proj_matrix(aspect);
 
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Camera UB"),
@@ -245,6 +242,7 @@ impl Renderer {
             texture_sampler, texture_bind_group_layout: texture_bgl,
             video_texture: None, video_texture_view: None, video_bind_group: None,
             placeholder_bind_group,
+            camera,
         }
     }
 
@@ -262,6 +260,13 @@ impl Renderer {
             0,
             bytemuck::cast_slice(&[CameraUniform { view_proj: *view_proj }]),
         );
+    }
+
+    /// Compute view-projection matrix from camera state and upload to GPU
+    pub fn update_camera_uniform(&mut self) {
+        let aspect = self.size.0 as f32 / self.size.1.max(1) as f32;
+        let vp = self.camera.view_proj_matrix(aspect);
+        self.update_camera(&vp);
     }
 
     /// Upload RGBA pixel data as a wgpu texture for video frame rendering
@@ -324,6 +329,7 @@ impl Renderer {
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        self.update_camera_uniform();
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device
