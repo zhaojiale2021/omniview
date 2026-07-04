@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 winit = "0.30"
-wgpu = "24"
+wgpu = "22"
 pollster = "0.4"
 ffmpeg-next = { version = "7", optional = true }
 egui = "0.29"
