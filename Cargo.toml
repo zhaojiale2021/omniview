@@ -14,10 +14,11 @@ egui-wgpu = "0.29"
 rfd = "0.15"
 glam = "0.29"
 bytemuck = { version = "1", features = ["derive"] }
-cpal = "0.15"
+cpal = { version = "0.15", optional = true }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
-default = []
+default = ["audio"]
+audio = ["dep:cpal"]

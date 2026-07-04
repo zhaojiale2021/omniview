@@ -8,6 +8,7 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
 };
+#[cfg(feature = "audio")]
 use crate::decoder::audio::AudioDecoder;
 use crate::decoder::video::{DecodedFrame, DecoderCommand, VideoDecoder};
 use crate::renderer::Renderer;
@@ -17,6 +18,7 @@ pub struct App {
     pub window: Option<Arc<Window>>,
     pub renderer: Option<Renderer>,
     pub decoder: Option<VideoDecoder>,
+    #[cfg(feature = "audio")]
     pub audio: Option<AudioDecoder>,
     pub command_tx: Option<mpsc::Sender<DecoderCommand>>,
     pub dragging: bool,
@@ -29,8 +31,9 @@ impl App {
             window: None,
             renderer: None,
             decoder: None,
-            audio: None,
             command_tx: None,
+            #[cfg(feature = "audio")]
+            audio: None,
             dragging: false,
             ui: None,
         }
@@ -41,6 +44,7 @@ impl App {
         if let Some(d) = self.decoder.take() {
             d.stop();
         }
+        #[cfg(feature = "audio")]
         drop(self.audio.take());
         self.command_tx.take();
 
@@ -49,6 +53,7 @@ impl App {
                 self.decoder = Some(decoder);
                 self.command_tx = Some(cmd_tx);
 
+                #[cfg(feature = "audio")]
                 // Start audio playback
                 match AudioDecoder::open(path) {
                     Ok(audio) => {

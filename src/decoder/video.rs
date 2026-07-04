@@ -339,3 +339,34 @@ impl Drop for VideoDecoder {
         self.stop();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_probe_metadata() {
+        let result = probe_metadata("/tmp/test_360.mp4");
+        assert!(result.is_ok(), "probe_metadata failed: {:?}", result.err());
+        let (w, h, dur, fps) = result.unwrap();
+        assert_eq!(w, 3840, "width should be 3840");
+        assert_eq!(h, 1920, "height should be 1920");
+        assert!(dur > 0.0, "duration should be positive");
+        assert!(fps > 0.0, "fps should be positive");
+        println!("probe_metadata: {}x{} @ {:.1}fps, {:.1}s", w, h, fps, dur);
+    }
+
+    #[test]
+    fn test_decode_single_frame() {
+        let (decoder, _cmd) = VideoDecoder::open("/tmp/test_360.mp4").unwrap();
+        // Receive first frame
+        let frame = decoder.frame_rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert!(frame.is_ok(), "Should receive a frame: {:?}", frame.err());
+        let frame = frame.unwrap();
+        assert_eq!(frame.width, 3840);
+        assert_eq!(frame.height, 1920);
+        assert_eq!(frame.data.len(), 3840 * 1920 * 4 as usize);
+        println!("decode_single_frame: {}x{} RGBA, pts={:.2}s", frame.width, frame.height, frame.pts_secs);
+        decoder.stop();
+    }
+}
