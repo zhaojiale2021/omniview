@@ -225,8 +225,8 @@ impl Renderer {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 // CW winding + cull front = inside-out rendering (we're inside the sphere)
-                front_face: wgpu::FrontFace::Cw,
-                cull_mode: Some(wgpu::Face::Front),
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
                 unclipped_depth: false,
                 polygon_mode: wgpu::PolygonMode::Fill,
                 conservative: false,
@@ -354,8 +354,10 @@ impl Renderer {
     }
 
     /// Render the 3D sphere and an egui UI overlay on top.
-    pub fn render(&mut self, clipped_primitives: &[egui::ClippedPrimitive],
-                  pixels_per_point: f32) -> Result<(), wgpu::SurfaceError> {
+    pub fn render(&mut self,
+        clipped_primitives: &[egui::ClippedPrimitive],
+        textures_delta: &egui::TexturesDelta,
+        pixels_per_point: f32) -> Result<(), wgpu::SurfaceError> {
         self.update_camera_uniform();
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -385,7 +387,7 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0, g: 0.0, b: 0.0, a: 1.0,
+                            r: 0.05, g: 0.05, b: 0.2, a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
                     },

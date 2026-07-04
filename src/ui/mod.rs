@@ -7,7 +7,6 @@ pub struct PlayerUI {
     pub duration: f64,
     pub volume: f32,
     pub seek_to: Option<f64>,
-    pub file_name: String,
     pub open_file_clicked: bool,
 }
 
@@ -20,14 +19,10 @@ impl PlayerUI {
             duration: 0.0,
             volume: 0.8,
             seek_to: None,
-            file_name: String::new(),
             open_file_clicked: false,
         }
     }
 
-    /// Run egui UI panels and return FullOutput.
-    /// The caller must have called `ctx.begin_pass()` first
-    /// (via `egui_winit::State::take_egui_input` + `Context::begin_pass`).
     pub fn update(&mut self) -> egui::FullOutput {
         let ctx = &self.ctx;
         let seek_to = &mut self.seek_to;
@@ -37,26 +32,38 @@ impl PlayerUI {
         let pos = self.position;
         let dur = self.duration;
 
-        egui::TopBottomPanel::bottom("controls")
+        // Draw a full-width colored bar at the top as a visual test
+        egui::TopBottomPanel::top("test_bar")
             .frame(egui::Frame {
-                fill: egui::Color32::from_black_alpha(180),
+                fill: egui::Color32::from_rgb(255, 0, 0), // BRIGHT RED
                 ..Default::default()
             })
-            .min_height(40.0)
+            .min_height(30.0)
+            .show(ctx, |ui| {
+                ui.label("360 Video Player");
+            });
+
+        // Main controls at the bottom
+        egui::TopBottomPanel::bottom("controls")
+            .frame(egui::Frame {
+                fill: egui::Color32::from_black_alpha(200),
+                ..Default::default()
+            })
+            .min_height(44.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     // Open file button
-                    if ui.button("\u{1F4C1}").clicked() {
+                    if ui.button("Open").clicked() {
                         *open_file = true;
                     }
 
-                    // Play/Pause button
-                    let icon = if *playing { "\u{23F8}" } else { "\u{25B6}" };
-                    if ui.button(icon).clicked() {
+                    // Play/Pause
+                    let label = if *playing { "Pause" } else { "Play" };
+                    if ui.button(label).clicked() {
                         *playing = !*playing;
                     }
 
-                    // Position slider
+                    // Seek bar
                     let dur_secs = dur.max(1.0);
                     let mut slider = pos;
                     ui.add(
@@ -81,7 +88,7 @@ impl PlayerUI {
                         *seek_to = Some(slider);
                     }
 
-                    // Time display
+                    // Time
                     ui.label(format!(
                         "{:02}:{:02} / {:02}:{:02}",
                         (pos as u64) / 60,
@@ -90,8 +97,8 @@ impl PlayerUI {
                         (dur as u64) % 60,
                     ));
 
-                    // Volume slider
-                    ui.add(egui::Slider::new(volume, 0.0..=1.0).text("Vol"));
+                    // Volume
+                    ui.add(egui::Slider::new(volume, 0.0..=1.0).text("V"));
                 });
             });
 

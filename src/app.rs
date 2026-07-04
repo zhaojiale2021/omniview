@@ -82,7 +82,18 @@ impl ApplicationHandler for App {
             false
         };
 
-        // Always handle Resized so the swap chain is reconfigured
+        // Always handle drag state and window focus before egui, so they're never lost
+        if let WindowEvent::MouseInput {
+            state,
+            button: MouseButton::Left,
+            ..
+        } = &event
+        {
+            self.dragging = *state == ElementState::Pressed;
+        }
+        if matches!(&event, WindowEvent::Focused(false)) {
+            self.dragging = false;
+        }
         if let WindowEvent::Resized(s) = &event {
             if let Some(r) = &mut self.renderer {
                 r.resize(s.width, s.height);
@@ -96,20 +107,6 @@ impl ApplicationHandler for App {
 
         // Events below are NOT consumed by egui — handle application logic
         match event {
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Left,
-                ..
-            } => {
-                self.dragging = true;
-            }
-            WindowEvent::MouseInput {
-                state: ElementState::Released,
-                button: MouseButton::Left,
-                ..
-            } => {
-                self.dragging = false;
-            }
             WindowEvent::MouseWheel { delta, .. } => {
                 if let Some(r) = &mut self.renderer {
                     let scroll = match delta {
@@ -252,7 +249,7 @@ impl ApplicationHandler for App {
             }
 
             // Render the 3D sphere scene with egui overlay
-            if let Err(e) = renderer.render(&clipped_primitives, full_output.pixels_per_point) {
+            if let Err(e) = renderer.render(&clipped_primitives, &full_output.textures_delta, full_output.pixels_per_point) {
                 match e {
                     wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
                         let s = renderer.size;
@@ -264,7 +261,7 @@ impl ApplicationHandler for App {
             }
         } else if let Some(r) = &mut self.renderer {
             // Fallback: render without UI (shouldn't happen once UI is initialized)
-            if let Err(e) = r.render(&[], 1.0) {
+            if let Err(e) = r.render(&[], &egui::TexturesDelta::default(), 1.0) {
                 match e {
                     wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
                         let s = r.size;
