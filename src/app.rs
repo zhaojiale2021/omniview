@@ -11,7 +11,7 @@ use winit::{
 };
 #[cfg(feature = "audio")]
 use crate::decoder::audio::AudioDecoder;
-use crate::decoder::video::{DecoderCommand, VideoDecoder};
+use crate::decoder::video::{DecodedFrame, DecoderCommand, VideoDecoder};
 use crate::renderer::Renderer;
 use crate::ui::PlayerUI;
 
@@ -210,9 +210,29 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // --- Take ONE frame per render call (avoids frame drops at 60fps display / 30fps video) ---
+        // --- Audio-clock-based frame sync ---
         if let Some(ref decoder) = self.decoder {
-            if let Ok(f) = decoder.frame_rx.try_recv() {
+            // Audio clock: from cpal samples played, or fallback to UI position
+            #[cfg(feature = "audio")]
+            let clock = self.audio.as_ref().map(|a| a.audio_time());
+            #[cfg(not(feature = "audio"))]
+            let clock: Option<f64> = None;
+            let clock = clock.unwrap_or(self.ui.as_ref().map(|u| u.position).unwrap_or(0.0));
+
+            // Drain channel, pick the best frame
+            let mut best: Option<DecodedFrame> = None;
+            while let Ok(f) = decoder.frame_rx.try_recv() {
+                if f.pts_secs <= clock + 0.05 {
+                    // This frame is ready to display (or slightly in the future within tolerance)
+                    // Keep the latest such frame
+                    best = Some(f);
+                } else {
+                    // Frame is too far in the future, put it back logic?
+                    // Since we can't put it back, drop it and break
+                    break;
+                }
+            }
+            if let Some(f) = best {
                 if let Some(r) = &mut self.renderer {
                     r.update_video_texture(&f.data, f.width, f.height);
                 }

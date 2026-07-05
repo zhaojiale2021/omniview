@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::thread;
@@ -20,6 +20,8 @@ struct AudioShared {
     volume: Mutex<f32>,
     paused: AtomicBool,
     stopped: AtomicBool,
+    /// Master audio clock: number of samples consumed by cpal
+    samples_played: AtomicU64,
 }
 
 pub struct AudioDecoder {
@@ -36,6 +38,7 @@ impl AudioDecoder {
             volume: Mutex::new(0.8),
             paused: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            samples_played: AtomicU64::new(0),
         });
 
         // cpal stream
@@ -53,8 +56,10 @@ impl AudioDecoder {
         let stream = device.build_output_stream(
             &config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                let n = data.len() as u64;
                 if shared_cb.paused.load(Ordering::Relaxed) {
                     for s in data.iter_mut() { *s = 0.0; }
+                    shared_cb.samples_played.fetch_add(n, Ordering::Relaxed);
                     return;
                 }
                 let vol = *shared_cb.volume.lock().unwrap();
@@ -62,6 +67,7 @@ impl AudioDecoder {
                 for s in data.iter_mut() {
                     *s = buf.pop_front().unwrap_or(0.0) * vol;
                 }
+                shared_cb.samples_played.fetch_add(n, Ordering::Relaxed);
             },
             err_fn,
             None,
@@ -150,6 +156,11 @@ impl AudioDecoder {
     }
     pub fn set_paused(&self, p: bool) {
         self.shared.paused.store(p, Ordering::Relaxed);
+    }
+    /// Get the audio clock position in seconds. This is the master clock for A/V sync.
+    pub fn audio_time(&self) -> f64 {
+        let total = self.shared.samples_played.load(Ordering::Relaxed) as f64;
+        total / (SAMPLE_RATE as f64 * CHANNELS as f64)
     }
     pub fn stop(&self) {
         self.shared.stopped.store(true, Ordering::Relaxed);
