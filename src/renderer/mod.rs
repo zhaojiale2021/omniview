@@ -357,7 +357,7 @@ impl Renderer {
     /// Render the 3D sphere and an egui UI overlay on top.
     pub fn render(&mut self,
         clipped_primitives: &[egui::ClippedPrimitive],
-        _textures_delta: &egui::TexturesDelta,
+        textures_delta: &egui::TexturesDelta,
         pixels_per_point: f32) -> Result<(), wgpu::SurfaceError> {
         self.update_camera_uniform();
         let output = self.surface.get_current_texture()?;
@@ -365,7 +365,15 @@ impl Renderer {
         let mut encoder = self.device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Encoder") });
 
-        // Upload egui vertex/index buffers (before the render passes)
+        // Upload egui textures (font atlas etc.) BEFORE vertex/index buffers
+        for (id, image_delta) in &textures_delta.set {
+            self.egui_renderer.update_texture(&self.device, &self.queue, *id, image_delta);
+        }
+        for id in &textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+
+        // Upload egui vertex/index buffers
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [self.size.0, self.size.1],
             pixels_per_point,
