@@ -9,6 +9,8 @@ pub struct PlayerUI {
     pub seek_to: Option<f64>,
     pub open_file_clicked: bool,
     pub is_360: bool,
+    pub speed: f64,
+    pub speed_changed: bool,
 }
 
 impl PlayerUI {
@@ -22,6 +24,8 @@ impl PlayerUI {
             seek_to: None,
             open_file_clicked: false,
             is_360: false,
+            speed: 1.0,
+            speed_changed: false,
         }
     }
 
@@ -96,6 +100,18 @@ impl PlayerUI {
                         (self.duration as u64) / 60,
                         (self.duration as u64) % 60,
                     ));
+
+                    // Speed buttons
+                    let speeds = [0.5, 1.0, 1.5, 2.0];
+                    for &s in &speeds {
+                        let label = if (s as f64 - 1.0).abs() < 0.01 { "1x".to_string() }
+                            else { format!("{}x", s) };
+                        let selected = (self.speed as f64 - s as f64).abs() < 0.01;
+                        if ui.selectable_label(selected, label).clicked() && !selected {
+                            self.speed = s;
+                            self.speed_changed = true;
+                        }
+                    }
 
                     ui.add(egui::Slider::new(&mut self.volume, 0.0..=1.0).text("V"));
                 });

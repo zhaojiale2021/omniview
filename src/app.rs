@@ -23,6 +23,8 @@ pub struct App {
     pub command_tx: Option<mpsc::Sender<DecoderCommand>>,
     pub dragging: bool,
     pub ui: Option<PlayerUI>,
+    pub current_file: Option<String>,
+    pub playback_speed: f64,
 }
 
 impl App {
@@ -36,16 +38,20 @@ impl App {
             audio: None,
             dragging: false,
             ui: None,
+            current_file: None,
+            playback_speed: 1.0,
         }
     }
 
     pub fn open_file(&mut self, path: &str) {
+        self.current_file = Some(path.to_string());
+        self.start_playback(path);
+    }
+
+    fn start_playback(&mut self, path: &str) {
         // Clean up previous playback
-        if let Some(d) = self.decoder.take() {
-            d.stop();
-        }
-        #[cfg(feature = "audio")]
-        drop(self.audio.take());
+        if let Some(d) = self.decoder.take() { d.stop(); }
+        #[cfg(feature = "audio")] drop(self.audio.take());
         self.command_tx.take();
 
         match VideoDecoder::open(path) {
@@ -54,20 +60,22 @@ impl App {
                 self.command_tx = Some(cmd_tx);
 
                 #[cfg(feature = "audio")]
-                // Start audio playback
-                match AudioDecoder::open(path, 1.0) {
-                    Ok(audio) => {
-                        self.audio = Some(audio);
-                        tracing::info!("Audio started");
-                    }
-                    Err(e) => tracing::warn!("Audio unavailable: {e}"),
+                match AudioDecoder::open(path, self.playback_speed) {
+                    Ok(audio) => { self.audio = Some(audio); }
+                    Err(e) => tracing::warn!("Audio: {e}"),
                 }
 
-                tracing::info!("Loaded: {path}");
+                tracing::info!("Loaded: {path} speed={}", self.playback_speed);
             }
-            Err(e) => {
-                tracing::error!("Failed to open video: {e}");
-            }
+            Err(e) => tracing::error!("Open failed: {e}"),
+        }
+    }
+
+    pub fn set_speed(&mut self, speed: f64) {
+        if (self.playback_speed - speed).abs() < 0.01 { return; }
+        self.playback_speed = speed;
+        if let Some(ref path) = self.current_file.clone() {
+            self.start_playback(path);
         }
     }
 }
@@ -232,18 +240,25 @@ impl ApplicationHandler for App {
         let mut action_open_file = false;
         let mut action_seek: Option<f64> = None;
         let mut action_toggle_pause = false;
+        let mut action_set_speed: Option<f64> = None;
 
         if let (Some(window), Some(renderer), Some(ui)) =
             (&self.window, &mut self.renderer, &mut self.ui)
         {
             ui.playing = !decoder_paused;
             ui.duration = duration;
+            ui.speed = self.playback_speed;  // sync app -> UI
             // Sync 360 toggle from UI -> renderer
             renderer.is_360 = ui.is_360;
             // Sync volume from UI -> audio
             #[cfg(feature = "audio")]
             if let Some(ref audio) = self.audio {
                 audio.set_volume(ui.volume);
+            }
+            // Handle speed change (capture for outside borrow scope)
+            if ui.speed_changed {
+                ui.speed_changed = false;
+                action_set_speed = Some(ui.speed);
             }
 
             // Prepare input for egui and begin the pass
@@ -316,6 +331,10 @@ impl ApplicationHandler for App {
             if let Some(tx) = &self.command_tx {
                 let _ = tx.send(DecoderCommand::Seek(seek));
             }
+        }
+
+        if let Some(speed) = action_set_speed {
+            self.set_speed(speed);
         }
 
         if action_toggle_pause {
