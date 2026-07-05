@@ -18,6 +18,7 @@ const CHANNELS: u16 = 2;
 struct AudioShared {
     buffer: Mutex<VecDeque<f32>>,
     volume: Mutex<f32>,
+    paused: AtomicBool,
     stopped: AtomicBool,
 }
 
@@ -33,6 +34,7 @@ impl AudioDecoder {
         let shared = Arc::new(AudioShared {
             buffer: Mutex::new(VecDeque::with_capacity((SAMPLE_RATE as usize) * 2)),
             volume: Mutex::new(0.8),
+            paused: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
         });
 
@@ -53,6 +55,10 @@ impl AudioDecoder {
             .build_output_stream(
                 &config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    if shared_cb.paused.load(Ordering::Relaxed) {
+                        for s in data.iter_mut() { *s = 0.0; }
+                        return;
+                    }
                     let volume = *shared_cb.volume.lock().unwrap();
                     let mut buf = shared_cb.buffer.lock().unwrap();
                     for sample in data.iter_mut() {
@@ -86,6 +92,10 @@ impl AudioDecoder {
 
     pub fn set_volume(&self, v: f32) {
         *self.shared.volume.lock().unwrap() = v.clamp(0.0, 1.0);
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        self.shared.paused.store(paused, Ordering::Relaxed);
     }
 
     pub fn stop(&self) {

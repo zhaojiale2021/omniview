@@ -214,14 +214,8 @@ impl ApplicationHandler for App {
     ) {
         if let DeviceEvent::MouseMotion { delta } = event {
             if self.dragging {
-                // Only rotate in 360 mode, and not when egui wants the pointer
-                if !self.renderer.as_ref().map(|r| r.is_360).unwrap_or(false) {
-                    return;
-                }
-                let egui_wants_pointer = self.renderer.as_ref()
-                    .map(|r| r.egui_state.egui_ctx().wants_pointer_input())
-                    .unwrap_or(false);
-                if egui_wants_pointer {
+                let is_360 = self.renderer.as_ref().map(|r| r.is_360).unwrap_or(false);
+                if !is_360 {
                     return;
                 }
                 if let Some(r) = &mut self.renderer {
@@ -362,13 +356,18 @@ impl ApplicationHandler for App {
         }
 
         if action_toggle_pause {
+            let should_pause = !decoder_paused;
             if let Some(tx) = &self.command_tx {
-                let cmd = if decoder_paused {
-                    DecoderCommand::Resume
-                } else {
+                let cmd = if should_pause {
                     DecoderCommand::Pause
+                } else {
+                    DecoderCommand::Resume
                 };
                 let _ = tx.send(cmd);
+            }
+            #[cfg(feature = "audio")]
+            if let Some(ref audio) = self.audio {
+                audio.set_paused(should_pause);
             }
         }
     }

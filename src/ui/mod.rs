@@ -102,12 +102,17 @@ impl PlayerUI {
                     ));
 
                     // Speed buttons
-                    let speeds = [0.5, 1.0, 1.5, 2.0];
+                    let speeds = [0.5_f64, 1.0, 1.5, 2.0];
+                    let cur_speed = self.speed;
                     for &s in &speeds {
-                        let label = if (s as f64 - 1.0).abs() < 0.01 { "1x".to_string() }
+                        let label = if (s - 1.0).abs() < 0.01 { "1x".to_string() }
                             else { format!("{}x", s) };
-                        let selected = (self.speed as f64 - s as f64).abs() < 0.01;
-                        if ui.selectable_label(selected, label).clicked() && !selected {
+                        let is_current = (cur_speed - s).abs() < 0.01;
+                        let mut btn = egui::Button::new(label);
+                        if is_current {
+                            btn = btn.fill(egui::Color32::from_rgb(60, 120, 200));
+                        }
+                        if ui.add_sized([40.0, 20.0], btn).clicked() && !is_current {
                             self.speed = s;
                             self.speed_changed = true;
                         }
