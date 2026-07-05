@@ -101,7 +101,7 @@ fn probe_metadata(path: &str) -> Result<(u32, u32, f64, f64), String> {
 }
 
 impl VideoDecoder {
-    pub fn open(path: &str) -> Result<(Self, mpsc::Sender<DecoderCommand>), String> {
+    pub fn open(path: &str, speed: f64) -> Result<(Self, mpsc::Sender<DecoderCommand>), String> {
         let (width, height, duration_secs, fps) = probe_metadata(path)?;
         tracing::info!(
             "Video: {}x{} @ {:.2}fps, duration={:.1}s",
@@ -123,22 +123,16 @@ impl VideoDecoder {
 
         let thread_handle = Some(thread::spawn(move || {
             Self::decode_loop(
-                &path, width, height, fps,
+                &path, width, height, fps, speed,
                 frame_tx, command_rx, stopped_clone, paused_clone,
             );
         }));
 
         Ok((
             Self {
-                frame_rx,
-                command_tx,
-                thread_handle,
-                stopped,
-                paused,
-                width,
-                height,
-                duration_secs,
-                fps,
+                frame_rx, command_tx, thread_handle,
+                stopped, paused,
+                width, height, duration_secs, fps,
             },
             cmd_tx,
         ))
@@ -149,6 +143,7 @@ impl VideoDecoder {
         width: u32,
         height: u32,
         fps: f64,
+        speed: f64,
         frame_tx: mpsc::Sender<DecodedFrame>,
         command_rx: mpsc::Receiver<DecoderCommand>,
         stopped: Arc<AtomicBool>,
@@ -166,8 +161,17 @@ impl VideoDecoder {
             // Build ffmpeg args
             let mut args: Vec<String> = vec![
                 "-v".into(), "quiet".into(),
-                "-re".into(), // read at native frame rate (real-time)
             ];
+
+            // Speed control: for 1x use -re; for others use setpts
+            let speed_filter: Option<String> = if (speed - 1.0).abs() < 0.01 {
+                args.push("-re".into());
+                None
+            } else {
+                // setpts=PTS/SPEED means SPEEDx playback
+                let p = speed.recip();
+                Some(format!("setpts={p:.4}*PTS"))
+            };
 
             if let Some(seek_pts) = seek_to.take() {
                 args.push("-ss".into());
@@ -177,6 +181,12 @@ impl VideoDecoder {
 
             args.push("-i".into());
             args.push(path.into());
+
+            if let Some(ref sf) = speed_filter {
+                args.push("-filter:v".into());
+                args.push(sf.clone());
+            }
+
             args.extend_from_slice(&[
                 "-f".into(), "rawvideo".into(),
                 "-pix_fmt".into(), "rgba".into(),
