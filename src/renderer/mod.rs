@@ -5,7 +5,9 @@ use winit::window::Window;
 
 pub mod sphere;
 pub mod camera;
+pub mod quad;
 use camera::OrbitCamera;
+use quad::{Quad, QuadVertex};
 use sphere::{Sphere, Vertex};
 
 #[repr(C)]
@@ -29,6 +31,9 @@ pub struct Renderer {
     pub size: (u32, u32),
     pub sphere: Sphere,
     pub render_pipeline: wgpu::RenderPipeline,
+    pub quad: Quad,
+    pub quad_pipeline: wgpu::RenderPipeline,
+    pub is_360: bool,
     pub camera_buffer: wgpu::Buffer,
     pub camera_bind_group: wgpu::BindGroup,
     pub texture_sampler: wgpu::Sampler,
@@ -84,6 +89,7 @@ impl Renderer {
         surface.configure(&device, &config);
 
         let sphere = Sphere::new(&device, 64, 32);
+        let quad = Quad::new(&device);
 
         let sphere_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Equirect Shader"),
@@ -238,6 +244,45 @@ impl Renderer {
             cache: None,
         });
 
+        // Quad pipeline for flat (non-360) video mode
+        let quad_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Quad Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("quad.wgsl").into()),
+        });
+        let quad_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Quad Pipeline"),
+            layout: Some(&pipeline_layout), // same layout as sphere: camera_bgl + texture_bgl
+            vertex: wgpu::VertexState {
+                module: &quad_shader,
+                entry_point: "vs_main",
+                buffers: &[QuadVertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &quad_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         tracing::info!("Render pipeline created");
 
         // Initialize egui
@@ -262,7 +307,8 @@ impl Renderer {
 
         Self {
             surface, device, queue, config, size: (size.width, size.height),
-            sphere, render_pipeline, camera_buffer, camera_bind_group,
+            sphere, render_pipeline, quad, quad_pipeline, is_360: false,
+            camera_buffer, camera_bind_group,
             texture_sampler, texture_bind_group_layout: texture_bgl,
             video_texture: None, video_texture_view: None, video_bind_group: None,
             placeholder_bind_group,
@@ -386,7 +432,7 @@ impl Renderer {
             &screen_descriptor,
         );
 
-        // --- 3D sphere pass ---
+        // --- Main video pass: sphere (360) or flat quad (normal) ---
         {
             let texture_bg = self.video_bind_group.as_ref().unwrap_or(&self.placeholder_bind_group);
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -396,7 +442,7 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05, g: 0.05, b: 0.2, a: 1.0,
+                            r: 0.0, g: 0.0, b: 0.0, a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -405,12 +451,19 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            rpass.set_pipeline(&self.render_pipeline);
             rpass.set_bind_group(0, &self.camera_bind_group, &[]);
             rpass.set_bind_group(1, texture_bg, &[]);
-            rpass.set_vertex_buffer(0, self.sphere.vertex_buffer.slice(..));
-            rpass.set_index_buffer(self.sphere.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            rpass.draw_indexed(0..self.sphere.index_count, 0, 0..1);
+            if self.is_360 {
+                rpass.set_pipeline(&self.render_pipeline);
+                rpass.set_vertex_buffer(0, self.sphere.vertex_buffer.slice(..));
+                rpass.set_index_buffer(self.sphere.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                rpass.draw_indexed(0..self.sphere.index_count, 0, 0..1);
+            } else {
+                rpass.set_pipeline(&self.quad_pipeline);
+                rpass.set_vertex_buffer(0, self.quad.vertex_buffer.slice(..));
+                rpass.set_index_buffer(self.quad.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                rpass.draw_indexed(0..self.quad.index_count, 0, 0..1);
+            }
         }
 
         // --- egui overlay pass ---

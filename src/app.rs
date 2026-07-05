@@ -184,7 +184,10 @@ impl ApplicationHandler for App {
     ) {
         if let DeviceEvent::MouseMotion { delta } = event {
             if self.dragging {
-                // Don't rotate the camera if an egui widget is capturing pointer input
+                // Only rotate in 360 mode, and not when egui wants the pointer
+                if !self.renderer.as_ref().map(|r| r.is_360).unwrap_or(false) {
+                    return;
+                }
                 let egui_wants_pointer = self.renderer.as_ref()
                     .map(|r| r.egui_state.egui_ctx().wants_pointer_input())
                     .unwrap_or(false);
@@ -235,6 +238,8 @@ impl ApplicationHandler for App {
         {
             ui.playing = !decoder_paused;
             ui.duration = duration;
+            // Sync 360 toggle from UI -> renderer
+            renderer.is_360 = ui.is_360;
 
             // Prepare input for egui and begin the pass
             let raw_input = renderer.egui_state.take_egui_input(window);

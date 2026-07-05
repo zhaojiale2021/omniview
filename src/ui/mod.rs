@@ -8,6 +8,7 @@ pub struct PlayerUI {
     pub volume: f32,
     pub seek_to: Option<f64>,
     pub open_file_clicked: bool,
+    pub is_360: bool,
 }
 
 impl PlayerUI {
@@ -20,30 +21,33 @@ impl PlayerUI {
             volume: 0.8,
             seek_to: None,
             open_file_clicked: false,
+            is_360: false,
         }
     }
 
     pub fn update(&mut self) -> egui::FullOutput {
         let ctx = &self.ctx;
-        let seek_to = &mut self.seek_to;
-        let playing = &mut self.playing;
-        let volume = &mut self.volume;
-        let open_file = &mut self.open_file_clicked;
-        let pos = self.position;
-        let dur = self.duration;
 
-        // Draw a full-width colored bar at the top as a visual test
-        egui::TopBottomPanel::top("test_bar")
+        // Top bar with 360 toggle
+        egui::TopBottomPanel::top("toolbar")
             .frame(egui::Frame {
-                fill: egui::Color32::from_rgb(255, 0, 0), // BRIGHT RED
+                fill: egui::Color32::from_black_alpha(160),
                 ..Default::default()
             })
-            .min_height(30.0)
+            .min_height(28.0)
             .show(ctx, |ui| {
-                ui.label("360 Video Player");
+                ui.horizontal(|ui| {
+                    ui.label("360° Video Player");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let label = if self.is_360 { "360°: ON" } else { "360°: OFF" };
+                        if ui.button(label).clicked() {
+                            self.is_360 = !self.is_360;
+                        }
+                    });
+                });
             });
 
-        // Main controls at the bottom
+        // Bottom controls
         egui::TopBottomPanel::bottom("controls")
             .frame(egui::Frame {
                 fill: egui::Color32::from_black_alpha(200),
@@ -52,20 +56,17 @@ impl PlayerUI {
             .min_height(44.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    // Open file button
                     if ui.button("Open").clicked() {
-                        *open_file = true;
+                        self.open_file_clicked = true;
                     }
 
-                    // Play/Pause
-                    let label = if *playing { "Pause" } else { "Play" };
+                    let label = if self.playing { "Pause" } else { "Play" };
                     if ui.button(label).clicked() {
-                        *playing = !*playing;
+                        self.playing = !self.playing;
                     }
 
-                    // Seek bar
-                    let dur_secs = dur.max(1.0);
-                    let mut slider = pos;
+                    let dur_secs = self.duration.max(1.0);
+                    let mut slider = self.position;
                     ui.add(
                         egui::Slider::new(&mut slider, 0.0..=dur_secs)
                             .text("")
@@ -84,21 +85,19 @@ impl PlayerUI {
                                 }
                             }),
                     );
-                    if (slider - pos).abs() > 0.1 {
-                        *seek_to = Some(slider);
+                    if (slider - self.position).abs() > 0.3 {
+                        self.seek_to = Some(slider);
                     }
 
-                    // Time
                     ui.label(format!(
                         "{:02}:{:02} / {:02}:{:02}",
-                        (pos as u64) / 60,
-                        (pos as u64) % 60,
-                        (dur as u64) / 60,
-                        (dur as u64) % 60,
+                        (self.position as u64) / 60,
+                        (self.position as u64) % 60,
+                        (self.duration as u64) / 60,
+                        (self.duration as u64) % 60,
                     ));
 
-                    // Volume
-                    ui.add(egui::Slider::new(volume, 0.0..=1.0).text("V"));
+                    ui.add(egui::Slider::new(&mut self.volume, 0.0..=1.0).text("V"));
                 });
             });
 
