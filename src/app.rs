@@ -11,7 +11,7 @@ use winit::{
 };
 #[cfg(feature = "audio")]
 use crate::decoder::audio::AudioDecoder;
-use crate::decoder::video::{DecodedFrame, DecoderCommand, VideoDecoder};
+use crate::decoder::video::{DecoderCommand, VideoDecoder};
 use crate::renderer::Renderer;
 use crate::ui::PlayerUI;
 
@@ -210,11 +210,9 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // --- Drain decoder frames ---
+        // --- Take ONE frame per render call (avoids frame drops at 60fps display / 30fps video) ---
         if let Some(ref decoder) = self.decoder {
-            let mut latest: Option<DecodedFrame> = None;
-            while let Ok(f) = decoder.frame_rx.try_recv() { latest = Some(f); }
-            if let Some(f) = latest {
+            if let Ok(f) = decoder.frame_rx.try_recv() {
                 if let Some(r) = &mut self.renderer {
                     r.update_video_texture(&f.data, f.width, f.height);
                 }

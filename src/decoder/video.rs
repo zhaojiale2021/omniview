@@ -112,7 +112,7 @@ impl VideoDecoder {
             duration_secs
         );
 
-        let (frame_tx, frame_rx) = mpsc::sync_channel::<DecodedFrame>(2); // bounded: max 2 frames in flight
+        let (frame_tx, frame_rx) = mpsc::sync_channel::<DecodedFrame>(4); // bounded: ~130ms buffer at 30fps
         let (command_tx, command_rx) = mpsc::channel();
         let stopped = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
