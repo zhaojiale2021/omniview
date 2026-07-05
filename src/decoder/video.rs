@@ -2,7 +2,8 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc, Arc,
+    mpsc::{self, SyncSender},
+    Arc,
 };
 use std::thread;
 
@@ -111,7 +112,7 @@ impl VideoDecoder {
             duration_secs
         );
 
-        let (frame_tx, frame_rx) = mpsc::channel();
+        let (frame_tx, frame_rx) = mpsc::sync_channel::<DecodedFrame>(2); // bounded: max 2 frames in flight
         let (command_tx, command_rx) = mpsc::channel();
         let stopped = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
@@ -144,7 +145,7 @@ impl VideoDecoder {
         height: u32,
         fps: f64,
         speed: f64,
-        frame_tx: mpsc::Sender<DecodedFrame>,
+        frame_tx: SyncSender<DecodedFrame>,
         command_rx: mpsc::Receiver<DecoderCommand>,
         stopped: Arc<AtomicBool>,
         paused: Arc<AtomicBool>,
