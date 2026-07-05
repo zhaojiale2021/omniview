@@ -61,7 +61,7 @@ impl App {
         self.command_tx = Some(cmd_tx);
 
         #[cfg(feature = "audio")]
-        match AudioDecoder::open(path, self.playback_speed, start_secs) {
+        match AudioDecoder::open(path, start_secs) {
             Ok(audio) => { self.audio = Some(audio); }
             Err(e) => tracing::warn!("Audio: {e}"),
         }
@@ -72,9 +72,19 @@ impl App {
     pub fn set_speed(&mut self, speed: f64) {
         if (self.playback_speed - speed).abs() < 0.01 { return; }
         self.playback_speed = speed;
-        let cur_pos = self.ui.as_ref().map(|u| u.position).unwrap_or(0.0);
-        if let Some(ref path) = self.current_file.clone() {
-            self.start_playback(path, cur_pos);
+        // Only restart video on speed change (audio stays at 1x)
+        if let (Some(ref path), Some(d)) = (self.current_file.clone(), self.decoder.take()) {
+            d.stop();
+            self.command_tx.take();
+            let cur_pos = self.ui.as_ref().map(|u| u.position).unwrap_or(0.0);
+            match VideoDecoder::open(path, speed) {
+                Ok((dec, tx)) => {
+                    let _ = tx.send(DecoderCommand::Seek(cur_pos));
+                    self.decoder = Some(dec);
+                    self.command_tx = Some(tx);
+                }
+                Err(e) => tracing::error!("Speed change: {e}"),
+            }
         }
     }
 
@@ -83,7 +93,7 @@ impl App {
         {
             drop(self.audio.take());
             if let Some(ref path) = self.current_file.clone() {
-                match AudioDecoder::open(path, self.playback_speed, start_secs) {
+                match AudioDecoder::open(path, start_secs) {
                     Ok(audio) => { self.audio = Some(audio); }
                     Err(e) => tracing::warn!("Audio restart: {e}"),
                 }
@@ -111,7 +121,7 @@ impl ApplicationHandler for App {
             return;
         }
 
-        // Resize always handled first
+        // Resize
         if let WindowEvent::Resized(s) = &event {
             if let Some(r) = &mut self.renderer {
                 r.resize(s.width, s.height);
@@ -119,7 +129,15 @@ impl ApplicationHandler for App {
             }
         }
 
-        // Track cursor position for camera drag (use CursorMoved for reliability)
+        // Camera: track drag state BEFORE egui (egui would consume MouseInput)
+        if let WindowEvent::MouseInput { state, button: MouseButton::Left, .. } = &event {
+            self.dragging = *state == ElementState::Pressed;
+            if !self.dragging {
+                self.last_cursor = None;
+            }
+        }
+
+        // Camera: update on CursorMoved BEFORE egui
         if let WindowEvent::CursorMoved { position, .. } = &event {
             if self.dragging {
                 if let Some(r) = &mut self.renderer {
@@ -134,7 +152,7 @@ impl ApplicationHandler for App {
             self.last_cursor = Some(*position);
         }
 
-        // Feed event to egui-winit AFTER camera handling
+        // Feed event to egui-winit
         let consumed = if let (Some(w), Some(r)) = (&self.window, &mut self.renderer) {
             r.egui_state.on_window_event(w, &event).consumed
         } else {
@@ -146,12 +164,6 @@ impl ApplicationHandler for App {
         }
 
         match event {
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
-                self.dragging = state == ElementState::Pressed;
-                if !self.dragging {
-                    self.last_cursor = None; // reset on release
-                }
-            }
             WindowEvent::MouseWheel { delta, .. } => {
                 if let Some(r) = &mut self.renderer {
                     let scroll = match delta {
