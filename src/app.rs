@@ -61,7 +61,7 @@ impl App {
         self.command_tx = Some(cmd_tx);
 
         #[cfg(feature = "audio")]
-        match AudioDecoder::open(path, self.playback_speed, start_secs) {
+        match AudioDecoder::open(path, start_secs) {
             Ok(audio) => { self.audio = Some(audio); }
             Err(e) => tracing::warn!("Audio: {e}"),
         }
@@ -73,32 +73,17 @@ impl App {
         if (self.playback_speed - speed).abs() < 0.01 { return; }
         self.playback_speed = speed;
         let cur_pos = self.ui.as_ref().map(|u| u.position).unwrap_or(0.0);
-
-        // Restart video with new speed
-        if let Some(d) = self.decoder.take() {
-            d.stop();
+        // Only restart video; audio stays at 1x
+        if let Some(ref path) = self.current_file.clone() {
             self.command_tx.take();
-            if let Some(ref path) = self.current_file {
-                match VideoDecoder::open(path, speed) {
-                    Ok((dec, tx)) => {
-                        let _ = tx.send(DecoderCommand::Seek(cur_pos));
-                        self.decoder = Some(dec);
-                        self.command_tx = Some(tx);
-                    }
-                    Err(e) => tracing::error!("Video speed: {e}"),
+            if let Some(d) = self.decoder.take() { d.stop(); }
+            match VideoDecoder::open(path, speed) {
+                Ok((dec, tx)) => {
+                    if cur_pos > 0.01 { let _ = tx.send(DecoderCommand::Seek(cur_pos)); }
+                    self.decoder = Some(dec);
+                    self.command_tx = Some(tx);
                 }
-            }
-        }
-
-        // Restart audio with new speed
-        #[cfg(feature = "audio")]
-        {
-            drop(self.audio.take());
-            if let Some(ref path) = self.current_file {
-                match AudioDecoder::open(path, speed, cur_pos) {
-                    Ok(a) => { self.audio = Some(a); }
-                    Err(e) => tracing::warn!("Audio speed: {e}"),
-                }
+                Err(e) => tracing::error!("Speed: {e}"),
             }
         }
     }
@@ -109,7 +94,7 @@ impl App {
         {
             drop(self.audio.take());
             if let Some(ref path) = self.current_file.clone() {
-                match AudioDecoder::open(path, self.playback_speed, start_secs) {
+                match AudioDecoder::open(path, start_secs) {
                     Ok(audio) => { self.audio = Some(audio); }
                     Err(e) => tracing::warn!("Audio restart: {e}"),
                 }

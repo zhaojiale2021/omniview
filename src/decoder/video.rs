@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn test_decode_single_frame() {
-        let (decoder, _cmd) = VideoDecoder::open("/tmp/test_360.mp4").unwrap();
+        let (decoder, _cmd) = VideoDecoder::open("/tmp/test_360.mp4", 1.0).unwrap();
         // Receive first frame
         let frame = decoder.frame_rx.recv_timeout(std::time::Duration::from_secs(5));
         assert!(frame.is_ok(), "Should receive a frame: {:?}", frame.err());
