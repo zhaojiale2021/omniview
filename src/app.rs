@@ -45,37 +45,59 @@ impl App {
 
     pub fn open_file(&mut self, path: &str) {
         self.current_file = Some(path.to_string());
-        self.start_playback(path);
+        self.start_playback(path, 0.0);
     }
 
-    fn start_playback(&mut self, path: &str) {
+    fn start_playback(&mut self, path: &str, start_secs: f64) {
         // Clean up previous playback
         if let Some(d) = self.decoder.take() { d.stop(); }
         #[cfg(feature = "audio")] drop(self.audio.take());
         self.command_tx.take();
 
-        match VideoDecoder::open(path) {
-            Ok((decoder, cmd_tx)) => {
-                self.decoder = Some(decoder);
-                self.command_tx = Some(cmd_tx);
-
-                #[cfg(feature = "audio")]
-                match AudioDecoder::open(path, self.playback_speed) {
-                    Ok(audio) => { self.audio = Some(audio); }
-                    Err(e) => tracing::warn!("Audio: {e}"),
-                }
-
-                tracing::info!("Loaded: {path} speed={}", self.playback_speed);
-            }
-            Err(e) => tracing::error!("Open failed: {e}"),
+        // Seek video to start position
+        let (decoder, cmd_tx) = match VideoDecoder::open(path) {
+            Ok(v) => v,
+            Err(e) => { tracing::error!("Open: {e}"); return; }
+        };
+        if start_secs > 0.01 {
+            let _ = cmd_tx.send(DecoderCommand::Seek(start_secs));
         }
+        self.decoder = Some(decoder);
+        self.command_tx = Some(cmd_tx);
+
+        #[cfg(feature = "audio")]
+        match AudioDecoder::open(path, self.playback_speed, start_secs) {
+            Ok(audio) => { self.audio = Some(audio); }
+            Err(e) => tracing::warn!("Audio: {e}"),
+        }
+
+        tracing::info!("Loaded: {path} speed={} start={start_secs}", self.playback_speed);
     }
 
     pub fn set_speed(&mut self, speed: f64) {
         if (self.playback_speed - speed).abs() < 0.01 { return; }
         self.playback_speed = speed;
+        // Capture current position before destroying decoders
+        let cur_pos = self
+            .ui
+            .as_ref()
+            .map(|u| u.position)
+            .unwrap_or(0.0);
         if let Some(ref path) = self.current_file.clone() {
-            self.start_playback(path);
+            self.start_playback(path, cur_pos);
+        }
+    }
+
+    fn restart_audio(&mut self, start_secs: f64) {
+        #[cfg(feature = "audio")]
+        {
+            drop(self.audio.take());
+            if let Some(ref path) = self.current_file.clone() {
+                match AudioDecoder::open(path, self.playback_speed, start_secs) {
+                    Ok(audio) => { self.audio = Some(audio); }
+                    Err(e) => tracing::warn!("Audio restart: {e}"),
+                }
+            }
         }
     }
 }
@@ -331,6 +353,8 @@ impl ApplicationHandler for App {
             if let Some(tx) = &self.command_tx {
                 let _ = tx.send(DecoderCommand::Seek(seek));
             }
+            // Restart audio at the same position for A/V sync
+            self.restart_audio(seek);
         }
 
         if let Some(speed) = action_set_speed {
