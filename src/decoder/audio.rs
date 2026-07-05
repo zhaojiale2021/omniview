@@ -30,7 +30,7 @@ pub struct AudioDecoder {
 }
 
 impl AudioDecoder {
-    pub fn open(path: &str, start_secs: f64) -> Result<Self, String> {
+    pub fn open(path: &str, speed: f64, start_secs: f64) -> Result<Self, String> {
         let shared = Arc::new(AudioShared {
             buffer: Mutex::new(VecDeque::with_capacity((SAMPLE_RATE as usize) * 2)),
             volume: Mutex::new(0.8),
@@ -79,7 +79,7 @@ impl AudioDecoder {
         let path_owned = path.to_string();
 
         let thread_handle = thread::spawn(move || {
-            read_audio(&path_owned, start_secs, &shared_reader, &child_for_thread);
+            read_audio(&path_owned, speed, start_secs, &shared_reader, &child_for_thread);
         });
 
         Ok(Self {
@@ -107,17 +107,23 @@ impl AudioDecoder {
     }
 }
 
-fn build_audio_ffmpeg_args(path: &str, start_secs: f64) -> Vec<String> {
-    let mut args: Vec<String> = vec!["-v".into(), "quiet".into()];
+fn build_audio_ffmpeg_args(path: &str, speed: f64, start_secs: f64) -> Vec<String> {
+    let mut args: Vec<String> = vec!["-v".into(), "quiet".into(), "-re".into()];
 
+    if (speed - 1.0).abs() > 0.01 {
+        args.push("-af".into());
+        args.push(format!("atempo={speed}"));
+    }
+
+    args.push("-i".into());
+    args.push(path.into());
+
+    // -ss AFTER -i (output seek) works correctly with audio filters
     if start_secs > 0.01 {
         args.push("-ss".into());
         args.push(format!("{start_secs}"));
     }
 
-    args.push("-re".into());
-    args.push("-i".into());
-    args.push(path.into());
     args.extend_from_slice(&[
         "-f".into(), "f32le".into(),
         "-acodec".into(), "pcm_f32le".into(),
@@ -130,11 +136,12 @@ fn build_audio_ffmpeg_args(path: &str, start_secs: f64) -> Vec<String> {
 
 fn read_audio(
     path: &str,
+    speed: f64,
     start_secs: f64,
     shared: &Arc<AudioShared>,
     child_holder: &Arc<Mutex<Option<Child>>>,
 ) {
-    let args = build_audio_ffmpeg_args(path, start_secs);
+    let args = build_audio_ffmpeg_args(path, speed, start_secs);
 
     let mut child = match Command::new("ffmpeg")
         .args(&args)

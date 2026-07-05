@@ -61,7 +61,7 @@ impl App {
         self.command_tx = Some(cmd_tx);
 
         #[cfg(feature = "audio")]
-        match AudioDecoder::open(path, start_secs) {
+        match AudioDecoder::open(path, self.playback_speed, start_secs) {
             Ok(audio) => { self.audio = Some(audio); }
             Err(e) => tracing::warn!("Audio: {e}"),
         }
@@ -72,28 +72,44 @@ impl App {
     pub fn set_speed(&mut self, speed: f64) {
         if (self.playback_speed - speed).abs() < 0.01 { return; }
         self.playback_speed = speed;
-        // Only restart video on speed change (audio stays at 1x)
-        if let (Some(ref path), Some(d)) = (self.current_file.clone(), self.decoder.take()) {
+        let cur_pos = self.ui.as_ref().map(|u| u.position).unwrap_or(0.0);
+
+        // Restart video with new speed
+        if let Some(d) = self.decoder.take() {
             d.stop();
             self.command_tx.take();
-            let cur_pos = self.ui.as_ref().map(|u| u.position).unwrap_or(0.0);
-            match VideoDecoder::open(path, speed) {
-                Ok((dec, tx)) => {
-                    let _ = tx.send(DecoderCommand::Seek(cur_pos));
-                    self.decoder = Some(dec);
-                    self.command_tx = Some(tx);
+            if let Some(ref path) = self.current_file {
+                match VideoDecoder::open(path, speed) {
+                    Ok((dec, tx)) => {
+                        let _ = tx.send(DecoderCommand::Seek(cur_pos));
+                        self.decoder = Some(dec);
+                        self.command_tx = Some(tx);
+                    }
+                    Err(e) => tracing::error!("Video speed: {e}"),
                 }
-                Err(e) => tracing::error!("Speed change: {e}"),
+            }
+        }
+
+        // Restart audio with new speed
+        #[cfg(feature = "audio")]
+        {
+            drop(self.audio.take());
+            if let Some(ref path) = self.current_file {
+                match AudioDecoder::open(path, speed, cur_pos) {
+                    Ok(a) => { self.audio = Some(a); }
+                    Err(e) => tracing::warn!("Audio speed: {e}"),
+                }
             }
         }
     }
 
+    #[allow(unused_variables)]
     fn restart_audio(&mut self, start_secs: f64) {
         #[cfg(feature = "audio")]
         {
             drop(self.audio.take());
             if let Some(ref path) = self.current_file.clone() {
-                match AudioDecoder::open(path, start_secs) {
+                match AudioDecoder::open(path, self.playback_speed, start_secs) {
                     Ok(audio) => { self.audio = Some(audio); }
                     Err(e) => tracing::warn!("Audio restart: {e}"),
                 }
@@ -144,7 +160,7 @@ impl ApplicationHandler for App {
                     if r.is_360 {
                         let dx = position.x - self.last_cursor.map(|p| p.x).unwrap_or(position.x);
                         let dy = position.y - self.last_cursor.map(|p| p.y).unwrap_or(position.y);
-                        r.camera.handle_mouse(dx, dy, r.size.1 as f64);
+                        r.camera.handle_mouse(dx, dy, r.size.0 as f64);
                         r.update_camera_uniform();
                     }
                 }
