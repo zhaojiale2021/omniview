@@ -55,7 +55,7 @@ impl App {
 
                 #[cfg(feature = "audio")]
                 // Start audio playback
-                match AudioDecoder::open(path) {
+                match AudioDecoder::open(path, 1.0) {
                     Ok(audio) => {
                         self.audio = Some(audio);
                         tracing::info!("Audio started");
@@ -240,6 +240,11 @@ impl ApplicationHandler for App {
             ui.duration = duration;
             // Sync 360 toggle from UI -> renderer
             renderer.is_360 = ui.is_360;
+            // Sync volume from UI -> audio
+            #[cfg(feature = "audio")]
+            if let Some(ref audio) = self.audio {
+                audio.set_volume(ui.volume);
+            }
 
             // Prepare input for egui and begin the pass
             let raw_input = renderer.egui_state.take_egui_input(window);

@@ -1,179 +1,207 @@
+use std::collections::VecDeque;
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc, Arc,
+    Arc, Mutex,
 };
 use std::thread;
+use std::time::Duration;
 
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     StreamConfig,
 };
 
-const PCM_SAMPLE_RATE: u32 = 48000;
-const PCM_CHANNELS: u16 = 2;
-const CHUNK_SIZE: usize = 2048; // samples per chunk
+const SAMPLE_RATE: u32 = 48000;
+const CHANNELS: u16 = 2;
 
-/// Audio decoder + player. Spawns an ffmpeg process that outputs raw f32 PCM
-/// to stdout, reads it in a background thread, and feeds it to cpal.
-#[allow(dead_code)]
+struct AudioShared {
+    buffer: Mutex<VecDeque<f32>>,
+    volume: Mutex<f32>,
+    stopped: AtomicBool,
+    eof: AtomicBool,
+    speed: Mutex<f64>,
+}
+
 pub struct AudioDecoder {
-    stopped: Arc<AtomicBool>,
-    thread_handle: Option<thread::JoinHandle<()>>,
+    shared: Arc<AudioShared>,
+    _stream: cpal::Stream,
+    _thread: Option<thread::JoinHandle<()>>,
+    child: Arc<Mutex<Option<Child>>>,
 }
 
 impl AudioDecoder {
-    pub fn open(path: &str) -> Result<Self, String> {
-        let stopped = Arc::new(AtomicBool::new(false));
-        let stopped_clone = stopped.clone();
-        let path = path.to_string();
+    pub fn open(path: &str, speed: f64) -> Result<Self, String> {
+        let shared = Arc::new(AudioShared {
+            buffer: Mutex::new(VecDeque::with_capacity((SAMPLE_RATE as usize) * 2)),
+            volume: Mutex::new(0.8),
+            stopped: AtomicBool::new(false),
+            eof: AtomicBool::new(false),
+            speed: Mutex::new(speed),
+        });
 
-        let thread_handle = Some(thread::spawn(move || {
-            Self::play_loop(&path, stopped_clone);
-        }));
-
-        Ok(Self { stopped, thread_handle })
-    }
-
-    fn play_loop(path: &str, stopped: Arc<AtomicBool>) {
-        // Get default audio output device
+        // --- Create cpal stream first ---
         let host = cpal::default_host();
-        let device = match host.default_output_device() {
-            Some(d) => d,
-            None => {
-                tracing::warn!("No audio output device found");
-                return;
-            }
-        };
+        let device = host.default_output_device()
+            .ok_or("No audio output device")?;
 
         let config = StreamConfig {
-            channels: PCM_CHANNELS,
-            sample_rate: cpal::SampleRate(PCM_SAMPLE_RATE),
+            channels: CHANNELS,
+            sample_rate: cpal::SampleRate(SAMPLE_RATE),
             buffer_size: cpal::BufferSize::Default,
         };
 
-        // Channel: raw PCM float chunks from reader → cpal callback
-        let (chunk_tx, chunk_rx) = mpsc::sync_channel::<Vec<f32>>(128);
+        let shared_cb = shared.clone();
+        let err_fn = |err| tracing::error!("cpal: {err}");
 
-        // Shared flag to signal EOF to the audio callback
-        let eof = Arc::new(AtomicBool::new(false));
-        let eof_cb = eof.clone();
-
-        let err_fn = |err| tracing::error!("Audio stream error: {err}");
-
-        let stream = match device.build_output_stream(
+        let stream = device.build_output_stream(
             &config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                // Fill output buffer from the chunk channel
-                let mut chunk_buf: Option<Vec<f32>> = None;
-                for sample in data.chunks_mut(PCM_CHANNELS as usize) {
-                    // Get a new chunk if we've exhausted the current one
-                    if chunk_buf.as_ref().map(|b| b.is_empty()).unwrap_or(true) {
-                        chunk_buf = match chunk_rx.try_recv() {
-                            Ok(chunk) => Some(chunk),
-                            Err(mpsc::TryRecvError::Empty) => {
-                                if eof_cb.load(Ordering::Relaxed) {
-                                    return; // EOF, leave remaining samples as silence
-                                }
-                                // No data yet — write silence and retry
-                                for s in sample.iter_mut() {
-                                    *s = 0.0;
-                                }
-                                continue;
-                            }
-                            Err(mpsc::TryRecvError::Disconnected) => return,
-                        };
-                    }
-                    if let Some(ref mut buf) = chunk_buf {
-                        for s in sample.iter_mut() {
-                            *s = buf.drain(..1).next().unwrap_or(0.0);
-                        }
-                    }
+                let volume = *shared_cb.volume.lock().unwrap();
+                let mut buf = shared_cb.buffer.lock().unwrap();
+                for sample in data.iter_mut() {
+                    *sample = buf.pop_front().unwrap_or(0.0) * volume;
                 }
             },
             err_fn,
             None,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("Failed to build output stream: {e}");
-                return;
-            }
-        };
+        ).map_err(|e| format!("Stream error: {e}"))?;
 
-        if let Err(e) = stream.play() {
-            tracing::error!("Failed to start stream: {e}");
-            return;
-        }
+        stream.play().map_err(|e| format!("Play error: {e}"))?;
 
-        // Spawn ffmpeg to decode audio
-        let mut child = match Command::new("ffmpeg")
-            .args([
-                "-v", "quiet",
-                "-i", path,
-                "-f", "f32le",
-                "-acodec", "pcm_f32le",
-                "-ac", &PCM_CHANNELS.to_string(),
-                "-ar", &PCM_SAMPLE_RATE.to_string(),
-                "-",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("Failed to spawn ffmpeg audio: {e}");
-                return;
-            }
-        };
+        // --- Spawn ffmpeg reader thread ---
+        let child_arc: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+        let child_for_thread = child_arc.clone();
+        let shared_reader = shared.clone();
+        let path_owned = path.to_string();
 
-        let stdout = match child.stdout.take() {
-            Some(s) => s,
-            None => return,
-        };
+        let thread_handle = thread::spawn(move || {
+            run_ffmpeg_reader(&path_owned, speed, &shared_reader, &child_for_thread);
+        });
 
-        let mut reader = std::io::BufReader::with_capacity(65536, stdout);
-        // Read CHUNK_SIZE floats at a time (4 bytes each)
-        let mut byte_buf = vec![0u8; CHUNK_SIZE * 4];
-        let mut chunk = Vec::with_capacity(CHUNK_SIZE);
+        Ok(Self {
+            shared,
+            _stream: stream,
+            _thread: Some(thread_handle),
+            child: child_arc,
+        })
+    }
 
-        loop {
-            if stopped.load(Ordering::Relaxed) {
-                break;
-            }
-
-            chunk.clear();
-            // Read enough bytes for one chunk
-            for _ in 0..CHUNK_SIZE {
-                if reader.read_exact(&mut byte_buf[..4]).is_err() {
-                    eof.store(true, Ordering::Relaxed);
-                    break;
-                }
-                chunk.push(f32::from_le_bytes([
-                    byte_buf[0], byte_buf[1], byte_buf[2], byte_buf[3],
-                ]));
-            }
-
-            if chunk.is_empty() {
-                eof.store(true, Ordering::Relaxed);
-                break;
-            }
-
-            if chunk_tx.send(chunk.clone()).is_err() {
-                break; // receiver dropped (stream closed)
-            }
-        }
-
-        eof.store(true, Ordering::Relaxed);
-        let _ = child.kill();
-        let _ = child.wait();
-        tracing::info!("Audio playback finished");
+    pub fn set_volume(&self, v: f32) {
+        *self.shared.volume.lock().unwrap() = v.clamp(0.0, 1.0);
     }
 
     pub fn stop(&self) {
-        self.stopped.store(true, Ordering::Relaxed);
+        self.shared.stopped.store(true, Ordering::Relaxed);
+        if let Some(mut child) = self.child.lock().unwrap().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn run_ffmpeg_reader(
+    path: &str,
+    speed: f64,
+    shared: &Arc<AudioShared>,
+    child_holder: &Arc<Mutex<Option<Child>>>,
+) {
+    // Build args: -re for real-time, optional atempo for speed
+    let mut args: Vec<String> = vec![
+        "-v".into(), "quiet".into(),
+        "-re".into(),
+    ];
+
+    if (speed - 1.0).abs() > 0.01 {
+        args.push("-af".into());
+        args.push(format!("atempo={speed}"));
+    }
+
+    args.push("-i".into());
+    args.push(path.into());
+    args.extend_from_slice(&[
+        "-f".into(), "f32le".into(),
+        "-acodec".into(), "pcm_f32le".into(),
+        "-ac".into(), CHANNELS.to_string(),
+        "-ar".into(), SAMPLE_RATE.to_string(),
+        "-".into(),
+    ]);
+
+    let mut child = match Command::new("ffmpeg")
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("ffmpeg audio spawn: {e}");
+            shared.eof.store(true, Ordering::Relaxed);
+            return;
+        }
+    };
+
+    let mut stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            shared.eof.store(true, Ordering::Relaxed);
+            return;
+        }
+    };
+
+    *child_holder.lock().unwrap() = Some(child);
+
+    let mut reader = std::io::BufReader::with_capacity(65536, stdout);
+    let mut byte_buf = [0u8; 4];
+    let chunk_size = 512; // push 512 samples at a time for smooth buffering
+    let mut samples = Vec::with_capacity(chunk_size);
+
+    loop {
+        if shared.stopped.load(Ordering::Relaxed) {
+            break;
+        }
+
+        samples.clear();
+        for _ in 0..chunk_size {
+            if let Err(e) = reader.read_exact(&mut byte_buf) {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    shared.eof.store(true, Ordering::Relaxed);
+                } else {
+                    tracing::error!("Audio read: {e}");
+                }
+                // Push remaining samples and exit
+                if !samples.is_empty() {
+                    shared.buffer.lock().unwrap().extend(samples.drain(..));
+                }
+                // Let the buffer drain naturally
+                thread::sleep(Duration::from_millis(500));
+                shared.eof.store(true, Ordering::Relaxed);
+                return;
+            }
+            samples.push(f32::from_le_bytes(byte_buf));
+        }
+
+        // Push to ring buffer; if full, wait briefly
+        {
+            let mut buf = shared.buffer.lock().unwrap();
+            while buf.len() > (SAMPLE_RATE as usize) * 4 {
+                // Buffer has >4 seconds of audio; wait for cpal to drain
+                drop(buf);
+                if shared.stopped.load(Ordering::Relaxed) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+                buf = shared.buffer.lock().unwrap();
+            }
+            buf.extend(samples.drain(..));
+        }
+    }
+
+    // Cleanup
+    if let Some(mut c) = child_holder.lock().unwrap().take() {
+        let _ = c.kill();
+        let _ = c.wait();
     }
 }
 

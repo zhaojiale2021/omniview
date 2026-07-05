@@ -166,6 +166,7 @@ impl VideoDecoder {
             // Build ffmpeg args
             let mut args: Vec<String> = vec![
                 "-v".into(), "quiet".into(),
+                "-re".into(), // read at native frame rate (real-time)
             ];
 
             if let Some(seek_pts) = seek_to.take() {
