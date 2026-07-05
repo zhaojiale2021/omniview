@@ -1,3 +1,3 @@
 pub mod video;
-#[cfg(feature = "audio")]
-pub mod audio;
+#[cfg(feature = "mpv")]
+pub mod media;
