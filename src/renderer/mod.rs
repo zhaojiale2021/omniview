@@ -43,7 +43,6 @@ pub struct Renderer {
     pub video_bind_group: Option<wgpu::BindGroup>,
     pub placeholder_bind_group: wgpu::BindGroup,
     pub camera: OrbitCamera,
-    // egui integration
     pub egui_state: egui_winit::State,
     pub egui_renderer: egui_wgpu::Renderer,
 }
@@ -231,7 +230,6 @@ impl Renderer {
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
-                // CW winding + cull front = inside-out rendering (we're inside the sphere)
                 front_face: wgpu::FrontFace::Ccw,
                 cull_mode: None,
                 unclipped_depth: false,
@@ -244,14 +242,14 @@ impl Renderer {
             cache: None,
         });
 
-        // Quad pipeline for flat (non-360) video mode
+        // Quad pipeline
         let quad_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Quad Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("quad.wgsl").into()),
         });
         let quad_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Quad Pipeline"),
-            layout: Some(&pipeline_layout), // same layout as sphere: camera_bgl + texture_bgl
+            layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &quad_shader,
                 entry_point: "vs_main",
@@ -285,24 +283,16 @@ impl Renderer {
 
         tracing::info!("Render pipeline created");
 
-        // Initialize egui
+        // egui
         let egui_ctx = egui::Context::default();
         let viewport_id = egui::ViewportId::ROOT;
         let egui_state = egui_winit::State::new(
-            egui_ctx,
-            viewport_id,
-            window.as_ref(),            // &dyn HasDisplayHandle
-            Some(window.scale_factor() as f32), // native_pixels_per_point
-            window.theme(),             // Option<Theme>
-            None,                       // max_texture_side
+            egui_ctx, viewport_id, window.as_ref(),
+            Some(window.scale_factor() as f32),
+            window.theme(), None,
         );
-
         let egui_renderer = egui_wgpu::Renderer::new(
-            &device,
-            config.format,
-            None,  // depth_format
-            1,     // msaa_samples
-            false, // depth_write_enabled
+            &device, config.format, None, 1, false,
         );
 
         Self {
@@ -311,10 +301,8 @@ impl Renderer {
             camera_buffer, camera_bind_group,
             texture_sampler, texture_bind_group_layout: texture_bgl,
             video_texture: None, video_texture_view: None, video_bind_group: None,
-            placeholder_bind_group,
-            camera,
-            egui_state,
-            egui_renderer,
+            placeholder_bind_group, camera,
+            egui_state, egui_renderer,
         }
     }
 
@@ -325,32 +313,33 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
-    /// Update camera uniform buffer from a view-projection matrix
     pub fn update_camera(&mut self, view_proj: &[[f32; 4]; 4]) {
         self.queue.write_buffer(
-            &self.camera_buffer,
-            0,
+            &self.camera_buffer, 0,
             bytemuck::cast_slice(&[CameraUniform { view_proj: *view_proj }]),
         );
     }
 
-    /// Compute view-projection matrix from camera state and upload to GPU
     pub fn update_camera_uniform(&mut self) {
         let aspect = self.size.0 as f32 / self.size.1.max(1) as f32;
         let vp = self.camera.view_proj_matrix(aspect);
         self.update_camera(&vp);
     }
 
-    /// Upload RGBA pixel data as a wgpu texture for video frame rendering
-    pub fn update_video_texture(&mut self, rgba_data: &[u8], width: u32, height: u32) {
-        let tex_size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
+    /// Upload a video frame into the GPU texture.  `write_texture`
+    /// enqueues a single staging→texture copy through wgpu's internal
+    /// ring — no per-frame allocations, no extra hop.
+    pub fn upload_video_frame(&mut self, rgba_data: &[u8], width: u32, height: u32) {
+        let bytes_needed = (width as usize) * (height as usize) * 4;
+        if bytes_needed == 0 { return; }
 
+        // Ensure the video texture exists and is the correct size
         let needs_new = match &self.video_texture {
             Some(t) => t.width() != width || t.height() != height,
             None => true,
         };
-
         if needs_new {
+            let tex_size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
             let texture = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("Video Frame"),
                 size: tex_size,
@@ -381,37 +370,52 @@ impl Renderer {
             self.video_bind_group = Some(bind_group);
         }
 
-        if let Some(ref texture) = self.video_texture {
-            self.queue.write_texture(
-                wgpu::ImageCopyTexture {
-                    texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                rgba_data,
-                wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(4 * width),
-                    rows_per_image: Some(height),
-                },
-                tex_size,
-            );
-        }
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: self.video_texture.as_ref().unwrap(),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &rgba_data[..bytes_needed],
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * width),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
     }
 
-    /// Render the 3D sphere and an egui UI overlay on top.
-    pub fn render(&mut self,
+    /// Render the video frame + egui overlay.
+    ///
+    /// `frame` is the freshly decoded frame to display, if any.  The
+    /// texture upload happens only AFTER the surface is acquired, so a
+    /// `write_texture` is always followed by a `submit` — a failing
+    /// surface can't leak staging buffers into `pending_writes`.
+    pub fn render(
+        &mut self,
         clipped_primitives: &[egui::ClippedPrimitive],
         textures_delta: &egui::TexturesDelta,
-        pixels_per_point: f32) -> Result<(), wgpu::SurfaceError> {
+        pixels_per_point: f32,
+        frame: Option<(std::sync::Arc<Vec<u8>>, u32, u32)>,
+    ) -> Result<(), wgpu::SurfaceError> {
         self.update_camera_uniform();
-        let output = self.surface.get_current_texture()?;
+        let output = match self.surface.get_current_texture() {
+            Ok(o) => o,
+            // Surface lost/outdated — skip this frame entirely.  The
+            // frame is NOT uploaded, so nothing accumulates.
+            Err(e) => return Err(e),
+        };
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Encoder") });
 
-        // Upload egui textures (font atlas etc.) BEFORE vertex/index buffers
+        if let Some((data, width, height)) = frame {
+            self.upload_video_frame(&data, width, height);
+        }
+
+        // Upload egui textures
         for (id, image_delta) in &textures_delta.set {
             self.egui_renderer.update_texture(&self.device, &self.queue, *id, image_delta);
         }
@@ -419,20 +423,16 @@ impl Renderer {
             self.egui_renderer.free_texture(id);
         }
 
-        // Upload egui vertex/index buffers
+        // egui vertex/index buffers
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [self.size.0, self.size.1],
             pixels_per_point,
         };
-        let extra_command_buffers = self.egui_renderer.update_buffers(
-            &self.device,
-            &self.queue,
-            &mut encoder,
-            clipped_primitives,
-            &screen_descriptor,
+        let extra_cbs = self.egui_renderer.update_buffers(
+            &self.device, &self.queue, &mut encoder, clipped_primitives, &screen_descriptor,
         );
 
-        // --- Main video pass: sphere (360) or flat quad (normal) ---
+        // ── Main video pass ──────────────────────────────────────
         {
             let texture_bg = self.video_bind_group.as_ref().unwrap_or(&self.placeholder_bind_group);
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -441,9 +441,7 @@ impl Renderer {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0, g: 0.0, b: 0.0, a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -466,7 +464,7 @@ impl Renderer {
             }
         }
 
-        // --- egui overlay pass ---
+        // ── egui overlay ─────────────────────────────────────────
         if !clipped_primitives.is_empty() {
             let rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Egui Pass"),
@@ -474,7 +472,7 @@ impl Renderer {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load, // overlay on top of the 3D scene
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -482,8 +480,6 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            // forget_lifetime() decouples the pass from the encoder lifetime,
-            // matching what egui_wgpu::Renderer::render expects.
             self.egui_renderer.render(
                 &mut rpass.forget_lifetime(),
                 clipped_primitives,
@@ -491,13 +487,11 @@ impl Renderer {
             );
         }
 
-        self.queue
-            .submit(extra_command_buffers.into_iter().chain(std::iter::once(encoder.finish())));
+        self.queue.submit(extra_cbs.into_iter().chain(std::iter::once(encoder.finish())));
         output.present();
         Ok(())
     }
 
-    /// Return a cloned reference to the egui context, so callers can build UI.
     pub fn egui_ctx(&self) -> egui::Context {
         self.egui_state.egui_ctx().clone()
     }

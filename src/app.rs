@@ -1,98 +1,48 @@
-use std::sync::mpsc;
 use std::sync::Arc;
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalPosition,
-    event::{DeviceEvent, ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::ActiveEventLoop,
+    event::{ElementState, KeyEvent, MouseButton, WindowEvent},
+    event_loop::{ActiveEventLoop, ControlFlow},
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
 };
-#[cfg(feature = "mpv")]
-use crate::decoder::media::AudioPlayer;
-use crate::decoder::video::{DecodedFrame, DecoderCommand, VideoDecoder};
+
+use crate::player::Player;
 use crate::renderer::Renderer;
 use crate::ui::PlayerUI;
 
 pub struct App {
-    pub window: Option<Arc<Window>>,
-    pub renderer: Option<Renderer>,
-    pub decoder: Option<VideoDecoder>,
-    #[cfg(feature = "mpv")]
-    pub audio: Option<AudioPlayer>,
-    pub command_tx: Option<mpsc::Sender<DecoderCommand>>,
-    pub dragging: bool,
-    pub ui: Option<PlayerUI>,
-    pub current_file: Option<String>,
-    pub playback_speed: f64,
+    window: Option<Arc<Window>>,
+    renderer: Option<Renderer>,
+    player: Player,
+    ui: Option<PlayerUI>,
+    dragging: bool,
     last_cursor: Option<PhysicalPosition<f64>>,
-    // ~30 completed video frames; video syncs to audio clock
-    frame_count: u64,
+    /// Any window event arrived since the last `about_to_wait` —
+    /// forces a render even when paused (UI interaction must be drawn).
+    input_seen: bool,
+    /// File to open once the window is ready.
+    pending_file: Option<String>,
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(initial_file: Option<String>) -> Self {
         Self {
-            window: None, renderer: None, decoder: None,
-            #[cfg(feature = "mpv")] audio: None,
-            command_tx: None, dragging: false, ui: None,
-            current_file: None, playback_speed: 1.0, last_cursor: None,
-            frame_count: 0,
+            window: None,
+            renderer: None,
+            player: Player::new(),
+            ui: None,
+            dragging: false,
+            last_cursor: None,
+            input_seen: false,
+            pending_file: initial_file,
         }
     }
 
-    pub fn open_file(&mut self, path: &str) {
-        self.current_file = Some(path.to_string());
-        self.frame_count = 0;
-
-        // Stop old
-        if let Some(d) = self.decoder.take() { d.stop(); }
-        #[cfg(feature = "mpv")]
-        drop(self.audio.take());
-        self.command_tx.take();
-
-        // Start mpv for audio + clock
-        #[cfg(feature = "mpv")]
-        match AudioPlayer::open(path) {
-            Ok(a) => self.audio = Some(a),
-            Err(e) => tracing::warn!("mpv: {e}"),
-        }
-
-        // Start ffmpeg for video frames
-        match VideoDecoder::open(path, self.playback_speed) {
-            Ok((dec, tx)) => {
-                self.decoder = Some(dec);
-                self.command_tx = Some(tx);
-            }
-            Err(e) => tracing::error!("Video: {e}"),
-        }
-
-        tracing::info!("Loaded: {path}");
-    }
-
-    pub fn set_speed(&mut self, speed: f64) {
-        if (self.playback_speed - speed).abs() < 0.01 { return; }
-        self.playback_speed = speed;
-
-        // Update mpv speed
-        #[cfg(feature = "mpv")]
-        if let Some(ref a) = self.audio {
-            a.set_speed(speed);
-        }
-
-        // Restart video decoder with new speed
-        if let (Some(ref path), Some(d)) = (self.current_file.clone(), self.decoder.take()) {
-            d.stop();
-            self.command_tx.take();
-            let cur = self.ui.as_ref().map(|u| u.position).unwrap_or(0.0);
-            match VideoDecoder::open(path, speed) {
-                Ok((dec, tx)) => {
-                    if cur > 0.01 { let _ = tx.send(DecoderCommand::Seek(cur)); }
-                    self.decoder = Some(dec);
-                    self.command_tx = Some(tx);
-                }
-                Err(e) => tracing::error!("Speed: {e}"),
-            }
+    fn open_file(&mut self, path: &str) {
+        if let Err(e) = self.player.open(path) {
+            tracing::error!("Open failed: {e}");
         }
     }
 }
@@ -100,7 +50,7 @@ impl App {
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
-            .with_title("360° Video Player")
+            .with_title("Media Player")
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
         let renderer = pollster::block_on(Renderer::new(window.clone()));
@@ -108,22 +58,39 @@ impl ApplicationHandler for App {
         self.window = Some(window);
         self.renderer = Some(renderer);
         self.ui = Some(ui);
+
+        // Open file from command line if provided
+        if let Some(ref path) = self.pending_file.take() {
+            self.open_file(path);
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        if matches!(&event, WindowEvent::CloseRequested) { event_loop.exit(); return; }
+        self.input_seen = true;
 
-        if let WindowEvent::Resized(s) = &event {
-            if let Some(r) = &mut self.renderer { r.resize(s.width, s.height); r.update_camera_uniform(); }
+        // ── Lifecycle ──────────────────────────────────────────
+        if matches!(&event, WindowEvent::CloseRequested) {
+            event_loop.exit();
+            return;
         }
 
-        // MouseInput BEFORE egui
+        // ── Resize ─────────────────────────────────────────────
+        if let WindowEvent::Resized(s) = &event {
+            if let Some(r) = &mut self.renderer {
+                r.resize(s.width, s.height);
+                r.update_camera_uniform();
+            }
+        }
+
+        // ── Mouse input BEFORE egui (so drag works even over UI) ──
         if let WindowEvent::MouseInput { state, button: MouseButton::Left, .. } = &event {
             self.dragging = *state == ElementState::Pressed;
-            if !self.dragging { self.last_cursor = None; }
+            if !self.dragging {
+                self.last_cursor = None;
+            }
         }
 
-        // CursorMoved BEFORE egui
+        // ── Cursor movement BEFORE egui ────────────────────────
         if let WindowEvent::CursorMoved { position, .. } = &event {
             if self.dragging {
                 if let Some(r) = &mut self.renderer {
@@ -138,37 +105,33 @@ impl ApplicationHandler for App {
             self.last_cursor = Some(*position);
         }
 
+        // ── egui input ─────────────────────────────────────────
         let consumed = if let (Some(w), Some(r)) = (&self.window, &mut self.renderer) {
             r.egui_state.on_window_event(w, &event).consumed
-        } else { false };
+        } else {
+            false
+        };
 
-        if consumed { return; }
+        if consumed {
+            return;
+        }
 
+        // ── Keyboard shortcuts ─────────────────────────────────
         match event {
-            WindowEvent::MouseWheel { delta, .. } => {
-                if let Some(r) = &mut self.renderer {
-                    let s = match delta { MouseScrollDelta::LineDelta(_, y) => y, MouseScrollDelta::PixelDelta(p) => p.y as f32 / 10.0 };
-                    r.camera.handle_scroll(s); r.update_camera_uniform();
-                }
-            }
             WindowEvent::KeyboardInput {
-                event: KeyEvent { physical_key: PhysicalKey::Code(kc), state: ElementState::Pressed, .. }, ..
+                event: KeyEvent { physical_key: PhysicalKey::Code(kc), state: ElementState::Pressed, .. },
+                ..
             } => match kc {
                 KeyCode::KeyO => {
-                    if let Some(p) = rfd::FileDialog::new().add_filter("Video", &["mp4","webm","mkv","avi","mov","m4v"]).pick_file() {
+                    if let Some(p) = rfd::FileDialog::new()
+                        .add_filter("Video", &["mp4", "webm", "mkv", "avi", "mov", "m4v"])
+                        .pick_file()
+                    {
                         self.open_file(&p.to_string_lossy());
                     }
                 }
                 KeyCode::Space => {
-                    #[cfg(feature = "mpv")]
-                    if let Some(ref a) = self.audio {
-                        a.set_paused(!a.is_paused());
-                        // Also pause video
-                        if let Some(tx) = &self.command_tx {
-                            let cmd = if a.is_paused() { DecoderCommand::Pause } else { DecoderCommand::Resume };
-                            let _ = tx.send(cmd);
-                        }
-                    }
+                    self.player.play_pause();
                 }
                 KeyCode::Escape => event_loop.exit(),
                 _ => {}
@@ -177,106 +140,128 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn device_event(&mut self, _el: &ActiveEventLoop, _id: winit::event::DeviceId, _event: DeviceEvent) {}
+    fn device_event(&mut self, _el: &ActiveEventLoop, _id: winit::event::DeviceId, _event: winit::event::DeviceEvent) {}
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // --- Frame sync: mpv clock → video frames ---
-        #[cfg(feature = "mpv")]
-        let clock = self.audio.as_ref().map(|a| a.clock()).unwrap_or(
-            self.ui.as_ref().map(|u| u.position).unwrap_or(0.0)
-        );
-        #[cfg(not(feature = "mpv"))]
-        let clock = self.ui.as_ref().map(|u| u.position).unwrap_or(0.0);
+        // ── Receive latest video frame ──────────────────────────
+        // The upload happens inside render() (after surface acquire),
+        // so a failing surface can't leak staging buffers.
+        let mut frame_data: Option<(std::sync::Arc<Vec<u8>>, u32, u32)> = None;
+        let frame_uploaded = if let Some(frame) = self.player.try_recv_frame() {
+            frame_data = Some((frame.data, frame.width, frame.height));
+            true
+        } else {
+            false
+        };
 
-        if let Some(ref decoder) = self.decoder {
-            // Drain all frames, find the one closest to the clock
-            let mut best: Option<DecodedFrame> = None;
-            let mut best_diff = f64::MAX;
-            while let Ok(f) = decoder.frame_rx.try_recv() {
-                let pts = f.pts_secs;
-                let diff = (pts - clock).abs();
-                if diff < best_diff {
-                    best = Some(f);
-                    best_diff = diff;
-                }
-                // If we've gone past the clock, stop draining
-                if pts > clock + 0.1 { break; }
+        // ── Sync UI state from player (skip fields driven by UI) ──
+        let seeking = self.ui.as_ref().map(|u| u.seeking).unwrap_or(false);
+        if let Some(ref mut ui) = self.ui {
+            if !seeking {
+                ui.position = self.player.clock();
             }
-            if let Some(f) = best {
-                if let Some(r) = &mut self.renderer {
-                    r.update_video_texture(&f.data, f.width, f.height);
-                }
-                if let Some(ref mut ui) = self.ui { ui.position = f.pts_secs; }
-            }
+            ui.duration = self.player.duration();
+            ui.playing = self.player.is_playing();
+            ui.speed = self.player.speed();
         }
 
-        // --- UI state ---
-        #[cfg(feature = "mpv")]
-        let paused = self.audio.as_ref().map(|a| a.is_paused()).unwrap_or(true);
-        #[cfg(not(feature = "mpv"))]
-        let paused = self.decoder.as_ref().map(|d| d.paused.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(true);
-        let dur = self.decoder.as_ref().map(|d| d.duration_secs).unwrap_or(0.0);
+        let paused = self.player.is_paused();
 
+        // ── Gather UI actions ────────────────────────────────────
         let mut open_action = false;
         let mut seek_action: Option<f64> = None;
-        let mut pause_action: Option<bool> = None;
+        let mut pause_action = false;
         let mut speed_action: Option<f64> = None;
+        let mut volume_action: Option<f32> = None;
 
-        if let (Some(w), Some(r), Some(ui)) = (&self.window, &mut self.renderer, &mut self.ui) {
-            ui.playing = !paused;
-            ui.duration = dur;
-            ui.speed = self.playback_speed;
+        let renderer = &mut self.renderer;
+        if let (Some(w), Some(r), Some(ui)) = (&self.window, renderer, &mut self.ui) {
             r.is_360 = ui.is_360;
-            #[cfg(feature = "mpv")]
-            if let Some(ref a) = self.audio { a.set_volume(ui.volume); }
 
             let raw = r.egui_state.take_egui_input(w);
             r.egui_state.egui_ctx().begin_pass(raw);
             let out = ui.update();
             r.egui_state.handle_platform_output(w, out.platform_output.clone());
-            let prims = r.egui_state.egui_ctx().tessellate(out.shapes.clone(), out.pixels_per_point);
+            let prims = r.egui_state
+                .egui_ctx()
+                .tessellate(out.shapes.clone(), out.pixels_per_point);
 
-            open_action = ui.open_file_clicked; ui.open_file_clicked = false;
+            open_action = ui.open_file_clicked;
+            ui.open_file_clicked = false;
             seek_action = ui.seek_to.take();
-            if ui.speed_changed { ui.speed_changed = false; speed_action = Some(ui.speed); }
-            if ui.playing != !paused { pause_action = Some(!ui.playing); }
+            if ui.speed_changed {
+                ui.speed_changed = false;
+                speed_action = Some(ui.speed);
+            }
+            if ui.volume_changed {
+                ui.volume_changed = false;
+                volume_action = Some(ui.volume);
+            }
+            if ui.playing == paused {
+                pause_action = true;
+            }
 
-            if let Err(e) = r.render(&prims, &out.textures_delta, out.pixels_per_point) {
-                match e {
-                    wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => { let s = r.size; r.resize(s.0, s.1); }
-                    wgpu::SurfaceError::OutOfMemory => tracing::error!("OOM"),
-                    wgpu::SurfaceError::Timeout => {}
+            // ── Render (unless paused and nothing changed) ──────
+            // Playback advancing, UI interaction, egui needing a
+            // repaint, or a fresh frame all keep the loop at Poll; a
+            // static paused screen drops to Wait and renders on
+            // demand (near-zero CPU).
+            let interactive = self.input_seen
+                || self.dragging
+                || ui.seeking
+                || r.egui_state.egui_ctx().has_requested_repaint();
+            let at_end = self.player.duration() > 0.0
+                && self.player.clock() >= self.player.duration() - 0.05;
+            if (!paused && !at_end) || interactive || frame_uploaded {
+                _event_loop.set_control_flow(ControlFlow::Poll);
+                if let Err(e) = r.render(&prims, &out.textures_delta, out.pixels_per_point, frame_data.take()) {
+                    match e {
+                        wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
+                            let s = r.size;
+                            r.resize(s.0, s.1);
+                        }
+                        wgpu::SurfaceError::OutOfMemory => tracing::error!("GPU OOM"),
+                        wgpu::SurfaceError::Timeout => {}
+                    }
                 }
+            } else {
+                _event_loop.set_control_flow(ControlFlow::Wait);
             }
         } else if let Some(r) = &mut self.renderer {
-            if let Err(e) = r.render(&[], &egui::TexturesDelta::default(), 1.0) {
+            if let Err(e) = r.render(&[], &egui::TexturesDelta::default(), 1.0, None) {
                 match e {
-                    wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => { let s = r.size; r.resize(s.0, s.1); }
-                    wgpu::SurfaceError::OutOfMemory => tracing::error!("OOM"),
+                    wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
+                        let s = r.size;
+                        r.resize(s.0, s.1);
+                    }
+                    wgpu::SurfaceError::OutOfMemory => {}
                     wgpu::SurfaceError::Timeout => {}
                 }
             }
         }
 
-        // --- Apply actions ---
+        self.input_seen = false;
+
+        // ── Apply actions ────────────────────────────────────────
         if open_action {
-            if let Some(p) = rfd::FileDialog::new().add_filter("Video", &["mp4","webm","mkv","avi","mov","m4v"]).pick_file() {
+            if let Some(p) = rfd::FileDialog::new()
+                .add_filter("Video", &["mp4", "webm", "mkv", "avi", "mov", "m4v"])
+                .pick_file()
+            {
                 self.open_file(&p.to_string_lossy());
             }
         }
         if let Some(pos) = seek_action {
-            #[cfg(feature = "mpv")]
-            if let Some(ref a) = self.audio { a.seek(pos); }
-            if let Some(tx) = &self.command_tx { let _ = tx.send(DecoderCommand::Seek(pos)); }
+            self.player.seek(pos);
         }
-        if let Some(do_pause) = pause_action {
-            #[cfg(feature = "mpv")]
-            if let Some(ref a) = self.audio { a.set_paused(do_pause); }
-            if let Some(tx) = &self.command_tx {
-                let cmd = if do_pause { DecoderCommand::Pause } else { DecoderCommand::Resume };
-                let _ = tx.send(cmd);
-            }
+        if pause_action {
+            self.player.play_pause();
         }
-        if let Some(spd) = speed_action { self.set_speed(spd); }
+        if let Some(spd) = speed_action {
+            self.player.set_speed(spd);
+        }
+        if let Some(vol) = volume_action {
+            self.player.set_volume(vol);
+        }
     }
 }

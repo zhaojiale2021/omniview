@@ -7,7 +7,7 @@ edition = "2024"
 winit = "0.30"
 wgpu = "22"
 pollster = "0.4"
-libmpv = { version = "2", optional = true }
+cpal = "0.15"
 egui = "0.29"
 egui-winit = "0.29"
 egui-wgpu = "0.29"
@@ -17,7 +17,3 @@ bytemuck = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[features]
-default = ["mpv"]
-mpv = ["dep:libmpv"]
