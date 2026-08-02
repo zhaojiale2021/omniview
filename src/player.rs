@@ -47,6 +47,9 @@ pub struct Player {
     first_frame_logged: bool,
     /// Last time a frame was actually displayed (not just polled).
     last_display: Instant,
+    /// Last time a frame was received from the decoder channel (used by
+    /// the self-heal to detect a genuinely dead decoder).
+    last_recv: Instant,
     no_frame_warned: bool,
     /// Frames received from the decoder channel (displayed or dropped).
     frames_received: u64,
@@ -76,6 +79,7 @@ impl Player {
             last_pts: -1.0,
             first_frame_logged: false,
             last_display: Instant::now(),
+            last_recv: Instant::now(),
             no_frame_warned: false,
             frames_received: 0,
             last_recv_pts: -1.0,
@@ -178,16 +182,24 @@ impl Player {
     fn restart_at(&mut self, pos: f64) {
         let path = match self.file_path.clone() { Some(p) => p, _ => return };
         let pos = pos.clamp(0.0, self.duration_secs);
+        if let Some(ref mut a) = self.audio { a.restart(&path, self.speed, pos); a.set_volume(self.volume); }
+        self.restart_video_at(pos);
+    }
+
+    /// Reopen ONLY the video decoder at `pos` (audio untouched).  Used by
+    /// the self-heal so a video recovery doesn't restart/spawn ffmpeg
+    /// audio (no console window, no audio glitch).
+    fn restart_video_at(&mut self, pos: f64) {
+        let path = match self.file_path.clone() { Some(p) => p, _ => return };
+        let pos = pos.clamp(0.0, self.duration_secs);
         self.pending = None;
         self.last_pts = -1.0;
-        if let Some(ref mut a) = self.audio { a.restart(&path, self.speed, pos); a.set_volume(self.volume); }
         if let Some(old) = self.video.take() { old.stop(); }
         self.video_cmd = None;
         let (d, t) = VideoDecoder::open(&path, self.speed, pos);
         self.video = Some(d);
         self.video_cmd = Some(t);
-        // The clock resumes from the seek target; if we're paused, stay
-        // paused (a fresh decoder starts unpaused).
+        // The clock resumes from the target; if we're paused, stay paused.
         self.video_start = Some(Instant::now());
         self.video_start_pos = pos;
         if !self.playing {
@@ -197,16 +209,16 @@ impl Player {
         self.push_play_state();
         // A fresh decoder shouldn't count as a stalled one.
         self.last_display = Instant::now();
+        self.last_recv = Instant::now();
         self.heal_count = 0;
     }
 
-    /// Self-heal: if we're supposed to be playing but no frame has been
-    /// displayed for a while, the decoder/ffmpeg pipe may be stuck
-    /// (seen after pause-resume on some Windows builds).  Restart the
-    /// decoder at the current clock position.  Guarded to avoid loops.
+    /// Self-heal: restart the VIDEO decoder if we're playing but no
+    /// frames have been RECEIVED for a while (a genuinely dead/stuck
+    /// decoder).  A frame sitting in `pending` just ahead of the clock is
+    /// NOT a stall — frames are still arriving — so it never heals for
+    /// that, which previously restarted the audio every few seconds.
     fn maybe_heal_decoder(&mut self) {
-        // Right after a resume, recover quickly if the decoder stalled;
-        // otherwise use a more relaxed window.
         let stall = if self.resume_pending {
             Duration::from_millis(400)
         } else {
@@ -215,7 +227,7 @@ impl Player {
         if self.playing
             && self.duration_secs > 0.0
             && self.clock() < self.duration_secs - 5.0
-            && self.last_display.elapsed() > stall
+            && self.last_recv.elapsed() > stall
             && self.last_heal.elapsed() > Duration::from_secs(3)
             && self.heal_count < 5
         {
@@ -223,10 +235,10 @@ impl Player {
             self.last_heal = Instant::now();
             let pos = self.clock();
             tracing::warn!(
-                "Video frames stalled ({}s) — restarting decoder at {pos:.1}s",
-                self.last_display.elapsed().as_secs()
+                "No video frames for {}s — restarting decoder at {pos:.1}s",
+                self.last_recv.elapsed().as_secs()
             );
-            self.restart_at(pos);
+            self.restart_video_at(pos);
         }
     }
 
@@ -338,6 +350,7 @@ impl Player {
         if let Some(video) = &self.video {
             while let Ok(f) = video.frame_rx.try_recv() {
                 self.frames_received += 1;
+                self.last_recv = Instant::now();
                 self.last_recv_pts = f.pts_secs;
                 if f.pts_secs <= clock {
                     chosen = Some(f);

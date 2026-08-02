@@ -57,49 +57,25 @@ impl AudioPlayer {
             .ok_or("No audio output device")?;
         let dev_name = dev.name().unwrap_or_else(|_| "?".into());
 
-        // ── Choose the stream format from the DEVICE's native config ──
-        // WASAPI in shared mode is happiest when we match the device's
-        // own sample rate / channel count; forcing 48 kHz on a device
-        // that natively runs at another rate can leave the event-driven
-        // callback never firing.
-        let (sample_rate, channels) = match dev.default_output_config() {
-            Ok(cfg) => {
-                tracing::info!(
-                    "Audio output device: {dev_name} — native {} Hz, {} ch, {:?}",
-                    cfg.sample_rate().0,
-                    cfg.channels(),
-                    cfg.sample_format(),
-                );
-                (cfg.sample_rate().0, cfg.channels())
-            }
-            Err(e) => {
-                tracing::warn!("No native config for {dev_name} ({e}); using 48 kHz/2ch");
-                (DEFAULT_SAMPLE_RATE, DEFAULT_CHANNELS as u16)
-            }
-        };
-
-        let samples_per_sec = (sample_rate as u64) * (channels as u64);
-
+        // Shared output state.
         let shared = Arc::new(Shared {
             buffer: Mutex::new(VecDeque::new()),
             volume: Mutex::new(0.8),
             paused: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
-            samples_played: AtomicU64::new((seek * samples_per_sec as f64) as u64),
+            samples_played: AtomicU64::new(0), // set once the config is chosen
         });
 
         // ── cpal output stream ────────────────────────────────────
         // `BufferSize::Default` lets WASAPI pick a device-aligned buffer
         // size.  `Fixed(256)` can stall the callback on some devices.
-        let cfg = cpal::StreamConfig {
-            channels,
-            sample_rate: cpal::SampleRate(sample_rate),
-            buffer_size: cpal::BufferSize::Default,
-        };
-
-        let sh = shared.clone();
-        let stream = dev
-            .build_output_stream(
+        let build_stream = |rate: u32, ch: u16, sh: Arc<Shared>| -> Result<cpal::Stream, String> {
+            let cfg = cpal::StreamConfig {
+                channels: ch,
+                sample_rate: cpal::SampleRate(rate),
+                buffer_size: cpal::BufferSize::Default,
+            };
+            dev.build_output_stream(
                 &cfg,
                 move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
                     // NEVER panic in the audio callback: a panic here
@@ -124,7 +100,36 @@ impl AudioPlayer {
                 |e| tracing::error!("cpal: {e}"),
                 None,
             )
-            .map_err(|e| format!("cpal stream: {e}"))?;
+            .map_err(|e| format!("cpal stream: {e}"))
+        };
+
+        // Prefer a standard 48 kHz / 2ch stream (most reliable on all
+        // devices).  Only fall back to the device's native config (e.g.
+        // 192 kHz / 6 ch) if 48k/2ch isn't supported.
+        let (stream, sample_rate, channels) =
+            match build_stream(DEFAULT_SAMPLE_RATE, DEFAULT_CHANNELS as u16, shared.clone()) {
+                Ok(s) => {
+                    tracing::info!("Audio output: {dev_name} — 48 kHz / 2 ch");
+                    (s, DEFAULT_SAMPLE_RATE, DEFAULT_CHANNELS as u16)
+                }
+                Err(e) => {
+                    tracing::warn!("48 kHz/2ch failed ({e}); trying device native config");
+                    let (r, c) = match dev.default_output_config() {
+                        Ok(cfg) => (cfg.sample_rate().0, cfg.channels()),
+                        Err(e2) => {
+                            tracing::warn!("no native config ({e2}); using 48 kHz/2ch");
+                            (DEFAULT_SAMPLE_RATE, DEFAULT_CHANNELS as u16)
+                        }
+                    };
+                    tracing::info!("Audio output: {dev_name} — {r} Hz / {c} ch (native)");
+                    (build_stream(r, c, shared.clone())?, r, c)
+                }
+            };
+
+        let samples_per_sec = (sample_rate as u64) * (channels as u64);
+        shared
+            .samples_played
+            .store((seek * samples_per_sec as f64) as u64, Ordering::Relaxed);
 
         stream.play().map_err(|e| format!("cpal play: {e}"))?;
 
@@ -250,11 +255,17 @@ fn run_reader(
         "-".into(),
     ]);
 
-    let mut child = match Command::new("ffmpeg")
-        .args(&args)
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(&args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    // Don't pop a console window when ffmpeg.exe launches (GUI app).
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = match cmd.spawn()
     {
         Ok(c) => c,
         Err(e) => {
