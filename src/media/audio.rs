@@ -86,11 +86,11 @@ impl AudioPipeline {
                     move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
                         // NEVER panic in the callback.
                         let n = data.len() as u64;
-                        sh.samples_played.fetch_add(n, Ordering::Relaxed);
                         if sh.paused.load(Ordering::Relaxed) {
                             data.fill(0.0);
-                            return;
+                            return; // do NOT advance samples_played — pause freezes the master clock
                         }
+                        sh.samples_played.fetch_add(n, Ordering::Relaxed);
                         let vol = sh.volume.lock().map(|v| *v).unwrap_or(1.0);
                         match sh.buffer.lock() {
                             Ok(mut buf) => {
@@ -363,9 +363,9 @@ fn decode_audio_packets(
                                     }
                                 }
                             }
+                            Ok(AudioCmd::Pause(true)) => {} // already paused — no-op
                             Ok(AudioCmd::Volume(_)) => {} // applied in cpal callback
                             Err(mpsc::RecvError) => return Ok(()),
-                            _ => {} // ignore other
                         }
                     }
                 }
