@@ -169,21 +169,32 @@ fn decode_loop(
 
     let mut packets = input.packets();
     'outer: loop {
-        // Process commands.
-        while let Ok(cmd) = command_rx.try_recv() {
-            match cmd {
-                DecoderCmd::Stop => {
+        // Process commands.  A disconnected command channel (all senders
+        // dropped) is an implicit stop: the caller can't send Stop any
+        // more, and dropping `frame_rx` alone is not detected while
+        // paused (no frames are sent then), so the thread would leak.
+        loop {
+            match command_rx.try_recv() {
+                Ok(cmd) => match cmd {
+                    DecoderCmd::Stop => {
+                        stopped.store(true, Ordering::Relaxed);
+                        break 'outer;
+                    }
+                    DecoderCmd::Pause => paused.store(true, Ordering::Relaxed),
+                    DecoderCmd::Resume => {
+                        paused.store(false, Ordering::Relaxed);
+                        // Restart the pacing clock on resume: after a
+                        // long pause the old schedule is far in the
+                        // past, which would make the decoder flood
+                        // frames to catch up.
+                        next_frame_at = std::time::Instant::now();
+                    }
+                },
+                Err(mpsc::TryRecvError::Disconnected) => {
                     stopped.store(true, Ordering::Relaxed);
                     break 'outer;
                 }
-                DecoderCmd::Pause => paused.store(true, Ordering::Relaxed),
-                DecoderCmd::Resume => {
-                    paused.store(false, Ordering::Relaxed);
-                    // Restart the pacing clock on resume: after a long
-                    // pause the old schedule is far in the past, which
-                    // would make the decoder flood frames to catch up.
-                    next_frame_at = std::time::Instant::now();
-                }
+                Err(mpsc::TryRecvError::Empty) => break,
             }
         }
         if stopped.load(Ordering::Relaxed) {
@@ -217,14 +228,23 @@ fn decode_loop(
         let mut decoded = frame::Video::empty();
         while decoder.receive_frame(&mut decoded).is_ok() {
             // A pause/stop may have arrived while frames were buffered.
-            while let Ok(cmd) = command_rx.try_recv() {
-                match cmd {
-                    DecoderCmd::Stop => {
+            // Disconnect (all senders dropped) is an implicit stop, as
+            // in the outer command-drain loop.
+            loop {
+                match command_rx.try_recv() {
+                    Ok(cmd) => match cmd {
+                        DecoderCmd::Stop => {
+                            stopped.store(true, Ordering::Relaxed);
+                            break 'outer;
+                        }
+                        DecoderCmd::Pause => paused.store(true, Ordering::Relaxed),
+                        DecoderCmd::Resume => paused.store(false, Ordering::Relaxed),
+                    },
+                    Err(mpsc::TryRecvError::Disconnected) => {
                         stopped.store(true, Ordering::Relaxed);
                         break 'outer;
                     }
-                    DecoderCmd::Pause => paused.store(true, Ordering::Relaxed),
-                    DecoderCmd::Resume => paused.store(false, Ordering::Relaxed),
+                    Err(mpsc::TryRecvError::Empty) => break,
                 }
             }
             if stopped.load(Ordering::Relaxed) {
@@ -308,5 +328,23 @@ mod tests {
         let f = f.expect("decoder should produce a frame within 5s");
         assert_eq!(f.data.len(), (f.width * f.height * 4) as usize);
         assert!(f.pts_secs >= 0.0);
+
+        // A second frame must arrive with a non-decreasing PTS — the
+        // `in_order` in the test name should mean something.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut f2 = None;
+        while f2.is_none() && std::time::Instant::now() < deadline {
+            f2 = dec.recv();
+            if f2.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        let f2 = f2.expect("decoder should produce a second frame within 5s");
+        assert!(
+            f2.pts_secs >= f.pts_secs,
+            "PTS should be non-decreasing: {} then {}",
+            f.pts_secs,
+            f2.pts_secs
+        );
     }
 }
