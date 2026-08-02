@@ -5,6 +5,7 @@
 mod app;
 mod audio;
 mod decoder;
+mod media;
 mod player;
 mod renderer;
 mod ui;
