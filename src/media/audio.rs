@@ -58,13 +58,19 @@ impl AudioPipeline {
     /// `pkt_rx` receives packets from the demuxer (Task 4).
     /// `start_pos` seeds the audio master clock so `position()` is correct
     /// after open/seek.
+    ///
+    /// Returns the packet receiver back on failure so the caller can keep the
+    /// demux alive (e.g. by spawning a discard-drain thread for video-only).
     pub fn start(
         path: &str,
         dev: &cpal::Device,
         pkt_rx: mpsc::Receiver<Packet>,
         start_pos: f64,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, (String, mpsc::Receiver<Packet>)> {
         let dev_name = dev.name().unwrap_or_else(|_| "?".into());
+
+        // Wrap so we can return it on error paths.
+        let mut pkt_rx = Some(pkt_rx);
 
         // ── Shared state ──────────────────────────────────────────
         // samples_played is seeded after we determine sample_rate/channels.
@@ -128,7 +134,16 @@ impl AudioPipeline {
                         }
                     };
                     tracing::info!("Audio output: {dev_name} — {r} Hz / {c} ch (native)");
-                    (build_stream(r, c, shared.clone())?, r, c)
+                    let s = match build_stream(r, c, shared.clone()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return Err((
+                                format!("cpal stream: {e}"),
+                                pkt_rx.take().unwrap(),
+                            ));
+                        }
+                    };
+                    (s, r, c)
                 }
             };
 
@@ -138,7 +153,10 @@ impl AudioPipeline {
             (start_pos * sample_rate as f64 * channels as f64) as u64;
         samples_played.store(initial_offset, Ordering::Relaxed);
 
-        stream.play().map_err(|e| format!("cpal play: {e}"))?;
+        stream.play().map_err(|e| {
+            let msg = format!("cpal play: {e}");
+            (msg, pkt_rx.take().unwrap())
+        })?;
 
         // ── Command channel ───────────────────────────────────────
         let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCmd>();
@@ -178,10 +196,11 @@ impl AudioPipeline {
         let spawn_rate = sample_rate;
         let spawn_channels = channels;
 
+        let rx = pkt_rx.take().unwrap();
         let decoder_thread = thread::spawn(move || {
             if let Err(e) = decode_audio_packets(
                 &path_owned,
-                pkt_rx,
+                rx,
                 cmd_rx,
                 spawn_rate,
                 spawn_channels,

@@ -67,6 +67,12 @@ impl PlaybackController {
         self.state == PlaybackState::Paused
     }
 
+    /// Whether an audio track is present and the pipeline is delivering
+    /// audio output (false on WSL2 or when audio init failed).
+    pub fn has_audio(&self) -> bool {
+        self.has_audio
+    }
+
     /// Apply a command: validate, drive the pipeline, and update state.
     pub fn apply(&mut self, cmd: Command) -> Result<(), String> {
         match cmd {
@@ -136,6 +142,9 @@ impl PlaybackController {
         self.state = PlaybackState::Loading;
 
         self.open_pipeline(path, 0.0)?;
+        // Re-apply stored speed/volume to the fresh decoders.
+        self.do_set_speed(self.speed)?;
+        self.do_set_volume(self.volume)?;
 
         self.state = PlaybackState::Ready;
         Ok(())
@@ -221,9 +230,13 @@ impl PlaybackController {
         };
 
         self.open_pipeline(&path, clamped)?;
+        // Re-apply stored speed/volume to the fresh decoders.
+        self.do_set_speed(self.speed)?;
+        self.do_set_volume(self.volume)?;
 
         // Restore play/pause state after the restart.
         if was_playing {
+            self.clock.play(self.position());
             self.state = PlaybackState::Playing;
         } else {
             self.state = PlaybackState::Paused;
@@ -326,9 +339,16 @@ impl PlaybackController {
                     self.has_audio = true;
                     Some(a)
                 }
-                Err(e) => {
+                Err((e, rx)) => {
                     tracing::warn!("Audio pipeline failed: {e}; proceeding video-only");
+                    // Drain audio packets so the demux doesn't block.
                     self.has_audio = false;
+                    let handle = thread::spawn(move || {
+                        while rx.recv().is_ok() {
+                            // discard
+                        }
+                    });
+                    self.audio_discard = Some(handle);
                     None
                 }
             }

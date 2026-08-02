@@ -403,6 +403,10 @@ fn decode_packets_loop(
     };
     let (width, height) = (decoder.width(), decoder.height());
 
+    // The input context was only needed for stream params — drop it so
+    // the file descriptor is not held for the thread's lifetime.
+    drop(input);
+
     let mut scaler = match software::scaling::Context::get(
         decoder.format(),
         width,
