@@ -6,10 +6,16 @@
 //! ffmpeg and routing them by stream index.  Commands (Seek, Stop) are
 //! drained via `try_recv` each iteration so they are never blocked by a
 //! full packet channel.
+//!
+//! When a packet channel is full (e.g. paused decoder), the demux **holds**
+//! the current packet, keeps draining commands, sleeps briefly, and retries
+//! the send — it does NOT exit.  The thread only exits on EOF, a `Stop`
+//! command, or a disconnected receiver.  A `Seek` command while holding a
+//! packet discards it (stale) and resumes reading from the seek target.
 
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ffmpeg_next as ffmpeg;
 use ffmpeg_next::{format, media};
@@ -102,32 +108,6 @@ impl Demux {
     /// Ask the demux thread to stop.
     pub fn stop(&self) {
         let _ = self.cmd_tx.send(DemuxCmd::Stop);
-    }
-}
-
-// ── Helpers ─────────────────────────────────────────────────────────
-
-/// Emulates `SyncSender::send_timeout` (unstable) using `try_send` with
-/// a retry loop.  Returns `Ok(())` on success or `Err(val)` on timeout /
-/// disconnect.
-fn send_timeout<T>(
-    tx: &mpsc::SyncSender<T>,
-    mut val: T,
-    timeout: Duration,
-) -> Result<(), T> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match tx.try_send(val) {
-            Ok(()) => return Ok(()),
-            Err(mpsc::TrySendError::Full(v)) => {
-                val = v;
-                if Instant::now() >= deadline {
-                    return Err(val);
-                }
-                thread::sleep(Duration::from_millis(1));
-            }
-            Err(mpsc::TrySendError::Disconnected(v)) => return Err(v),
-        }
     }
 }
 
@@ -278,38 +258,58 @@ fn demux_loop(
 
         let stream_index = stream.index();
 
-        // (3) Route to the appropriate channel with a 50 ms timeout.
-        //     `send_timeout` retries via try_send so the thread never
-        //     blocks indefinitely on a full channel (paused decoder).
-        if Some(stream_index) == video_stream_index {
-            if send_timeout(&video_pkt_tx, packet, Duration::from_millis(50)).is_err() {
-                break 'outer;
-            }
-        } else if Some(stream_index) == audio_stream_index {
-            if send_timeout(&audio_pkt_tx, packet, Duration::from_millis(50)).is_err() {
-                break 'outer;
-            }
-        }
+        // Select the target channel for this packet.
+        let tx: &mpsc::SyncSender<ffmpeg::Packet> =
+            if Some(stream_index) == video_stream_index {
+                &video_pkt_tx
+            } else if Some(stream_index) == audio_stream_index {
+                &audio_pkt_tx
+            } else {
+                continue; // skip non-A/V streams
+            };
 
-        // (4) Drain commands AFTER the send as well (catches commands that
-        //     arrived while send_timeout was retrying).
+        // (3) Send with retry.  When the channel is full (paused
+        //     decoder), HOLD the packet and drain commands so that
+        //     Seek/Stop stay responsive.  Only exit on Disconnected,
+        //     Stop, or EOF — a full channel is normal during pause.
+        let mut pkt = packet;
         loop {
-            match cmd_rx.try_recv() {
-                Ok(DemuxCmd::Stop) => break 'outer,
-                Ok(DemuxCmd::Seek(pos)) => {
-                    let ts = (pos * 1_000_000.0) as i64;
-                    unsafe {
-                        ffmpeg::ffi::av_seek_frame(
-                            input.as_mut_ptr(),
-                            -1,
-                            ts,
-                            ffmpeg::ffi::AVSEEK_FLAG_BACKWARD as i32,
-                        );
+            match tx.try_send(pkt) {
+                Ok(()) => break, // sent — go read next packet
+                Err(mpsc::TrySendError::Full(p)) => {
+                    pkt = p; // hold the packet
+                    // Drain commands while waiting for channel space.
+                    let mut seeked = false;
+                    loop {
+                        match cmd_rx.try_recv() {
+                            Ok(DemuxCmd::Stop) => break 'outer,
+                            Ok(DemuxCmd::Seek(pos)) => {
+                                let ts = (pos * 1_000_000.0) as i64;
+                                unsafe {
+                                    ffmpeg::ffi::av_seek_frame(
+                                        input.as_mut_ptr(),
+                                        -1,
+                                        ts,
+                                        ffmpeg::ffi::AVSEEK_FLAG_BACKWARD as i32,
+                                    );
+                                }
+                                packets = input.packets();
+                                seeked = true;
+                                break; // exit inner command-drain loop
+                            }
+                            Err(mpsc::TryRecvError::Empty) => break,
+                            Err(mpsc::TryRecvError::Disconnected) => break 'outer,
+                        }
                     }
-                    packets = input.packets();
+                    if seeked {
+                        // Held packet is stale after seek — drop it and
+                        // resume reading from the new position.
+                        continue 'outer;
+                    }
+                    // Brief sleep, then retry the send.
+                    thread::sleep(Duration::from_millis(1));
                 }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => break 'outer,
+                Err(mpsc::TrySendError::Disconnected(_)) => break 'outer,
             }
         }
     }
