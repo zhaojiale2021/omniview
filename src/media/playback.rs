@@ -73,6 +73,14 @@ impl PlaybackController {
         self.has_audio
     }
 
+    pub fn speed(&self) -> f64 {
+        self.speed
+    }
+
+    pub fn file_path(&self) -> Option<&str> {
+        self.file_path.as_deref()
+    }
+
     /// Apply a command: validate, drive the pipeline, and update state.
     pub fn apply(&mut self, cmd: Command) -> Result<(), String> {
         match cmd {

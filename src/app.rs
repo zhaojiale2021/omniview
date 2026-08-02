@@ -11,7 +11,8 @@ use winit::{
     window::{Window, WindowId},
 };
 
-use crate::player::Player;
+use crate::media::playback::PlaybackController;
+use crate::media::types::{Command, PlaybackState};
 use crate::renderer::Renderer;
 use crate::ui::PlayerUI;
 
@@ -27,7 +28,7 @@ const STATE_SAVE_INTERVAL: Duration = Duration::from_secs(5);
 pub struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
-    player: Player,
+    ctl: PlaybackController,
     ui: Option<PlayerUI>,
     dragging: bool,
     last_cursor: Option<PhysicalPosition<f64>>,
@@ -46,6 +47,9 @@ pub struct App {
 
     // ── Screenshots ────────────────────────────────────────────
     shot_dir: PathBuf,
+
+    // ── One-shot error logging ─────────────────────────────────
+    error_logged: bool,
 }
 
 impl App {
@@ -53,7 +57,7 @@ impl App {
         Self {
             window: None,
             renderer: None,
-            player: Player::new(),
+            ctl: PlaybackController::new(),
             ui: None,
             dragging: false,
             last_cursor: None,
@@ -64,17 +68,21 @@ impl App {
             state_path: PathBuf::from("player_state.json"),
             last_state_save: Instant::now(),
             shot_dir: PathBuf::from("."),
+            error_logged: false,
         }
     }
 
     fn open_file(&mut self, path: &str) {
-        if let Err(e) = self.player.open(path) {
+        if let Err(e) = self.ctl.apply(Command::Open(path.into())) {
             tracing::error!("Open failed: {e}");
             return;
         }
+        // Auto-play to preserve the old UX (opening a file started playback).
+        let _ = self.ctl.apply(Command::Play);
+        // Restore the resume position if we have one.
         if let Some(&pos) = self.state.get(path) {
             tracing::info!("Resuming from {pos:.1}s");
-            self.player.seek(pos);
+            let _ = self.ctl.apply(Command::Seek(pos));
         }
     }
 
@@ -87,11 +95,6 @@ impl App {
             }
         }
         self.last_input = Instant::now();
-    }
-
-    fn seek_relative(&mut self, delta: f64) {
-        let pos = (self.player.clock() + delta).clamp(0.0, self.player.duration());
-        self.player.seek(pos);
     }
 
     fn screenshot(&mut self) {
@@ -121,11 +124,11 @@ impl App {
     /// Persist the current playback position so the next session can
     /// resume.  Skips positions near the start/end.
     fn save_state(&mut self) {
-        let Some(path) = self.player.file_path().map(|s| s.to_string()) else {
+        let Some(path) = self.ctl.file_path().map(|s| s.to_string()) else {
             return;
         };
-        let pos = self.player.clock();
-        let dur = self.player.duration();
+        let pos = self.ctl.position();
+        let dur = self.ctl.duration();
         if pos > 5.0 && dur > 10.0 && pos < dur - 5.0 {
             self.state.insert(path.clone(), pos);
             if self.state.len() > 30 {
@@ -260,7 +263,7 @@ impl ApplicationHandler for App {
                     }
                 }
                 KeyCode::Space => {
-                    self.player.play_pause();
+                    let _ = self.ctl.apply(Command::Toggle);
                 }
                 KeyCode::KeyF => {
                     self.toggle_fullscreen();
@@ -279,19 +282,25 @@ impl ApplicationHandler for App {
                         ui.mute_clicked = true;
                     }
                 }
-                KeyCode::ArrowLeft => self.seek_relative(-SEEK_STEP),
-                KeyCode::ArrowRight => self.seek_relative(SEEK_STEP),
+                KeyCode::ArrowLeft => {
+                    let pos = (self.ctl.position() - SEEK_STEP).clamp(0.0, self.ctl.duration());
+                    let _ = self.ctl.apply(Command::Seek(pos));
+                }
+                KeyCode::ArrowRight => {
+                    let pos = (self.ctl.position() + SEEK_STEP).clamp(0.0, self.ctl.duration());
+                    let _ = self.ctl.apply(Command::Seek(pos));
+                }
                 KeyCode::ArrowUp => {
-                    let v = (self.player.volume() + VOLUME_STEP).min(1.0);
-                    self.player.set_volume(v);
+                    let v = (self.ctl.volume() + VOLUME_STEP).min(1.0);
+                    let _ = self.ctl.apply(Command::SetVolume(v));
                     if let Some(ref mut ui) = self.ui {
                         ui.volume = v;
                         if v > 0.0 { ui.muted = false; }
                     }
                 }
                 KeyCode::ArrowDown => {
-                    let v = (self.player.volume() - VOLUME_STEP).max(0.0);
-                    self.player.set_volume(v);
+                    let v = (self.ctl.volume() - VOLUME_STEP).max(0.0);
+                    let _ = self.ctl.apply(Command::SetVolume(v));
                     if let Some(ref mut ui) = self.ui {
                         ui.volume = v;
                         if v <= 0.001 { ui.muted = true; }
@@ -319,25 +328,35 @@ impl ApplicationHandler for App {
         // The upload happens inside render() (after surface acquire),
         // so a failing surface can't leak staging buffers.
         let mut frame_data: Option<(std::sync::Arc<Vec<u8>>, u32, u32)> = None;
-        let frame_uploaded = if let Some(frame) = self.player.try_recv_frame() {
+        let frame_uploaded = if let Some(frame) = self.ctl.next_video_frame() {
             frame_data = Some((frame.data, frame.width, frame.height));
             true
         } else {
             false
         };
 
-        // ── Sync UI state from player (skip fields driven by UI) ──
+        // ── Sync UI state from controller (skip fields driven by UI) ──
         let seeking = self.ui.as_ref().map(|u| u.seeking).unwrap_or(false);
         if let Some(ref mut ui) = self.ui {
             if !seeking {
-                ui.position = self.player.clock();
+                ui.position = self.ctl.position();
             }
-            ui.duration = self.player.duration();
-            ui.playing = self.player.is_playing();
-            ui.speed = self.player.speed();
+            ui.duration = self.ctl.duration();
+            ui.playing = !self.ctl.paused();
+            ui.speed = self.ctl.speed();
         }
 
-        let paused = self.player.is_paused();
+        let paused = self.ctl.paused();
+
+        // ── Error surfacing (one-shot) ────────────────────────────
+        if let PlaybackState::Error(msg) = self.ctl.state() {
+            if !self.error_logged {
+                tracing::error!("Playback error: {msg}");
+                self.error_logged = true;
+            }
+        } else {
+            self.error_logged = false;
+        }
 
         // ── Fullscreen auto-hide ─────────────────────────────────
         // Bars hide in fullscreen after UI_HIDE_DELAY without input
@@ -402,8 +421,8 @@ impl ApplicationHandler for App {
                 || self.dragging
                 || ui.seeking
                 || r.egui_state.egui_ctx().has_requested_repaint();
-            let at_end = self.player.duration() > 0.0
-                && self.player.clock() >= self.player.duration() - 0.05;
+            let at_end = self.ctl.duration() > 0.0
+                && self.ctl.position() >= self.ctl.duration() - 0.05;
             if (!paused && !at_end) || interactive || frame_uploaded {
                 _event_loop.set_control_flow(ControlFlow::Poll);
                 if let Err(e) = r.render(&prims, &out.textures_delta, out.pixels_per_point, frame_data.take()) {
@@ -447,16 +466,16 @@ impl ApplicationHandler for App {
             self.toggle_fullscreen();
         }
         if let Some(pos) = seek_action {
-            self.player.seek(pos);
+            let _ = self.ctl.apply(Command::Seek(pos));
         }
         if pause_action {
-            self.player.play_pause();
+            let _ = self.ctl.apply(Command::Toggle);
         }
         if let Some(spd) = speed_action {
-            self.player.set_speed(spd);
+            let _ = self.ctl.apply(Command::SetSpeed(spd));
         }
         if let Some(vol) = volume_action {
-            self.player.set_volume(vol);
+            let _ = self.ctl.apply(Command::SetVolume(vol));
         }
 
         // ── Persist resume position periodically ─────────────────
