@@ -56,14 +56,18 @@ impl AudioPipeline {
     /// `path` is the media file (opened inside the decode thread to read
     /// codec parameters).  `dev` is the cpal output device.
     /// `pkt_rx` receives packets from the demuxer (Task 4).
+    /// `start_pos` seeds the audio master clock so `position()` is correct
+    /// after open/seek.
     pub fn start(
         path: &str,
         dev: &cpal::Device,
         pkt_rx: mpsc::Receiver<Packet>,
+        start_pos: f64,
     ) -> Result<Self, String> {
         let dev_name = dev.name().unwrap_or_else(|_| "?".into());
 
         // ── Shared state ──────────────────────────────────────────
+        // samples_played is seeded after we determine sample_rate/channels.
         let samples_played = Arc::new(AtomicU64::new(0));
         let shared = Arc::new(Shared {
             buffer: Mutex::new(VecDeque::new()),
@@ -127,6 +131,12 @@ impl AudioPipeline {
                     (build_stream(r, c, shared.clone())?, r, c)
                 }
             };
+
+        // Seed the audio master clock so position() starts at `start_pos`.
+        // speed is 1.0 at construction time.
+        let initial_offset =
+            (start_pos * sample_rate as f64 * channels as f64) as u64;
+        samples_played.store(initial_offset, Ordering::Relaxed);
 
         stream.play().map_err(|e| format!("cpal play: {e}"))?;
 
