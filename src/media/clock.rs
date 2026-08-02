@@ -17,10 +17,12 @@ impl MediaClock {
     }
     pub fn set_speed(&mut self, speed: f64) {
         if (self.speed - speed).abs() < 0.01 { return; }
-        let pos = self.position();
         self.speed = speed;
-        self.start = Some(Instant::now());
-        self.start_pos = pos;
+        if self.playing {
+            let pos = self.position();
+            self.start = Some(Instant::now());
+            self.start_pos = pos;
+        }
     }
     pub fn play(&mut self, pos: f64) {
         self.playing = true;
@@ -41,8 +43,10 @@ impl MediaClock {
     pub fn speed(&self) -> f64 { self.speed }
     pub fn reset(&mut self, pos: f64) {
         self.paused_pos = pos;
-        self.start = Some(Instant::now());
-        self.start_pos = pos;
+        if self.playing {
+            self.start = Some(Instant::now());
+            self.start_pos = pos;
+        }
     }
 }
 
@@ -61,7 +65,7 @@ mod tests {
         assert!((c.position() - p).abs() < 0.02);
     }
     #[test]
-    fn speed_scales_position() {
+    fn clock_speed_scales_position() {
         let mut c = MediaClock::new();
         c.play(0.0);
         std::thread::sleep(Duration::from_millis(100));
