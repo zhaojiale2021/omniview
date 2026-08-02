@@ -17,9 +17,9 @@ impl MediaClock {
     }
     pub fn set_speed(&mut self, speed: f64) {
         if (self.speed - speed).abs() < 0.01 { return; }
+        let pos = self.position(); // position at the OLD speed — continuity
         self.speed = speed;
         if self.playing {
-            let pos = self.position();
             self.start = Some(Instant::now());
             self.start_pos = pos;
         }
