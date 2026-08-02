@@ -6,3 +6,5 @@ registry = "sparse+https://rsproxy.cn/index/"
 
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-g++"
+# For the Windows cross-compile, FFmpeg comes from the prebuilt mingw
+# libs in third_party/ffmpeg-win64 — set FFMPEG_DIR (see build-win.sh).

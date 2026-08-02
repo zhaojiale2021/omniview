@@ -45,6 +45,16 @@ pub struct Renderer {
     pub camera: OrbitCamera,
     pub egui_state: egui_winit::State,
     pub egui_renderer: egui_wgpu::Renderer,
+
+    // ── Debug self-capture (env CAPTURE_PNG=<path>) ─────────────
+    // Reads the backbuffer back to CPU every ~20 frames and writes a
+    // PPM at <path>_<frame>.ppm, so the UI can be verified without a
+    // screen grabber.  No-op when the env var is unset.
+    capture_path: Option<String>,
+    capture_staging: Option<wgpu::Buffer>,
+    capture_counter: u32,
+    /// Buffer used for on-demand screenshot readbacks.
+    png_staging: Option<wgpu::Buffer>,
 }
 
 impl Renderer {
@@ -75,8 +85,14 @@ impl Renderer {
         let caps = surface.get_capabilities(&adapter);
         let format = caps.formats.iter().copied()
             .find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
+        // Debug self-capture: needs COPY_SRC on the surface texture.
+        let capture_path = std::env::var("CAPTURE_PNG").ok();
+        let mut usage = TextureUsages::RENDER_ATTACHMENT;
+        if capture_path.is_some() && caps.usages.contains(TextureUsages::COPY_SRC) {
+            usage |= TextureUsages::COPY_SRC;
+        }
         let config = wgpu::SurfaceConfiguration {
-            usage: TextureUsages::RENDER_ATTACHMENT,
+            usage,
             format,
             width: size.width.max(1),
             height: size.height.max(1),
@@ -295,6 +311,17 @@ impl Renderer {
             &device, config.format, None, 1, false,
         );
 
+        let capture_staging = if capture_path.is_some() {
+            Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Capture Staging"),
+                size: (config.width as u64) * (config.height as u64) * 4,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }))
+        } else {
+            None
+        };
+
         Self {
             surface, device, queue, config, size: (size.width, size.height),
             sphere, render_pipeline, quad, quad_pipeline, is_360: false,
@@ -303,6 +330,10 @@ impl Renderer {
             video_texture: None, video_texture_view: None, video_bind_group: None,
             placeholder_bind_group, camera,
             egui_state, egui_renderer,
+            capture_path,
+            capture_staging,
+            capture_counter: 0,
+            png_staging: None,
         }
     }
 
@@ -347,7 +378,8 @@ impl Renderer {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                // COPY_SRC lets us read the frame back for screenshots.
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
             let view = texture.create_view(&Default::default());
@@ -487,12 +519,123 @@ impl Renderer {
             );
         }
 
+        // Debug self-capture: copy the backbuffer into a staging buffer
+        // every ~20 frames, read it back after present, save a PPM.
+        let capture_now = self.capture_path.is_some()
+            && self.capture_staging.is_some()
+            && {
+                self.capture_counter += 1;
+                self.capture_counter % 20 == 0
+            };
+        if capture_now {
+            if let (Some(staging), Some(_)) = (&self.capture_staging, &self.capture_path) {
+                encoder.copy_texture_to_buffer(
+                    wgpu::ImageCopyTexture {
+                        texture: &output.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::ImageCopyBuffer {
+                        buffer: staging,
+                        layout: wgpu::ImageDataLayout {
+                            offset: 0,
+                            bytes_per_row: Some(4 * self.size.0),
+                            rows_per_image: Some(self.size.1),
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width: self.size.0,
+                        height: self.size.1,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
+
         self.queue.submit(extra_cbs.into_iter().chain(std::iter::once(encoder.finish())));
         output.present();
+
+        if capture_now {
+            if let (Some(staging), Some(path)) = (&self.capture_staging, &self.capture_path) {
+                let slice = staging.slice(..);
+                let (tx, rx) = std::sync::mpsc::channel();
+                slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+                self.device.poll(wgpu::Maintain::Wait);
+                if rx.recv().is_ok() {
+                    let data = slice.get_mapped_range();
+                    let (w, h) = (self.size.0, self.size.1);
+                    let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+                    for px in data.chunks_exact(4) {
+                        ppm.extend_from_slice(&px[..3]);
+                    }
+                    let p = format!("{path}_{}", self.capture_counter);
+                    let _ = std::fs::write(&p, ppm);
+                    tracing::info!("Captured UI frame to {p}");
+                }
+                staging.unmap();
+            }
+        }
+
         Ok(())
     }
 
     pub fn egui_ctx(&self) -> egui::Context {
         self.egui_state.egui_ctx().clone()
+    }
+
+    /// Save the current video frame (no UI) as a PNG.  Returns false if
+    /// there is no frame yet.  Blocks briefly for the GPU readback.
+    pub fn save_frame_png(&mut self, path: &str) -> bool {
+        let Some(tex) = &self.video_texture else {
+            return false;
+        };
+        let (w, h) = (tex.width(), tex.height());
+        let size = (w as u64) * (h as u64) * 4;
+
+        if self.png_staging.as_ref().map(|b| b.size() != size).unwrap_or(true) {
+            self.png_staging = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("PNG Staging"),
+                size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }));
+        }
+        let staging = self.png_staging.as_ref().unwrap();
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("PNG Encoder"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: staging,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * w),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.queue.submit([encoder.finish()]);
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        self.device.poll(wgpu::Maintain::Wait);
+        if rx.recv().is_err() {
+            return false;
+        }
+        let data = slice.get_mapped_range();
+        let ok = image::save_buffer(path, &data, w, h, image::ColorType::Rgba8).is_ok();
+        drop(data);
+        staging.unmap();
+        ok
     }
 }

@@ -8,6 +8,11 @@ winit = "0.30"
 wgpu = "22"
 pollster = "0.4"
 cpal = "0.15"
+# In-process video decoding (replaces the ffmpeg-CLI pipe — gives true
+# pause/resume like native players).  Version tracks FFmpeg major: 8.x.
+# device/filter are not used (and pull in huge dependency chains on the
+# bundled-Windows-DLL build), so they are disabled.
+ffmpeg-next = { version = "8.0", default-features = false, features = ["codec", "format", "software-scaling"] }
 egui = "0.29"
 egui-winit = "0.29"
 egui-wgpu = "0.29"
@@ -15,5 +20,7 @@ rfd = "0.15"
 glam = "0.29"
 bytemuck = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Screenshot → PNG
+image = { version = "0.25", default-features = false, features = ["png"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

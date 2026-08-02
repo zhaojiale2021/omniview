@@ -1,3 +1,7 @@
+// Windows: build as a GUI app so launching the exe doesn't open a
+// console window spamming logs (logs still go to player.log).
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod app;
 mod audio;
 mod decoder;

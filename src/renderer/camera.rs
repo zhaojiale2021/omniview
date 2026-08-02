@@ -29,4 +29,10 @@ impl OrbitCamera {
     pub fn handle_scroll(&mut self, delta: f32) {
         self.fov = (self.fov - delta * 2.0).clamp(30.0, 120.0);
     }
+
+    pub fn reset(&mut self) {
+        self.yaw = 0.0;
+        self.pitch = 0.0;
+        self.fov = 90.0;
+    }
 }

@@ -156,10 +156,6 @@ impl AudioPlayer {
         self.shared.paused.store(paused, Ordering::Relaxed);
     }
 
-    pub fn is_paused(&self) -> bool {
-        self.shared.paused.load(Ordering::Relaxed)
-    }
-
     /// 0.0 – 1.0
     pub fn set_volume(&self, v: f32) {
         *self.shared.volume.lock().unwrap() = v.clamp(0.0, 1.0);
