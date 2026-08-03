@@ -549,4 +549,181 @@ mod tests {
         ctl.apply(Command::Stop).unwrap();
         assert_eq!(ctl.state(), &PlaybackState::Idle);
     }
+
+    #[test]
+    fn av_sync_within_tolerance() {
+        // Same fixture as full_pipeline_plays.  On WSL2 there is no audio
+        // device, so the controller falls back to video-only: MediaClock
+        // uses the Instant clock and the decoder paces frames at content
+        // rate in real time.  That keeps the displayed frame's PTS within
+        // one frame interval + startup offset of the clock position.
+        let test_path = "/tmp/test_av.mp4";
+        assert!(
+            std::path::Path::new(test_path).exists(),
+            "test file {test_path} must exist (run the demux/audio tests first)"
+        );
+
+        let mut ctl = PlaybackController::new();
+        ctl.apply(Command::Open(test_path.into())).unwrap();
+        assert_eq!(ctl.state(), &PlaybackState::Ready);
+        ctl.apply(Command::Play).unwrap();
+        assert_eq!(ctl.state(), &PlaybackState::Playing);
+
+        // Poll for ~2s, recording (frame PTS, clock position) for every
+        // frame the controller hands to the (virtual) renderer.
+        let mut pairs: Vec<(f64, f64)> = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if let Some(f) = ctl.next_video_frame() {
+                pairs.push((f.pts_secs, ctl.position()));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(!pairs.is_empty(), "frames must flow during playback");
+        let best = pairs
+            .iter()
+            .map(|(pts, pos)| (pts - pos).abs())
+            .fold(f64::MAX, f64::min);
+        assert!(
+            best < 0.15,
+            "|frame PTS - position| must be within 0.15s at least once \
+             (best was {best:.3}s over {} samples)",
+            pairs.len()
+        );
+
+        ctl.apply(Command::Stop).unwrap();
+        assert_eq!(ctl.state(), &PlaybackState::Idle);
+    }
+
+    #[test]
+    fn seek_resumes_at_position() {
+        // Seeks mid-stream: the pipeline restarts at the target and the
+        // fresh decoder must deliver frames at (or just past) the seek
+        // position — frames below it are discarded.
+        let test_path = "/tmp/test_av.mp4";
+        assert!(
+            std::path::Path::new(test_path).exists(),
+            "test file {test_path} must exist (run the demux/audio tests first)"
+        );
+
+        let mut ctl = PlaybackController::new();
+        ctl.apply(Command::Open(test_path.into())).unwrap();
+        ctl.apply(Command::Play).unwrap();
+        assert_eq!(ctl.state(), &PlaybackState::Playing);
+
+        // Wait for a frame so the pipeline is clearly running before seek.
+        let mut saw_frame = false;
+        let dl = std::time::Instant::now() + Duration::from_secs(5);
+        while !saw_frame && std::time::Instant::now() < dl {
+            saw_frame = ctl.next_video_frame().is_some();
+            if !saw_frame {
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        assert!(saw_frame, "must receive a frame before seeking");
+
+        // Seek to 1.5s.  In WSL2 video-only the clock restarts from the
+        // seek position, so it should be (near) 1.5 immediately.
+        ctl.apply(Command::Seek(1.5)).unwrap();
+
+        // Poll until position is within 0.5s of the target.
+        let dl = std::time::Instant::now() + Duration::from_secs(5);
+        let mut pos_near = false;
+        while std::time::Instant::now() < dl {
+            if (ctl.position() - 1.5).abs() < 0.5 {
+                pos_near = true;
+                break;
+            }
+            let _ = ctl.next_video_frame(); // keep the pipeline moving
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            pos_near,
+            "position must approach 1.5s after seek (was {})",
+            ctl.position()
+        );
+
+        // The fresh decoder discards frames below the seek target, so the
+        // next displayed frame should carry a PTS near 1.5s.
+        let mut frame = None;
+        let dl = std::time::Instant::now() + Duration::from_secs(5);
+        while frame.is_none() && std::time::Instant::now() < dl {
+            frame = ctl.next_video_frame();
+            if frame.is_none() {
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        let f = frame.expect("must receive a frame after seeking");
+        assert!(
+            (f.pts_secs - 1.5).abs() < 0.5,
+            "frame PTS after seek to 1.5 must be near 1.5 (got {})",
+            f.pts_secs
+        );
+
+        ctl.apply(Command::Stop).unwrap();
+        assert_eq!(ctl.state(), &PlaybackState::Idle);
+    }
+
+    #[test]
+    fn pause_resume_preserves_position() {
+        // Pause must freeze the clock; resume must continue from the same
+        // position and let frames flow again.
+        let test_path = "/tmp/test_av.mp4";
+        assert!(
+            std::path::Path::new(test_path).exists(),
+            "test file {test_path} must exist (run the demux/audio tests first)"
+        );
+
+        let mut ctl = PlaybackController::new();
+        ctl.apply(Command::Open(test_path.into())).unwrap();
+        ctl.apply(Command::Play).unwrap();
+        assert_eq!(ctl.state(), &PlaybackState::Playing);
+
+        // Let playback run ~0.3s, then record the position.
+        let dl = std::time::Instant::now() + Duration::from_millis(300);
+        let mut frames_seen = 0u32;
+        while std::time::Instant::now() < dl {
+            if ctl.next_video_frame().is_some() {
+                frames_seen += 1;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(frames_seen >= 1, "frames must flow before pausing");
+        let pos_at_pause = ctl.position();
+
+        // Pause: position must freeze (allow <50ms drift for llvmpipe).
+        ctl.apply(Command::Pause).unwrap();
+        assert_eq!(ctl.state(), &PlaybackState::Paused);
+        thread::sleep(Duration::from_secs(1));
+        let pos_frozen = ctl.position();
+        assert!(
+            (pos_frozen - pos_at_pause).abs() < 0.05,
+            "position must freeze while paused (was {pos_at_pause}, now {pos_frozen})"
+        );
+
+        // Resume (Toggle from Paused → Playing): position advances and
+        // frames flow again.
+        ctl.apply(Command::Toggle).unwrap();
+        assert_eq!(ctl.state(), &PlaybackState::Playing);
+        thread::sleep(Duration::from_millis(300));
+        let pos_after_resume = ctl.position();
+        assert!(
+            pos_after_resume > pos_frozen + 0.01,
+            "position must advance after resume (frozen {pos_frozen}, now {pos_after_resume})"
+        );
+
+        let mut resumed_frame = false;
+        let dl = std::time::Instant::now() + Duration::from_secs(5);
+        while !resumed_frame && std::time::Instant::now() < dl {
+            resumed_frame = ctl.next_video_frame().is_some();
+            if !resumed_frame {
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        assert!(resumed_frame, "frames must flow after resume");
+
+        ctl.apply(Command::Stop).unwrap();
+        assert_eq!(ctl.state(), &PlaybackState::Idle);
+    }
 }
