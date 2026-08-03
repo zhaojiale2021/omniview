@@ -24,10 +24,11 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 REL="target/x86_64-pc-windows-gnu/release"
 
-# Stage the runtime FFmpeg DLLs (self-contained build) + the CLI tools the
-# audio path uses, next to the exe.
-cp "$BIN"/*.dll "$BIN"/ffmpeg.exe "$BIN"/ffprobe.exe "$REL"/ 2>/dev/null || true
-echo "Staged runtime FFmpeg DLLs + ffmpeg.exe/ffprobe.exe from $BIN"
+# Stage the runtime FFmpeg DLLs (self-contained build) next to the exe.
+# Audio is decoded in-process now, so ffmpeg.exe/ffprobe.exe are no longer
+# needed at runtime.
+cp "$BIN"/*.dll "$REL"/
+echo "Staged runtime FFmpeg DLLs from $BIN"
 
 echo
 echo "Built: $REL/my-project.exe"
