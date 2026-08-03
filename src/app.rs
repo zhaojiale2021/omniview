@@ -78,12 +78,9 @@ impl App {
             return;
         }
         // Auto-play to preserve the old UX (opening a file started playback).
+        // Playback always starts at 0; the saved position is available via
+        // the resume button in the transport bar.
         let _ = self.ctl.apply(Command::Play);
-        // Restore the resume position if we have one.
-        if let Some(&pos) = self.state.get(path) {
-            tracing::info!("Resuming from {pos:.1}s");
-            let _ = self.ctl.apply(Command::Seek(pos));
-        }
     }
 
     fn toggle_fullscreen(&mut self) {
@@ -338,6 +335,11 @@ impl ApplicationHandler for App {
 
         // ── Sync UI state from controller (skip fields driven by UI) ──
         let seeking = self.ui.as_ref().map(|u| u.seeking).unwrap_or(false);
+        // Saved position for the current file, shown as the resume button.
+        let resume_pos = self
+            .ctl
+            .file_path()
+            .and_then(|p| self.state.get(p).copied());
         // Treat Ended like paused for UI purposes: playback is over, the
         // transport shows stopped, and the control bars stay visible.
         let ended = matches!(self.ctl.state(), PlaybackState::Ended);
@@ -348,6 +350,8 @@ impl ApplicationHandler for App {
             ui.duration = self.ctl.duration();
             ui.playing = !self.ctl.paused() && !ended;
             ui.speed = self.ctl.speed();
+            ui.resume_available = resume_pos.is_some();
+            ui.resume_position = resume_pos.unwrap_or(0.0);
         }
 
         let paused = self.ctl.paused() || ended;
@@ -384,6 +388,7 @@ impl ApplicationHandler for App {
         let mut speed_action: Option<f64> = None;
         let mut volume_action: Option<f32> = None;
         let mut fullscreen_action = false;
+        let mut resume_action = false;
 
         let renderer = &mut self.renderer;
         if let (Some(w), Some(r), Some(ui)) = (&self.window, renderer, &mut self.ui) {
@@ -403,6 +408,8 @@ impl ApplicationHandler for App {
             ui.open_file_clicked = false;
             fullscreen_action = ui.fullscreen_clicked;
             ui.fullscreen_clicked = false;
+            resume_action = ui.resume_clicked;
+            ui.resume_clicked = false;
             seek_action = ui.seek_to.take();
             if ui.speed_changed {
                 ui.speed_changed = false;
@@ -469,6 +476,16 @@ impl ApplicationHandler for App {
         }
         if fullscreen_action {
             self.toggle_fullscreen();
+        }
+        if resume_action {
+            if let Some(pos) = self
+                .ctl
+                .file_path()
+                .and_then(|p| self.state.get(p).copied())
+            {
+                let _ = self.ctl.apply(Command::Seek(pos));
+                let _ = self.ctl.apply(Command::Play);
+            }
         }
         if let Some(pos) = seek_action {
             let _ = self.ctl.apply(Command::Seek(pos));

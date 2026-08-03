@@ -28,6 +28,12 @@ pub struct PlayerUI {
     pub fullscreen_clicked: bool,
     /// Set (by the UI or the M key) to toggle mute on the next update.
     pub mute_clicked: bool,
+    /// Whether a saved resume position exists for the current file.
+    pub resume_available: bool,
+    /// Saved position (seconds) for the current file.
+    pub resume_position: f64,
+    /// Set when the user clicks the resume button.
+    pub resume_clicked: bool,
     file_name: String,
     /// Position saved at drag start, used to detect actual changes.
     drag_start_pos: f64,
@@ -56,6 +62,9 @@ impl PlayerUI {
             ui_visible: true,
             fullscreen_clicked: false,
             mute_clicked: false,
+            resume_available: false,
+            resume_position: 0.0,
+            resume_clicked: false,
             file_name: String::new(),
             drag_start_pos: 0.0,
             muted: false,
@@ -241,6 +250,23 @@ impl PlayerUI {
                     let pp = Self::icon_button(ui, pp_icon, 16.0, if self.playing { "Pause (Space)" } else { "Play (Space)" });
                     if pp.clicked() {
                         self.playing = !self.playing;
+                    }
+
+                    // Resume from the saved position — shown only when a
+                    // position was remembered for this file.  Opening a
+                    // video always starts at 0; resuming is explicit.
+                    if self.resume_available {
+                        let label = format!("续播 {}", Self::fmt_time(self.resume_position));
+                        let resume = ui
+                            .add_sized(
+                                [100.0, 26.0],
+                                egui::Button::new(egui::RichText::new(label).size(12.0))
+                                    .rounding(3.0),
+                            )
+                            .on_hover_text("Resume from last position");
+                        if resume.clicked() {
+                            self.resume_clicked = true;
+                        }
                     }
 
                     // Right cluster (time · volume · fullscreen)
