@@ -569,27 +569,53 @@ mod tests {
         ctl.apply(Command::Play).unwrap();
         assert_eq!(ctl.state(), &PlaybackState::Playing);
 
-        // Poll for ~2s, recording (frame PTS, clock position) for every
-        // frame the controller hands to the (virtual) renderer.
-        let mut pairs: Vec<(f64, f64)> = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        // Poll for ~2s, recording (frame PTS, clock position) at the same
+        // moment for every frame the controller hands to the (virtual)
+        // renderer, plus the wall-clock capture time.
+        let t0 = std::time::Instant::now();
+        let mut samples: Vec<(f64, f64, f64)> = Vec::new(); // (pts, pos, t)
+        let deadline = t0 + Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
             if let Some(f) = ctl.next_video_frame() {
-                pairs.push((f.pts_secs, ctl.position()));
+                samples.push((f.pts_secs, ctl.position(), t0.elapsed().as_secs_f64()));
             }
             thread::sleep(Duration::from_millis(20));
         }
-
-        assert!(!pairs.is_empty(), "frames must flow during playback");
-        let best = pairs
-            .iter()
-            .map(|(pts, pos)| (pts - pos).abs())
-            .fold(f64::MAX, f64::min);
         assert!(
-            best < 0.15,
-            "|frame PTS - position| must be within 0.15s at least once \
-             (best was {best:.3}s over {} samples)",
-            pairs.len()
+            !samples.is_empty(),
+            "frames must flow during playback ({} samples)",
+            samples.len()
+        );
+
+        // The deviation must stay BOUNDED over the window, not just be
+        // small at the earliest (start-aligned) samples.  A clock running
+        // at a wrong constant rate (e.g. 2x content) matches at start and
+        // then diverges monotonically — a min-based check would pass it, a
+        // max-based check catches it.  Skip the ~0.5s startup transient,
+        // then require the max |frame PTS - position| to stay under one
+        // frame period's worth of slack: the frame selector holds at most
+        // one frame ahead and only chooses frames <= clock, so steady-state
+        // deviation is ~one frame period (~0.033s) well under 0.15s.
+        const GRACE: f64 = 0.5;
+        let steady: Vec<f64> = samples
+            .iter()
+            .filter(|(_, _, t)| *t >= GRACE)
+            .map(|(pts, pos, _)| (pts - pos).abs())
+            .collect();
+        assert!(
+            !steady.is_empty(),
+            "must collect steady-state samples after the {GRACE:.1}s startup \
+             grace period ({} total samples)",
+            samples.len()
+        );
+        let max_dev = steady.iter().cloned().fold(0.0f64, f64::max);
+        assert!(
+            max_dev < 0.15,
+            "|frame PTS - position| must stay below 0.15s in steady state \
+             (max was {max_dev:.3}s over {} steady samples after {GRACE:.1}s \
+             grace; {} total collected)",
+            steady.len(),
+            samples.len()
         );
 
         ctl.apply(Command::Stop).unwrap();
