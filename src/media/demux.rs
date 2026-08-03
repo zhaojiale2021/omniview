@@ -121,6 +121,27 @@ impl Demux {
 
 // ── Demux loop (runs in background thread) ─────────────────────────
 
+/// Send as many stashed packets as the channel accepts.
+fn flush_stash(
+    tx: &mpsc::SyncSender<ffmpeg::Packet>,
+    stash: &mut std::collections::VecDeque<ffmpeg::Packet>,
+    count: &mut u64,
+) {
+    while let Some(p) = stash.pop_front() {
+        match tx.try_send(p) {
+            Ok(()) => *count += 1,
+            Err(mpsc::TrySendError::Full(p)) => {
+                stash.push_front(p);
+                break;
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                stash.clear();
+                break;
+            }
+        }
+    }
+}
+
 fn demux_loop(
     path: &str,
     start_pos: f64,
@@ -240,6 +261,17 @@ fn demux_loop(
     let mut routed_audio = 0u64;
     let mut read_errors = 0u64;
     let mut route_log = std::time::Instant::now();
+    // Bounded per-stream read-ahead stashes.  When one stream's channel is
+    // full (e.g. the audio ring backs up at speed != 1), the demux stashes
+    // that stream's packets and KEEPS READING, so the other stream (video)
+    // is never starved by audio backpressure.  Without this, the demux
+    // holds a full audio packet and video packets behind it stop flowing —
+    // video freezes at 2x while the audio ring drains.
+    let mut video_stash: std::collections::VecDeque<ffmpeg::Packet> =
+        std::collections::VecDeque::with_capacity(8);
+    let mut audio_stash: std::collections::VecDeque<ffmpeg::Packet> =
+        std::collections::VecDeque::with_capacity(8);
+
     'outer: loop {
         // (1) Drain commands BEFORE reading the next packet.
         loop {
@@ -249,6 +281,10 @@ fn demux_loop(
                 Err(mpsc::TryRecvError::Disconnected) => break 'outer,
             }
         }
+
+        // (1b) Flush stashed packets whose channels have space again.
+        flush_stash(&video_pkt_tx, &mut video_stash, &mut routed_video);
+        flush_stash(&audio_pkt_tx, &mut audio_stash, &mut routed_audio);
 
         // (2) Read the next packet from the container.  The iterator API
         // spins silently on any non-EOF error, so read manually: EOF ends
@@ -270,27 +306,39 @@ fn demux_loop(
 
         let stream_index = packet.stream();
 
-        // Select the target channel for this packet.
-        let tx: &mpsc::SyncSender<ffmpeg::Packet> =
-            if Some(stream_index) == video_stream_index {
-                &video_pkt_tx
-            } else if Some(stream_index) == audio_stream_index {
-                &audio_pkt_tx
-            } else {
-                continue; // skip non-A/V streams
-            };
+        // Select the target channel + stash for this packet.
+        let target_video = Some(stream_index) == video_stream_index;
+        let target_audio = Some(stream_index) == audio_stream_index;
+        if !target_video && !target_audio {
+            continue; // skip non-A/V streams
+        }
+        let (tx, stash, count): (
+            &mpsc::SyncSender<ffmpeg::Packet>,
+            &mut std::collections::VecDeque<ffmpeg::Packet>,
+            &mut u64,
+        ) = if target_video {
+            (&video_pkt_tx, &mut video_stash, &mut routed_video)
+        } else {
+            (&audio_pkt_tx, &mut audio_stash, &mut routed_audio)
+        };
 
-        // (3) Send with retry.  When the channel is full (paused
-        //     decoder), HOLD the packet and drain commands so that
-        //     Seek/Stop stay responsive.  Only exit on Disconnected,
-        //     Stop, or EOF — a full channel is normal during pause.
+        // (3) Send, or stash when the channel is full so the OTHER stream
+        //     keeps flowing.  Only when the channel AND the stash are both
+        //     full do we wait (draining commands so Stop/Seek stay
+        //     responsive).  A full channel is normal during pause.
         let mut pkt = packet;
         loop {
             match tx.try_send(pkt) {
-                Ok(()) => break, // sent — go read next packet
+                Ok(()) => {
+                    *count += 1;
+                    break; // sent — go read next packet
+                }
                 Err(mpsc::TrySendError::Full(p)) => {
-                    pkt = p; // hold the packet
-                    // Drain commands while waiting for channel space.
+                    if stash.len() < 8 {
+                        stash.push_back(p);
+                        break; // keep reading — other stream flows
+                    }
+                    pkt = p; // channel + stash full: wait for space
                     loop {
                         match cmd_rx.try_recv() {
                             Ok(DemuxCmd::Stop) => break 'outer,
@@ -298,18 +346,10 @@ fn demux_loop(
                             Err(mpsc::TryRecvError::Disconnected) => break 'outer,
                         }
                     }
-                    // Brief sleep, then retry the send.
-                    thread::sleep(Duration::from_millis(1));
+                    thread::sleep(Duration::from_millis(2));
                 }
                 Err(mpsc::TrySendError::Disconnected(_)) => break 'outer,
             }
-        }
-
-        // Route accounting (diagnostics).
-        if Some(stream_index) == video_stream_index {
-            routed_video += 1;
-        } else {
-            routed_audio += 1;
         }
         if route_log.elapsed().as_secs() >= 5 {
             tracing::info!(

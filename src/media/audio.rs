@@ -586,27 +586,13 @@ fn decode_audio_packets(
                     sink(samples);
                 }
 
-                // Flush swr internal frames.
-                loop {
-                    let Some(resampler) = resampler.as_mut() else { break };
-                    match resampler.flush(&mut resampled) {
-                        Ok(Some(_)) => {
-                            let flush_bytes = resampled.data(0);
-                            let flush_samples: Vec<f32> = flush_bytes
-                                .chunks_exact(4)
-                                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                                .collect();
-                            if !flush_samples.is_empty() {
-                                sink(flush_samples);
-                            }
-                        }
-                        Ok(None) => break,
-                        Err(e) => {
-                            tracing::warn!("swr flush: {e}");
-                            break;
-                        }
-                    }
-                }
+                // NOTE: no per-frame swr flush here.  ffmpeg-next's
+                // flush() returns Ok(Some) without clearing the output
+                // frame, so looping here re-pushed the same samples ~10x
+                // (silent at 1x because delay()==None, but after atempo
+                // engaged the duplicates flooded the ring and the whole
+                // pipeline stalled).  The remaining swr delay is a few ms
+                // and is flushed once at EOF below.
             }
         }
     }
@@ -692,6 +678,11 @@ fn decode_audio_packets(
         let Some(resampler) = resampler.as_mut() else { break };
         match resampler.flush(&mut resampled) {
             Ok(Some(_)) => {
+                // Guard against ffmpeg-next's flush quirk: an empty output
+                // frame still reports Some — stop when there is no data.
+                if resampled.samples() == 0 {
+                    break;
+                }
                 let flush_bytes = resampled.data(0);
                 let flush_samples: Vec<f32> = flush_bytes
                     .chunks_exact(4)
@@ -806,6 +797,61 @@ mod tests {
         assert!(final_samples > 0, "decoded audio samples must be non-empty");
 
         // Send Stop so the decode thread exits cleanly.
+        let _ = cmd_tx.send(AudioCmd::Stop);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn atempo_doubles_sample_output() {
+        // Direct rate check: feed ALL packets of the 20s fixture and let the
+        // decoder run to EOF with speed=2 engaged from the start.  A working
+        // atempo halves the output sample count (~960k vs ~1.92M).
+        let mut demux = Demux::open("/tmp/test_av20.mp4", 0.0);
+        loop {
+            if let Some(r) = demux.poll_ready() {
+                r.unwrap();
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let (video_rx, audio_rx) = demux.take_channels().unwrap();
+        let _video_drain = thread::spawn(move || while video_rx.recv().is_ok() {});
+
+        let (pkt_tx, pkt_rx) = mpsc::channel::<ffmpeg::codec::packet::Packet>();
+        let _feed = thread::spawn(move || {
+            while let Ok(p) = audio_rx.recv() {
+                if pkt_tx.send(p).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCmd>();
+        let produced: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+        let produced_sink = produced.clone();
+        let sink = move |samples: Vec<f32>| {
+            *produced_sink.lock().unwrap() += samples.len() as u64;
+        };
+        let handle = thread::spawn(move || {
+            let _ = decode_audio_packets("/tmp/test_av20.mp4", pkt_rx, cmd_rx, 48000, 2, 0.0, sink);
+        });
+        // Engage 2x immediately so the whole stream is processed at tempo.
+        let _ = cmd_tx.send(AudioCmd::Speed(2.0));
+
+        let dl = std::time::Instant::now() + Duration::from_secs(15);
+        while !handle.is_finished() && std::time::Instant::now() < dl {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let total = *produced.lock().unwrap();
+        // 20s @ 48kHz stereo = 1,920,000 samples; atempo=2 -> ~960,000.
+        assert!(
+            total < 1_400_000,
+            "atempo=2 should roughly halve output (got {total} samples, ~1.92M expected at 1x)"
+        );
+        assert!(
+            total > 500_000,
+            "atempo=2 should still produce most of the stream (got {total})"
+        );
         let _ = cmd_tx.send(AudioCmd::Stop);
         let _ = handle.join();
     }
