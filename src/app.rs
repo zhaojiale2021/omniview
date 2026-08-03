@@ -337,16 +337,19 @@ impl ApplicationHandler for App {
 
         // ── Sync UI state from controller (skip fields driven by UI) ──
         let seeking = self.ui.as_ref().map(|u| u.seeking).unwrap_or(false);
+        // Treat Ended like paused for UI purposes: playback is over, the
+        // transport shows stopped, and the control bars stay visible.
+        let ended = matches!(self.ctl.state(), PlaybackState::Ended);
         if let Some(ref mut ui) = self.ui {
             if !seeking {
                 ui.position = self.ctl.position();
             }
             ui.duration = self.ctl.duration();
-            ui.playing = !self.ctl.paused();
+            ui.playing = !self.ctl.paused() && !ended;
             ui.speed = self.ctl.speed();
         }
 
-        let paused = self.ctl.paused();
+        let paused = self.ctl.paused() || ended;
 
         // ── Error surfacing (one-shot) ────────────────────────────
         if let PlaybackState::Error(msg) = self.ctl.state() {
@@ -421,9 +424,10 @@ impl ApplicationHandler for App {
                 || self.dragging
                 || ui.seeking
                 || r.egui_state.egui_ctx().has_requested_repaint();
-            let at_end = self.ctl.duration() > 0.0
-                && self.ctl.position() >= self.ctl.duration() - 0.05;
-            if (!paused && !at_end) || interactive || frame_uploaded {
+            // Ended (like paused) drops the loop to Wait.  The old
+            // position-based `at_end` heuristic is gone — the controller
+            // now reports Ended itself when the demuxer reaches EOF.
+            if !paused || interactive || frame_uploaded {
                 _event_loop.set_control_flow(ControlFlow::Poll);
                 if let Err(e) = r.render(&prims, &out.textures_delta, out.pixels_per_point, frame_data.take()) {
                     match e {

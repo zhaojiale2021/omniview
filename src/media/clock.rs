@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Lightweight handle to the audio output's monotonic sample counter.
 /// Stored by MediaClock so `position()` can derive real time from the
@@ -130,10 +130,6 @@ impl MediaClock {
         }
     }
 
-    pub fn speed(&self) -> f64 {
-        self.speed
-    }
-
     pub fn reset(&mut self, pos: f64) {
         self.paused_pos = pos;
         if self.playing {
@@ -152,6 +148,8 @@ impl MediaClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     #[test]
     fn clock_advances_only_while_playing() {
         let mut c = MediaClock::new();

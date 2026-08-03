@@ -8,7 +8,16 @@ pub enum PlaybackState {
 
 #[derive(Debug, Clone)]
 pub enum Command {
-    Open(String), Play, Pause, Toggle, Seek(f64), SetSpeed(f64), SetVolume(f32), Stop,
+    Open(String),
+    Play,
+    #[allow(dead_code)] // explicit pause binding; UI/keyboard currently uses Toggle
+    Pause,
+    Toggle,
+    Seek(f64),
+    SetSpeed(f64),
+    SetVolume(f32),
+    #[allow(dead_code)] // controller-level stop; window close tears down via Drop
+    Stop,
 }
 
 #[derive(Clone)]

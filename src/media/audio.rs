@@ -24,7 +24,10 @@ use ffmpeg::{channel_layout::ChannelLayout, codec, filter, format, frame, media,
 pub enum AudioCmd {
     Pause(bool),
     Speed(f64),
-    Volume(f32),
+    // The value is redundant: volume is applied in the cpal callback via
+    // shared state; the decoder thread only needs to know a volume change
+    // happened so it can wake from its command-drain loop.
+    Volume,
     Stop,
 }
 
@@ -240,11 +243,6 @@ impl AudioPipeline {
 
     // ── Controls ──────────────────────────────────────────────────
 
-    /// Monotonic sample count delivered to the output device.
-    pub fn samples_played(&self) -> u64 {
-        self.shared.samples_played.load(Ordering::Relaxed)
-    }
-
     /// Pause / resume the decode thread and the cpal callback.
     pub fn set_paused(&self, p: bool) {
         self.shared.paused.store(p, Ordering::Relaxed);
@@ -260,7 +258,7 @@ impl AudioPipeline {
     pub fn set_volume(&self, v: f32) {
         let clamped = v.clamp(0.0, 1.0);
         *self.shared.volume.lock().unwrap() = clamped;
-        let _ = self.cmd_tx.send(AudioCmd::Volume(clamped));
+        let _ = self.cmd_tx.send(AudioCmd::Volume);
     }
 
     /// Stop playback: signal the decode thread and cpal callback.
@@ -418,7 +416,7 @@ fn decode_audio_packets(
                                 }
                             }
                             Ok(AudioCmd::Pause(true)) => {} // already paused — no-op
-                            Ok(AudioCmd::Volume(_)) => {} // applied in cpal callback
+                            Ok(AudioCmd::Volume) => {} // applied in cpal callback
                             Err(mpsc::RecvError) => return Ok(()),
                         }
                     }
@@ -441,7 +439,7 @@ fn decode_audio_packets(
                         }
                     }
                 }
-                Ok(AudioCmd::Volume(_)) => {} // applied in cpal callback
+                Ok(AudioCmd::Volume) => {} // applied in cpal callback
                 Ok(AudioCmd::Pause(false)) => {} // already playing — no-op
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => return Ok(()),

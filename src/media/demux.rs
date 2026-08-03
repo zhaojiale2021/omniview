@@ -3,15 +3,15 @@
 //!
 //! The demuxer opens the file, probes for the best video and audio streams,
 //! reports metadata via `ready_tx`, then enters a loop reading packets from
-//! ffmpeg and routing them by stream index.  Commands (Seek, Stop) are
-//! drained via `try_recv` each iteration so they are never blocked by a
-//! full packet channel.
+//! ffmpeg and routing them by stream index.  Commands (Stop) are drained
+//! via `try_recv` each iteration so they are never blocked by a full packet
+//! channel.  Reaching end-of-file is reported via a one-shot `eof_tx`
+//! signal so the controller can transition to `PlaybackState::Ended`.
 //!
 //! When a packet channel is full (e.g. paused decoder), the demux **holds**
 //! the current packet, keeps draining commands, sleeps briefly, and retries
 //! the send — it does NOT exit.  The thread only exits on EOF, a `Stop`
-//! command, or a disconnected receiver.  A `Seek` command while holding a
-//! packet discards it (stale) and resumes reading from the seek target.
+//! command, or a disconnected receiver.
 
 use std::sync::mpsc;
 use std::thread;
@@ -23,7 +23,12 @@ use ffmpeg_next::{format, media};
 // ── Public types ────────────────────────────────────────────────────
 
 /// Stream metadata gathered during the probe phase.
+///
+/// `width`/`height`/`fps`/`has_audio` are informational metadata: consumed
+/// by tests and available for future UI indicators; playback itself only
+/// needs `has_video` and `duration`.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct DemuxInfo {
     pub has_video: bool,
     pub width: u32,
@@ -35,7 +40,6 @@ pub struct DemuxInfo {
 
 /// Commands sent to the demux thread.
 pub enum DemuxCmd {
-    Seek(f64),
     Stop,
 }
 
@@ -49,6 +53,7 @@ pub struct Demux {
     video_pkt_rx: Option<mpsc::Receiver<ffmpeg::Packet>>,
     audio_pkt_rx: Option<mpsc::Receiver<ffmpeg::Packet>>,
     cmd_tx: mpsc::Sender<DemuxCmd>,
+    eof_rx: mpsc::Receiver<()>,
     _thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -63,6 +68,7 @@ impl Demux {
         let (video_pkt_tx, video_pkt_rx) = mpsc::sync_channel::<ffmpeg::Packet>(64);
         let (audio_pkt_tx, audio_pkt_rx) = mpsc::sync_channel::<ffmpeg::Packet>(64);
         let (cmd_tx, cmd_rx) = mpsc::channel::<DemuxCmd>();
+        let (eof_tx, eof_rx) = mpsc::channel::<()>();
 
         let p = path.to_string();
         let handle = thread::spawn(move || {
@@ -73,6 +79,7 @@ impl Demux {
                 video_pkt_tx,
                 audio_pkt_tx,
                 cmd_rx,
+                eof_tx,
             );
         });
 
@@ -81,6 +88,7 @@ impl Demux {
             video_pkt_rx: Some(video_pkt_rx),
             audio_pkt_rx: Some(audio_pkt_rx),
             cmd_tx,
+            eof_rx,
             _thread: Some(handle),
         }
     }
@@ -100,14 +108,14 @@ impl Demux {
         }
     }
 
-    /// Ask the demux thread to seek to a position (seconds).
-    pub fn seek(&self, pos: f64) {
-        let _ = self.cmd_tx.send(DemuxCmd::Seek(pos));
-    }
-
     /// Ask the demux thread to stop.
     pub fn stop(&self) {
         let _ = self.cmd_tx.send(DemuxCmd::Stop);
+    }
+
+    /// Whether the demuxer has reached the end of the file (one-shot).
+    pub fn poll_eof(&self) -> bool {
+        matches!(self.eof_rx.try_recv(), Ok(()))
     }
 }
 
@@ -120,6 +128,7 @@ fn demux_loop(
     video_pkt_tx: mpsc::SyncSender<ffmpeg::Packet>,
     audio_pkt_tx: mpsc::SyncSender<ffmpeg::Packet>,
     cmd_rx: mpsc::Receiver<DemuxCmd>,
+    eof_tx: mpsc::Sender<()>,
 ) {
     // Init ffmpeg (once per process is fine, but safe to call again).
     if let Err(e) = ffmpeg::init() {
@@ -227,24 +236,12 @@ fn demux_loop(
     // ── Main packet-routing loop ───────────────────────────────────
 
     let mut packets = input.packets();
+    let mut reached_eof = false;
     'outer: loop {
         // (1) Drain commands BEFORE reading the next packet.
         loop {
             match cmd_rx.try_recv() {
                 Ok(DemuxCmd::Stop) => break 'outer,
-                Ok(DemuxCmd::Seek(pos)) => {
-                    let ts = (pos * 1_000_000.0) as i64;
-                    unsafe {
-                        ffmpeg::ffi::av_seek_frame(
-                            input.as_mut_ptr(),
-                            -1,
-                            ts,
-                            ffmpeg::ffi::AVSEEK_FLAG_BACKWARD as i32,
-                        );
-                    }
-                    // Re-create iterator so reads resume from seek target.
-                    packets = input.packets();
-                }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => break 'outer,
             }
@@ -253,7 +250,10 @@ fn demux_loop(
         // (2) Read the next packet from the container.
         let (stream, packet) = match packets.next() {
             Some(p) => p,
-            None => break, // EOF
+            None => {
+                reached_eof = true;
+                break; // EOF
+            }
         };
 
         let stream_index = stream.index();
@@ -279,32 +279,12 @@ fn demux_loop(
                 Err(mpsc::TrySendError::Full(p)) => {
                     pkt = p; // hold the packet
                     // Drain commands while waiting for channel space.
-                    let mut seeked = false;
                     loop {
                         match cmd_rx.try_recv() {
                             Ok(DemuxCmd::Stop) => break 'outer,
-                            Ok(DemuxCmd::Seek(pos)) => {
-                                let ts = (pos * 1_000_000.0) as i64;
-                                unsafe {
-                                    ffmpeg::ffi::av_seek_frame(
-                                        input.as_mut_ptr(),
-                                        -1,
-                                        ts,
-                                        ffmpeg::ffi::AVSEEK_FLAG_BACKWARD as i32,
-                                    );
-                                }
-                                packets = input.packets();
-                                seeked = true;
-                                break; // exit inner command-drain loop
-                            }
                             Err(mpsc::TryRecvError::Empty) => break,
                             Err(mpsc::TryRecvError::Disconnected) => break 'outer,
                         }
-                    }
-                    if seeked {
-                        // Held packet is stale after seek — drop it and
-                        // resume reading from the new position.
-                        continue 'outer;
                     }
                     // Brief sleep, then retry the send.
                     thread::sleep(Duration::from_millis(1));
@@ -314,6 +294,9 @@ fn demux_loop(
         }
     }
 
+    if reached_eof {
+        let _ = eof_tx.send(());
+    }
     tracing::debug!("Demux thread finished");
 }
 

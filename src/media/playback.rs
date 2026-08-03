@@ -69,12 +69,6 @@ impl PlaybackController {
         self.state == PlaybackState::Paused
     }
 
-    /// Whether an audio track is present and the pipeline is delivering
-    /// audio output (false on WSL2 or when audio init failed).
-    pub fn has_audio(&self) -> bool {
-        self.has_audio
-    }
-
     pub fn speed(&self) -> f64 {
         self.speed
     }
@@ -131,7 +125,10 @@ impl PlaybackController {
 
         let frame = match chosen {
             Some(f) => f,
-            None => return None,
+            None => {
+                self.check_eof();
+                return None;
+            }
         };
 
         // Skip frames whose PTS matches the last displayed PTS (avoid
@@ -141,6 +138,28 @@ impl PlaybackController {
         }
         self.last_pts = frame.pts_secs;
         Some(frame)
+    }
+
+    /// If the demuxer reached the end of the stream and the decoder has no
+    /// more frames to offer, transition to `Ended` and freeze the clock so
+    /// the UI stops at the last frame instead of drifting past the end.
+    ///
+    /// Only fires from `Playing`: while paused the demuxer may already have
+    /// buffered to EOF on short files, and a user pause must not be
+    /// reinterpreted as "ended".  Resuming then reaches Ended normally.
+    fn check_eof(&mut self) {
+        if self.state != PlaybackState::Playing {
+            return;
+        }
+        let eof = self
+            .demux
+            .as_ref()
+            .map(|d| d.poll_eof())
+            .unwrap_or(false);
+        if eof {
+            self.state = PlaybackState::Ended;
+            self.clock.pause();
+        }
     }
 
     // ── Command handlers ──────────────────────────────────────────
@@ -164,9 +183,22 @@ impl PlaybackController {
         match &self.state {
             PlaybackState::Ready
             | PlaybackState::Paused
-            | PlaybackState::Ended
             | PlaybackState::Seeking
             | PlaybackState::Playing => {} // Playing: re-anchor clock, no-op otherwise
+            PlaybackState::Ended => {
+                // Play after EOF restarts the media from the beginning.
+                let path = self
+                    .file_path
+                    .clone()
+                    .ok_or_else(|| "No file open".to_string())?;
+                self.teardown();
+                self.open_pipeline(&path, 0.0)?;
+                self.do_set_speed(self.speed)?;
+                self.do_set_volume(self.volume)?;
+                self.clock.play(0.0);
+                self.state = PlaybackState::Playing;
+                return Ok(());
+            }
             _ => return Err(format!("cannot play from {:?}", self.state)),
         }
 
@@ -763,6 +795,61 @@ mod tests {
             }
         }
         assert!(resumed_frame, "frames must flow after resume");
+
+        ctl.apply(Command::Stop).unwrap();
+        assert_eq!(ctl.state(), &PlaybackState::Idle);
+    }
+
+    #[test]
+    fn eof_transitions_to_ended_and_play_restarts() {
+        // At end-of-file the controller must report Ended (not keep Playing
+        // forever), freeze the clock, and restart from 0 when Play is
+        // pressed again.
+        let test_path = "/tmp/test_av.mp4"; // 3s fixture
+        assert!(
+            std::path::Path::new(test_path).exists(),
+            "test file {test_path} must exist (run the demux/audio tests first)"
+        );
+
+        let mut ctl = PlaybackController::new();
+        ctl.apply(Command::Open(test_path.into())).unwrap();
+        assert_eq!(ctl.state(), &PlaybackState::Ready);
+
+        // Seek near the end (2.8s of 3s) so the test reaches EOF quickly.
+        ctl.apply(Command::Seek(2.8)).unwrap();
+        ctl.apply(Command::Play).unwrap();
+        assert_eq!(ctl.state(), &PlaybackState::Playing);
+
+        // Drive the (virtual) render loop until the controller reports Ended.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while ctl.state() != &PlaybackState::Ended && std::time::Instant::now() < deadline {
+            let _ = ctl.next_video_frame();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            ctl.state(),
+            &PlaybackState::Ended,
+            "playback must reach Ended at EOF (position {:.2}s of {:.2}s)",
+            ctl.position(),
+            ctl.duration()
+        );
+
+        // The clock must freeze once Ended (allow small drift).
+        let pos = ctl.position();
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            (ctl.position() - pos).abs() < 0.05,
+            "position must freeze after Ended"
+        );
+
+        // Play after Ended restarts from the beginning.
+        ctl.apply(Command::Play).unwrap();
+        assert_eq!(ctl.state(), &PlaybackState::Playing);
+        assert!(
+            ctl.position() < 1.0,
+            "restart must begin near 0 (was {:.2}s)",
+            ctl.position()
+        );
 
         ctl.apply(Command::Stop).unwrap();
         assert_eq!(ctl.state(), &PlaybackState::Idle);
