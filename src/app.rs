@@ -12,7 +12,7 @@ use winit::{
 };
 
 use crate::media::playback::PlaybackController;
-use crate::media::types::{Command, PlaybackState};
+use crate::media::types::{Command, PlaybackState, VideoFrame};
 use crate::renderer::Renderer;
 use crate::ui::PlayerUI;
 
@@ -327,13 +327,8 @@ impl ApplicationHandler for App {
         // ── Receive latest video frame ──────────────────────────
         // The upload happens inside render() (after surface acquire),
         // so a failing surface can't leak staging buffers.
-        let mut frame_data: Option<(std::sync::Arc<Vec<u8>>, u32, u32)> = None;
-        let frame_uploaded = if let Some(frame) = self.ctl.next_video_frame() {
-            frame_data = Some((frame.data, frame.width, frame.height));
-            true
-        } else {
-            false
-        };
+        let mut frame: Option<VideoFrame> = self.ctl.next_video_frame();
+        let frame_uploaded = frame.is_some();
 
         // ── Sync UI state from controller (skip fields driven by UI) ──
         let seeking = self.ui.as_ref().map(|u| u.seeking).unwrap_or(false);
@@ -429,7 +424,7 @@ impl ApplicationHandler for App {
             // now reports Ended itself when the demuxer reaches EOF.
             if !paused || interactive || frame_uploaded {
                 _event_loop.set_control_flow(ControlFlow::Poll);
-                if let Err(e) = r.render(&prims, &out.textures_delta, out.pixels_per_point, frame_data.take()) {
+                if let Err(e) = r.render(&prims, &out.textures_delta, out.pixels_per_point, frame.take()) {
                     match e {
                         wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
                             let s = r.size;

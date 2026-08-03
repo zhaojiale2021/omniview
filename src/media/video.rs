@@ -1,18 +1,20 @@
 //! In-process video decoder using FFmpeg libraries (ffmpeg-next).
 //!
 //! The decoder consumes packets from the demuxer's packet channel and
-//! emits RGBA `VideoFrame`s into a bounded frame queue (capacity 3), so the
-//! render loop picks one frame per vsync and decode is paced by consumption.
+//! emits NV12 `VideoFrame`s into a bounded frame queue.  Decoding runs at
+//! full speed; the queue is the jitter buffer and the render loop picks the
+//! frame that matches the media clock.  YUV→RGB conversion happens on the
+//! GPU (shader), so the CPU never touches a full RGB frame.
 //!
 //! Codec parameters (time_base, fps, width, height) are read by briefly
 //! opening the file inside the decode thread; the demux owns all seeking
 //! and packet routing.
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
-    mpsc::{self, SyncSender},
-    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Condvar, Mutex,
 };
+use std::collections::VecDeque;
 use std::thread;
 
 use ffmpeg_next as ffmpeg;
@@ -20,12 +22,71 @@ use ffmpeg_next::{format, frame, media, software};
 
 use crate::media::types::VideoFrame;
 
+/// Bounded jitter buffer with peek semantics: the renderer pops only the
+/// frames whose PTS has been reached by the media clock and leaves the rest
+/// queued, so decode-ahead never causes frames to be discarded.
+const FRAME_QUEUE_CAP: usize = 6;
+
+pub struct VideoQueue {
+    frames: Mutex<VecDeque<VideoFrame>>,
+    space: Condvar,
+}
+
+impl VideoQueue {
+    pub fn new() -> Self {
+        Self {
+            frames: Mutex::new(VecDeque::new()),
+            space: Condvar::new(),
+        }
+    }
+
+    /// Push a decoded frame, blocking while the queue is full (backpressure
+    /// paces decode to consumption).  Returns immediately if `stopped`.
+    pub fn push(&self, frame: VideoFrame, stopped: &AtomicBool) {
+        let mut q = self.frames.lock().unwrap();
+        while q.len() >= FRAME_QUEUE_CAP && !stopped.load(Ordering::Relaxed) {
+            q = self.space.wait(q).unwrap();
+        }
+        if stopped.load(Ordering::Relaxed) {
+            return;
+        }
+        q.push_back(frame);
+        self.space.notify_one();
+    }
+
+    /// Pop every frame whose PTS is at/before `clock` and return the newest
+    /// one popped (frames in between are skipped, which is correct when the
+    /// clock is ahead, e.g. after a speed change or resume).  Also returns
+    /// how many frames remain buffered ahead of the clock.
+    pub fn drain_upto(&self, clock: f64) -> (Option<VideoFrame>, usize) {
+        let mut q = self.frames.lock().unwrap();
+        let mut last = None;
+        while let Some(f) = q.front() {
+            if f.pts_secs <= clock {
+                last = q.pop_front();
+            } else {
+                break;
+            }
+        }
+        if !q.is_empty() {
+            self.space.notify_one();
+        }
+        (last, q.len())
+    }
+
+    /// Wake a decoder thread blocked waiting for queue space.  Used on
+    /// teardown: the decoder cannot drain its command channel while blocked
+    /// in `push`, so the controller pokes the condvar after sending Stop.
+    pub fn wake(&self) {
+        self.space.notify_all();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum DecoderCmd { Pause, Resume, Stop }
 
 pub struct VideoDecoder {
-    frame_rx: mpsc::Receiver<VideoFrame>,
-    speed_secs: Arc<AtomicU64>,
+    queue: Arc<VideoQueue>,
 }
 
 impl VideoDecoder {
@@ -39,35 +100,32 @@ impl VideoDecoder {
         pkt_rx: mpsc::Receiver<ffmpeg::codec::packet::Packet>,
         start_pos: f64,
     ) -> (Self, mpsc::Sender<DecoderCmd>) {
-        let (frame_tx, frame_rx) = mpsc::sync_channel::<VideoFrame>(3);
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let paused = Arc::new(AtomicBool::new(false));
         let stopped = Arc::new(AtomicBool::new(false));
-        let speed_secs = Arc::new(AtomicU64::new(1.0f64.to_bits()));
+        let queue = Arc::new(VideoQueue::new());
 
         let st = stopped.clone();
         let pa = paused.clone();
-        let spd = speed_secs.clone();
         let p = path.to_string();
         let ct = cmd_tx.clone();
+        let q = queue.clone();
 
         thread::spawn(move || {
-            decode_packets_loop(&p, start_pos, pkt_rx, frame_tx, cmd_rx, st, pa, spd);
+            decode_packets_loop(&p, start_pos, pkt_rx, q, cmd_rx, st, pa);
         });
 
-        (Self { frame_rx, speed_secs }, ct)
+        (Self { queue }, ct)
     }
 
-    /// Update the pacing speed (1.0 = normal).  Frames are produced at
-    /// content-rate × speed so they are not generated faster than needed.
-    pub fn set_speed(&self, speed: f64) {
-        self.speed_secs
-            .store(speed.to_bits(), Ordering::Relaxed);
+    /// Pop the frames the media clock has reached.
+    pub fn drain_upto(&self, clock: f64) -> (Option<VideoFrame>, usize) {
+        self.queue.drain_upto(clock)
     }
 
-    /// Non-blocking poll for the next decoded frame.
-    pub fn recv(&self) -> Option<VideoFrame> {
-        self.frame_rx.try_recv().ok()
+    /// Wake the decoder thread if it is blocked waiting for queue space.
+    pub fn interrupt(&self) {
+        self.queue.wake();
     }
 }
 
@@ -77,11 +135,10 @@ fn decode_packets_loop(
     path: &str,
     start_pos: f64,
     pkt_rx: mpsc::Receiver<ffmpeg::codec::packet::Packet>,
-    frame_tx: SyncSender<VideoFrame>,
+    queue: Arc<VideoQueue>,
     command_rx: mpsc::Receiver<DecoderCmd>,
     stopped: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
-    speed_secs: Arc<AtomicU64>,
 ) {
     if let Err(e) = ffmpeg::init() {
         tracing::error!("ffmpeg init: {e}");
@@ -106,12 +163,6 @@ fn decode_packets_loop(
         }
     };
     let time_base = stream.time_base();
-    let rate = stream.rate();
-    let fps = if rate.denominator() > 0 {
-        rate.numerator() as f64 / rate.denominator() as f64
-    } else {
-        30.0
-    };
 
     let ctx = match ffmpeg::codec::context::Context::from_parameters(stream.parameters()) {
         Ok(c) => c,
@@ -137,7 +188,9 @@ fn decode_packets_loop(
         decoder.format(),
         width,
         height,
-        format::Pixel::RGBA,
+        // NV12 keeps the CPU on the planar side (no RGB matrix); the GPU
+        // shader converts to RGB.  Half the upload bytes of RGBA.
+        format::Pixel::NV12,
         width,
         height,
         software::scaling::Flags::BILINEAR,
@@ -153,10 +206,7 @@ fn decode_packets_loop(
     // Frames decoded before the target pts (from the earlier keyframe)
     // are discarded below.
 
-    let mut rgb = frame::Video::empty();
-
-    let mut last_speed = f64::from_bits(speed_secs.load(Ordering::Relaxed)).max(0.1);
-    let mut next_frame_at = std::time::Instant::now();
+    let mut nv12 = frame::Video::empty();
 
     'outer: loop {
         // Drain commands (non-blocking).
@@ -170,7 +220,6 @@ fn decode_packets_loop(
                     DecoderCmd::Pause => paused.store(true, Ordering::Relaxed),
                     DecoderCmd::Resume => {
                         paused.store(false, Ordering::Relaxed);
-                        next_frame_at = std::time::Instant::now();
                     }
                 },
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -195,7 +244,6 @@ fn decode_packets_loop(
             Ok(p) => p,
             Err(_) => break, // channel closed (demux stopped / EOF)
         };
-
         if let Err(e) = decoder.send_packet(&packet) {
             if matches!(e, ffmpeg::Error::Eof) {
                 break;
@@ -231,7 +279,7 @@ fn decode_packets_loop(
                 continue 'outer;
             }
 
-            if let Err(e) = scaler.run(&decoded, &mut rgb) {
+            if let Err(e) = scaler.run(&decoded, &mut nv12) {
                 tracing::debug!("scale: {e}");
                 continue;
             }
@@ -247,33 +295,53 @@ fn decode_packets_loop(
                 continue;
             }
 
-            // Pace to content rate × current speed.
-            let sp = f64::from_bits(speed_secs.load(Ordering::Relaxed)).max(0.1);
-            if (sp - last_speed).abs() > 0.01 {
-                last_speed = sp;
-                next_frame_at = std::time::Instant::now();
-            }
-            let frame_period = 1.0 / (fps * sp);
-            let now = std::time::Instant::now();
-            if now < next_frame_at {
-                thread::sleep(next_frame_at - now);
-            }
-            next_frame_at += std::time::Duration::from_secs_f64(frame_period);
-
-            let data = Arc::new(rgb.data(0).to_vec());
+            let (y, y_stride) = pad_plane(
+                nv12.data(0),
+                nv12.stride(0),
+                nv12.height(),
+                nv12.width() as usize,
+            );
+            let uv_width = ((nv12.width() + 1) / 2) as usize;
+            let uv_height = (nv12.height() + 1) / 2;
+            let (uv, uv_stride) = pad_plane(
+                nv12.data(1),
+                nv12.stride(1),
+                uv_height,
+                uv_width * 2,
+            );
             let frame_out = VideoFrame {
-                data,
-                width,
-                height,
+                y: Arc::new(y),
+                uv: Arc::new(uv),
+                width: nv12.width(),
+                height: nv12.height(),
+                y_stride,
+                uv_stride,
                 pts_secs,
             };
-            if frame_tx.send(frame_out).is_err() {
-                stopped.store(true, Ordering::Relaxed);
-                break 'outer;
-            }
+            queue.push(frame_out, &stopped);
         }
     }
 
     let _ = decoder.send_eof();
     tracing::debug!("Video decoder thread (packets) finished");
+}
+
+/// Copy a decoded plane row-by-row into a buffer whose rows are aligned to
+/// 256 bytes — the alignment `wgpu::Queue::write_texture` requires for
+/// `bytes_per_row`.  Decoder line sizes are only 32/64-byte aligned, so the
+/// copy is cheap (plain memcpy per row, no pixel work).
+fn pad_plane(
+    src: &[u8],
+    src_stride: usize,
+    height: u32,
+    row_bytes: usize,
+) -> (Vec<u8>, u32) {
+    debug_assert!(row_bytes <= src_stride, "row_bytes {row_bytes} > src_stride {src_stride}");
+    let padded = (row_bytes + 255) / 256 * 256;
+    let mut out = vec![0u8; padded * height as usize];
+    for r in 0..height as usize {
+        out[r * padded..r * padded + row_bytes]
+            .copy_from_slice(&src[r * src_stride..r * src_stride + row_bytes]);
+    }
+    (out, padded as u32)
 }

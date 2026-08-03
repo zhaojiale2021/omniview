@@ -1,6 +1,6 @@
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::traits::HostTrait;
 
@@ -26,7 +26,11 @@ pub struct PlaybackController {
     /// PTS of the last displayed frame.  Sentinel -1.0 so a first frame at
     /// pts 0.0 is displayed (the dedupe threshold is |pts - last_pts| < 0.001).
     last_pts: f64,
-    pending: Option<VideoFrame>,
+    /// Demuxer has reported end-of-file (latched).
+    eof_seen: bool,
+    /// When the frame queue last delivered a frame; drives the EOF grace
+    /// period so buffered frames are shown before `Ended` fires.
+    last_frame_at: Option<Instant>,
 }
 
 impl PlaybackController {
@@ -45,7 +49,8 @@ impl PlaybackController {
             duration: 0.0,
             file_path: None,
             last_pts: -1.0,
-            pending: None,
+            eof_seen: false,
+            last_frame_at: None,
         }
     }
 
@@ -93,35 +98,19 @@ impl PlaybackController {
 
     /// Select the frame to display this cycle.
     ///
-    /// Ported from the legacy player's `try_recv_frame`: drain all
-    /// available frames, pick the newest one whose PTS is at/before the
-    /// clock, and hold one ahead in `pending`.  Returns None when no new
-    /// displayable frame is available.
+    /// The decoder keeps a bounded jitter buffer of decoded frames; the
+    /// queue pops every frame the media clock has reached and returns the
+    /// newest of those (older ones are skipped when the clock is ahead, e.g.
+    /// after a speed change).  Frames ahead of the clock stay buffered.
     pub fn next_video_frame(&mut self) -> Option<VideoFrame> {
         let clock_pos = self.clock.position();
-        let mut chosen: Option<VideoFrame> = None;
-        let mut newest_ahead: Option<VideoFrame> = None;
-
-        // The frame held from the last call.
-        if let Some(f) = self.pending.take() {
-            if f.pts_secs <= clock_pos {
-                chosen = Some(f);
-            } else {
-                newest_ahead = Some(f);
-            }
+        let (chosen, remaining) = match self.video {
+            Some(ref video) => video.drain_upto(clock_pos),
+            None => (None, 0),
+        };
+        if chosen.is_some() || remaining > 0 {
+            self.last_frame_at = Some(Instant::now());
         }
-
-        // Drain all available frames this cycle.
-        if let Some(ref video) = self.video {
-            while let Some(f) = video.recv() {
-                if f.pts_secs <= clock_pos {
-                    chosen = Some(f);
-                } else {
-                    newest_ahead = Some(f);
-                }
-            }
-        }
-        self.pending = newest_ahead;
 
         let frame = match chosen {
             Some(f) => f,
@@ -147,16 +136,30 @@ impl PlaybackController {
     /// Only fires from `Playing`: while paused the demuxer may already have
     /// buffered to EOF on short files, and a user pause must not be
     /// reinterpreted as "ended".  Resuming then reaches Ended normally.
+    ///
+    /// The demuxer reports EOF as soon as the file is fully read, which can
+    /// happen while decoded frames are still buffered (decode runs at full
+    /// speed into the queue).  The signal is latched and the transition only
+    /// fires once the queue has been empty for a grace period, so every
+    /// buffered frame is shown before the end state.  The grace also covers
+    /// slow decoders (e.g. 8K) that may still be producing the final frames.
     fn check_eof(&mut self) {
         if self.state != PlaybackState::Playing {
             return;
         }
-        let eof = self
-            .demux
-            .as_ref()
-            .map(|d| d.poll_eof())
-            .unwrap_or(false);
-        if eof {
+        if let Some(ref demux) = self.demux {
+            if demux.poll_eof() {
+                self.eof_seen = true;
+            }
+        }
+        if !self.eof_seen {
+            return;
+        }
+        let idle = self
+            .last_frame_at
+            .map(|t| t.elapsed())
+            .unwrap_or(Duration::MAX);
+        if idle > Duration::from_millis(400) {
             self.state = PlaybackState::Ended;
             self.clock.pause();
         }
@@ -297,9 +300,6 @@ impl PlaybackController {
     fn do_set_speed(&mut self, s: f64) -> Result<(), String> {
         self.speed = s;
         self.clock.set_speed(s);
-        if let Some(ref video) = self.video {
-            video.set_speed(s);
-        }
         if let Some(ref audio) = self.audio {
             audio.set_speed(s);
         }
@@ -319,7 +319,8 @@ impl PlaybackController {
         self.clock = MediaClock::new();
         self.state = PlaybackState::Idle;
         self.last_pts = -1.0;
-        self.pending = None;
+        self.eof_seen = false;
+        self.last_frame_at = None;
         self.duration = 0.0;
         self.file_path = None;
         Ok(())
@@ -429,7 +430,8 @@ impl PlaybackController {
         self.audio = audio;
         self.clock.reset(pos);
         self.last_pts = -1.0;
-        self.pending = None;
+        self.eof_seen = false;
+        self.last_frame_at = None;
 
         Ok(())
     }
@@ -441,7 +443,11 @@ impl PlaybackController {
         if let Some(cmd) = self.video_cmd.take() {
             let _ = cmd.send(DecoderCmd::Stop);
         }
-        self.video = None;
+        // Wake the decoder if it is blocked pushing into a full queue, so it
+        // can process the Stop command instead of leaking.
+        if let Some(video) = self.video.take() {
+            video.interrupt();
+        }
 
         // Stop audio pipeline.
         if let Some(audio) = self.audio.take() {

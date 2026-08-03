@@ -22,8 +22,15 @@ pub enum Command {
 
 #[derive(Clone)]
 pub struct VideoFrame {
-    pub data: Arc<Vec<u8>>,
+    /// Luma plane (NV12), row-aligned to the GPU upload stride.
+    pub y: Arc<Vec<u8>>,
+    /// Interleaved CbCr plane (NV12), row-aligned to the GPU upload stride.
+    pub uv: Arc<Vec<u8>>,
     pub width: u32,
     pub height: u32,
+    /// Bytes per row of `y` (multiple of 256, required by wgpu uploads).
+    pub y_stride: u32,
+    /// Bytes per row of `uv` (multiple of 256).
+    pub uv_stride: u32,
     pub pts_secs: f64,
 }

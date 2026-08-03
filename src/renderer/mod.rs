@@ -3,6 +3,8 @@ use wgpu::{PresentMode, TextureUsages};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
+use crate::media::types::VideoFrame;
+
 pub mod sphere;
 pub mod camera;
 pub mod quad;
@@ -38,11 +40,17 @@ pub struct Renderer {
     pub camera_bind_group: wgpu::BindGroup,
     pub texture_sampler: wgpu::Sampler,
     pub texture_bind_group_layout: wgpu::BindGroupLayout,
-    pub video_texture: Option<wgpu::Texture>,
-    pub video_texture_view: Option<wgpu::TextureView>,
+    pub y_texture: Option<wgpu::Texture>,
+    pub y_texture_view: Option<wgpu::TextureView>,
+    pub uv_texture: Option<wgpu::Texture>,
+    pub uv_texture_view: Option<wgpu::TextureView>,
     pub video_bind_group: Option<wgpu::BindGroup>,
     pub placeholder_bind_group: wgpu::BindGroup,
     pub camera: OrbitCamera,
+    /// Uploaded stride (bytes per row) of the current Y plane.
+    y_stride: u32,
+    /// Uploaded stride (bytes per row) of the current UV plane.
+    uv_stride: u32,
     pub egui_state: egui_winit::State,
     pub egui_renderer: egui_wgpu::Renderer,
 
@@ -70,6 +78,13 @@ impl Renderer {
             })
             .await
             .unwrap();
+        let adapter_info = adapter.get_info();
+        tracing::info!(
+            "GPU adapter: {} | backend={:?} | type={:?}",
+            adapter_info.name,
+            adapter_info.backend,
+            adapter_info.device_type
+        );
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
@@ -156,7 +171,7 @@ impl Renderer {
             ..Default::default()
         });
 
-        // Texture bind group layout
+        // Texture bind group layout: Y plane (R8), UV plane (Rg8), sampler.
         let texture_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Texture BGL"),
             entries: &[
@@ -173,26 +188,46 @@ impl Renderer {
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
         });
 
-        // Placeholder 1x1 white texture
-        let placeholder = device.create_texture(&wgpu::TextureDescriptor {
+        // Placeholder 1x1 textures (Y=255, Cb=128, Cr=128 → white).
+        let placeholder_y = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Placeholder"),
             size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let placeholder_uv = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Placeholder UV"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rg8Unorm,
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
             view_formats: &[],
         });
         queue.write_texture(
             wgpu::ImageCopyTexture {
-                texture: &placeholder,
+                texture: &placeholder_y,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -205,16 +240,36 @@ impl Renderer {
             },
             wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
         );
-        let placeholder_view = placeholder.create_view(&Default::default());
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &placeholder_uv,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[128u8, 128],
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(2),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        let placeholder_y_view = placeholder_y.create_view(&Default::default());
+        let placeholder_uv_view = placeholder_uv.create_view(&Default::default());
         let placeholder_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Placeholder BG"),
             layout: &texture_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&placeholder_view),
+                    resource: wgpu::BindingResource::TextureView(&placeholder_y_view),
                 },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&texture_sampler) },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&placeholder_uv_view),
+                },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&texture_sampler) },
             ],
         });
 
@@ -327,8 +382,11 @@ impl Renderer {
             sphere, render_pipeline, quad, quad_pipeline, is_360: false,
             camera_buffer, camera_bind_group,
             texture_sampler, texture_bind_group_layout: texture_bgl,
-            video_texture: None, video_texture_view: None, video_bind_group: None,
+            y_texture: None, y_texture_view: None,
+            uv_texture: None, uv_texture_view: None,
+            video_bind_group: None,
             placeholder_bind_group, camera,
+            y_stride: 0, uv_stride: 0,
             egui_state, egui_renderer,
             capture_path,
             capture_staging,
@@ -357,66 +415,105 @@ impl Renderer {
         self.update_camera(&vp);
     }
 
-    /// Upload a video frame into the GPU texture.  `write_texture`
-    /// enqueues a single staging→texture copy through wgpu's internal
-    /// ring — no per-frame allocations, no extra hop.
-    pub fn upload_video_frame(&mut self, rgba_data: &[u8], width: u32, height: u32) {
-        let bytes_needed = (width as usize) * (height as usize) * 4;
-        if bytes_needed == 0 { return; }
+    /// Upload an NV12 video frame into the GPU textures.  YUV→RGB is left
+    /// to the fragment shader, so the CPU only copies planar data (about
+    /// half the bytes of RGBA) and never runs an RGB conversion matrix.
+    pub fn upload_video_frame(&mut self, frame: &VideoFrame) {
+        let (width, height) = (frame.width, frame.height);
+        if width == 0 || height == 0 {
+            return;
+        }
+        let uv_w = (width + 1) / 2;
+        let uv_h = (height + 1) / 2;
 
-        // Ensure the video texture exists and is the correct size
-        let needs_new = match &self.video_texture {
+        // Ensure the video textures exist and are the correct size.
+        let needs_new = match &self.y_texture {
             Some(t) => t.width() != width || t.height() != height,
             None => true,
         };
         if needs_new {
-            let tex_size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
-            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Video Frame"),
-                size: tex_size,
+            let y_tex_size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
+            let y_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Video Y Plane"),
+                size: y_tex_size,
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                // COPY_SRC lets us read the frame back for screenshots.
+                format: wgpu::TextureFormat::R8Unorm,
+                // COPY_SRC lets screenshots read the frame back.
                 usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
-            let view = texture.create_view(&Default::default());
+            let uv_tex_size = wgpu::Extent3d { width: uv_w, height: uv_h, depth_or_array_layers: 1 };
+            let uv_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Video UV Plane"),
+                size: uv_tex_size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rg8Unorm,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let y_view = y_texture.create_view(&Default::default());
+            let uv_view = uv_texture.create_view(&Default::default());
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Video BG"),
                 layout: &self.texture_bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
+                        resource: wgpu::BindingResource::TextureView(&y_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&uv_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
                         resource: wgpu::BindingResource::Sampler(&self.texture_sampler),
                     },
                 ],
             });
-            self.video_texture = Some(texture);
-            self.video_texture_view = Some(view);
+            self.y_texture = Some(y_texture);
+            self.y_texture_view = Some(y_view);
+            self.uv_texture = Some(uv_texture);
+            self.uv_texture_view = Some(uv_view);
             self.video_bind_group = Some(bind_group);
         }
 
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
-                texture: self.video_texture.as_ref().unwrap(),
+                texture: self.y_texture.as_ref().unwrap(),
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &rgba_data[..bytes_needed],
+            &frame.y,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(4 * width),
+                bytes_per_row: Some(frame.y_stride),
                 rows_per_image: Some(height),
             },
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: self.uv_texture.as_ref().unwrap(),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &frame.uv,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(frame.uv_stride),
+                rows_per_image: Some(uv_h),
+            },
+            wgpu::Extent3d { width: uv_w, height: uv_h, depth_or_array_layers: 1 },
+        );
+        self.y_stride = frame.y_stride;
+        self.uv_stride = frame.uv_stride;
     }
 
     /// Render the video frame + egui overlay.
@@ -430,7 +527,7 @@ impl Renderer {
         clipped_primitives: &[egui::ClippedPrimitive],
         textures_delta: &egui::TexturesDelta,
         pixels_per_point: f32,
-        frame: Option<(std::sync::Arc<Vec<u8>>, u32, u32)>,
+        frame: Option<VideoFrame>,
     ) -> Result<(), wgpu::SurfaceError> {
         self.update_camera_uniform();
         let output = match self.surface.get_current_texture() {
@@ -443,8 +540,8 @@ impl Renderer {
         let mut encoder = self.device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Encoder") });
 
-        if let Some((data, width, height)) = frame {
-            self.upload_video_frame(&data, width, height);
+        if let Some(frame) = frame {
+            self.upload_video_frame(&frame);
         }
 
         // Upload egui textures
@@ -587,16 +684,21 @@ impl Renderer {
     /// Save the current video frame (no UI) as a PNG.  Returns false if
     /// there is no frame yet.  Blocks briefly for the GPU readback.
     pub fn save_frame_png(&mut self, path: &str) -> bool {
-        let Some(tex) = &self.video_texture else {
+        let (Some(y_tex), Some(uv_tex)) = (&self.y_texture, &self.uv_texture) else {
             return false;
         };
-        let (w, h) = (tex.width(), tex.height());
-        let size = (w as u64) * (h as u64) * 4;
+        let (w, h) = (y_tex.width(), y_tex.height());
+        let uv_h = uv_tex.height();
+        let y_stride = self.y_stride.max(((w + 255) / 256) * 256);
+        let uv_stride = self.uv_stride.max(((uv_tex.width() * 2 + 255) / 256) * 256);
+        let y_size = y_stride as u64 * h as u64;
+        let uv_size = uv_stride as u64 * uv_h as u64;
+        let total = y_size + uv_size;
 
-        if self.png_staging.as_ref().map(|b| b.size() != size).unwrap_or(true) {
+        if self.png_staging.as_ref().map(|b| b.size() != total).unwrap_or(true) {
             self.png_staging = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("PNG Staging"),
-                size,
+                size: total,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             }));
@@ -608,7 +710,7 @@ impl Renderer {
         });
         encoder.copy_texture_to_buffer(
             wgpu::ImageCopyTexture {
-                texture: tex,
+                texture: y_tex,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -617,11 +719,28 @@ impl Renderer {
                 buffer: staging,
                 layout: wgpu::ImageDataLayout {
                     offset: 0,
-                    bytes_per_row: Some(4 * w),
+                    bytes_per_row: Some(y_stride),
                     rows_per_image: Some(h),
                 },
             },
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: uv_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: staging,
+                layout: wgpu::ImageDataLayout {
+                    offset: y_size,
+                    bytes_per_row: Some(uv_stride),
+                    rows_per_image: Some(uv_h),
+                },
+            },
+            wgpu::Extent3d { width: uv_tex.width(), height: uv_h, depth_or_array_layers: 1 },
         );
         self.queue.submit([encoder.finish()]);
 
@@ -633,7 +752,27 @@ impl Renderer {
             return false;
         }
         let data = slice.get_mapped_range();
-        let ok = image::save_buffer(path, &data, w, h, image::ColorType::Rgba8).is_ok();
+        let y = &data[..y_size as usize];
+        let uv = &data[y_size as usize..];
+        let mut rgba = Vec::with_capacity((w as usize) * (h as usize) * 4);
+        for row in 0..h {
+            for col in 0..w {
+                let yv = y[row as usize * y_stride as usize + col as usize] as f32 / 255.0;
+                let u = uv[(row / 2) as usize * uv_stride as usize + (col / 2) as usize * 2] as f32
+                    / 255.0;
+                let v = uv[(row / 2) as usize * uv_stride as usize + (col / 2) as usize * 2 + 1]
+                    as f32
+                    / 255.0;
+                let y2 = (yv - 16.0 / 255.0) * (255.0 / 219.0);
+                let u2 = (u - 128.0 / 255.0) * (255.0 / 224.0);
+                let v2 = (v - 128.0 / 255.0) * (255.0 / 224.0);
+                let r = (y2 + 1.5748 * v2).clamp(0.0, 1.0) * 255.0;
+                let g = (y2 - 0.1873 * u2 - 0.4681 * v2).clamp(0.0, 1.0) * 255.0;
+                let b = (y2 + 1.8556 * u2).clamp(0.0, 1.0) * 255.0;
+                rgba.extend_from_slice(&[r as u8, g as u8, b as u8, 255]);
+            }
+        }
+        let ok = image::save_buffer(path, &rgba, w, h, image::ColorType::Rgba8).is_ok();
         drop(data);
         staging.unmap();
         ok
