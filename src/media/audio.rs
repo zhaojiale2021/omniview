@@ -228,15 +228,30 @@ impl AudioPipeline {
 
         let rx = pkt_rx.take().unwrap();
         let decoder_thread = thread::spawn(move || {
-            if let Err(e) = decode_audio_packets(
-                &path_owned,
-                rx,
-                cmd_rx,
-                spawn_rate,
-                spawn_channels,
-                sink,
-            ) {
-                tracing::error!("Audio decoder: {e}");
+            // Catch panics so a filter/FFI bug is logged instead of dying
+            // silently (on Windows there is no console to see the panic).
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                decode_audio_packets(
+                    &path_owned,
+                    rx,
+                    cmd_rx,
+                    spawn_rate,
+                    spawn_channels,
+                    start_pos,
+                    sink,
+                )
+            }));
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::error!("Audio decoder: {e}"),
+                Err(p) => {
+                    let msg = p
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| p.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".into());
+                    tracing::error!("Audio decoder PANICKED: {msg}");
+                }
             }
             tracing::info!("Audio: decoder thread finished");
             // Signal the cpal callback to stop expecting data.
@@ -305,6 +320,7 @@ fn decode_audio_packets(
     cmd_rx: mpsc::Receiver<AudioCmd>,
     sample_rate: u32,
     channels: u16,
+    start_pos: f64,
     mut sink: impl FnMut(Vec<f32>) + Send,
 ) -> Result<(), String> {
     ffmpeg::init().map_err(|e| format!("ffmpeg init: {e}"))?;
@@ -318,6 +334,7 @@ fn decode_audio_packets(
         .best(media::Type::Audio)
         .ok_or_else(|| "no audio stream".to_string())?;
     tracing::info!("Audio: opened file, audio stream index={}", audio_stream.index());
+    let audio_time_base = audio_stream.time_base();
 
     let ctx = codec::context::Context::from_parameters(audio_stream.parameters())
         .map_err(|e| format!("audio codec context: {e}"))?;
@@ -329,18 +346,11 @@ fn decode_audio_packets(
         .set_parameters(audio_stream.parameters())
         .map_err(|e| format!("set audio decoder params: {e}"))?;
 
-    // Swr resampler: decoder native format -> interleaved f32 @ target rate/channels.
-    let output_layout = ChannelLayout::default(channels as i32);
-    let mut resampler = software::resampling::Context::get(
-        decoder.format(),
-        decoder.channel_layout(),
-        decoder.rate(),
-        format::Sample::F32(format::sample::Type::Packed),
-        output_layout,
-        sample_rate,
-    )
-    .map_err(|e| format!("swr context: {e}"))?;
-    tracing::info!("Audio: swr ready -> {sample_rate} Hz / {channels} ch");
+    // Swr resampler: created lazily from the FIRST real frame's parameters
+    // and rebuilt when the input format changes.  The decoder's reported
+    // channel layout can be unset, which made swr reject every real frame
+    // with "Input changed" — killing audio the moment atempo engaged.
+    let mut resampler: Option<software::resampling::Context> = None;
 
     // ── Atempo filter graph (None when speed == 1.0) ──────────────
     let mut atempo: Option<filter::Graph> = None;
@@ -373,13 +383,10 @@ fn decode_audio_packets(
             )
             .map_err(|e| format!("add abuffersink: {e}"))?;
 
-        {
-            let mut out = graph.get("out").unwrap();
-            out.set_sample_format(decoder.format());
-            out.set_channel_layout(decoder.channel_layout());
-            out.set_sample_rate(decoder.rate());
-        }
-
+        // Note: abuffersink options are NOT set here — they are non-runtime
+        // options and setting them after graph.add() fails with warnings.
+        // atempo passes the input format through, and the swr resampler is
+        // built from the actual frames, so no sink configuration is needed.
         let spec = format!("atempo={speed}");
         graph
             .output("in", 0)
@@ -499,6 +506,20 @@ fn decode_audio_packets(
 
         // (4) Receive decoded frames.
         while decoder.receive_frame(&mut decoded).is_ok() {
+            // Discard audio decoded before the seek target: the demux seeks
+            // BACKWARD to a keyframe, and without this filter the ring plays
+            // pre-target audio, leaving A/V desynced by the keyframe
+            // distance after every seek.
+            if start_pos > 0.01 {
+                if let Some(pts) = decoded.timestamp().or(decoded.pts()) {
+                    let pts_secs = pts as f64
+                        * audio_time_base.numerator() as f64
+                        / audio_time_base.denominator() as f64;
+                    if pts_secs < start_pos {
+                        continue;
+                    }
+                }
+            }
             // Process the decoded frame through atempo filter (if active),
             // then resample to target format.
             let frames_to_resample: Vec<frame::Audio> = if let Some(ref mut graph) = atempo {
@@ -534,9 +555,19 @@ fn decode_audio_packets(
 
             for f in frames_to_resample {
                 // Resample to interleaved f32 @ target rate/channels.
-                if let Err(e) = resampler.run(&f, &mut resampled) {
-                    tracing::warn!("audio swr run: {e}");
-                    continue;
+                if resampler.is_none() {
+                    resampler = Some(new_resampler(&f, channels, sample_rate)?);
+                    tracing::info!("Audio: swr ready -> {sample_rate} Hz / {channels} ch");
+                }
+                if let Err(e) = resampler.as_mut().unwrap().run(&f, &mut resampled) {
+                    // Input parameters changed (atempo output negotiation):
+                    // rebuild from this frame and retry once.
+                    tracing::warn!("audio swr run: {e}; rebuilding resampler");
+                    resampler = Some(new_resampler(&f, channels, sample_rate)?);
+                    if let Err(e2) = resampler.as_mut().unwrap().run(&f, &mut resampled) {
+                        tracing::warn!("audio swr run after rebuild: {e2}");
+                        continue;
+                    }
                 }
 
                 // Extract interleaved f32 samples from the resampled frame.
@@ -557,6 +588,7 @@ fn decode_audio_packets(
 
                 // Flush swr internal frames.
                 loop {
+                    let Some(resampler) = resampler.as_mut() else { break };
                     match resampler.flush(&mut resampled) {
                         Ok(Some(_)) => {
                             let flush_bytes = resampled.data(0);
@@ -591,9 +623,11 @@ fn decode_audio_packets(
                 match graph.get("out").unwrap().sink().frame(&mut filtered) {
                     Ok(()) => {
                         let f = std::mem::replace(&mut filtered, frame::Audio::empty());
-                        resampler
-                            .run(&f, &mut resampled)
-                            .map_err(|e| format!("swr run: {e}"))?;
+                        let Some(resampler) = resampler.as_mut() else { break };
+                        if let Err(e) = resampler.run(&f, &mut resampled) {
+                            tracing::warn!("audio swr flush: {e}");
+                            continue;
+                        }
                         let bytes = resampled.data(0);
                         let samples: Vec<f32> = bytes
                             .chunks_exact(4)
@@ -609,9 +643,11 @@ fn decode_audio_packets(
                 }
             }
         } else {
-            resampler
-                .run(&decoded, &mut resampled)
-                .map_err(|e| format!("swr run: {e}"))?;
+            let Some(resampler) = resampler.as_mut() else { continue };
+            if let Err(e) = resampler.run(&decoded, &mut resampled) {
+                tracing::warn!("audio swr flush: {e}");
+                continue;
+            }
             let bytes = resampled.data(0);
             let samples: Vec<f32> = bytes
                 .chunks_exact(4)
@@ -630,9 +666,11 @@ fn decode_audio_packets(
             match graph.get("out").unwrap().sink().frame(&mut filtered) {
                 Ok(()) => {
                     let f = std::mem::replace(&mut filtered, frame::Audio::empty());
-                    resampler
-                        .run(&f, &mut resampled)
-                        .map_err(|e| format!("swr run: {e}"))?;
+                    let Some(resampler) = resampler.as_mut() else { break };
+                    if let Err(e) = resampler.run(&f, &mut resampled) {
+                        tracing::warn!("audio swr flush: {e}");
+                        continue;
+                    }
                     let bytes = resampled.data(0);
                     let samples: Vec<f32> = bytes
                         .chunks_exact(4)
@@ -651,6 +689,7 @@ fn decode_audio_packets(
 
     // Flush swr internal frames.
     loop {
+        let Some(resampler) = resampler.as_mut() else { break };
         match resampler.flush(&mut resampled) {
             Ok(Some(_)) => {
                 let flush_bytes = resampled.data(0);
@@ -671,6 +710,27 @@ fn decode_audio_packets(
     }
 
     Ok(())
+}
+
+/// Build a swr context for converting a frame to the target output
+/// configuration.  Uses the FRAME's actual format/layout/rate: the
+/// decoder's reported channel layout can be unset, which makes swr reject
+/// every real frame with "Input changed".
+fn new_resampler(
+    frame: &ffmpeg::frame::Audio,
+    channels: u16,
+    sample_rate: u32,
+) -> Result<software::resampling::Context, String> {
+    let output_layout = ChannelLayout::default(channels as i32);
+    software::resampling::Context::get(
+        frame.format(),
+        frame.channel_layout(),
+        frame.rate(),
+        format::Sample::F32(format::sample::Type::Packed),
+        output_layout,
+        sample_rate,
+    )
+    .map_err(|e| format!("swr context: {e}"))
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -723,6 +783,7 @@ mod tests {
                 cmd_rx,
                 48000,
                 2,
+                0.0,
                 sink,
             );
         });
@@ -745,6 +806,119 @@ mod tests {
         assert!(final_samples > 0, "decoded audio samples must be non-empty");
 
         // Send Stop so the decode thread exits cleanly.
+        let _ = cmd_tx.send(AudioCmd::Stop);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn atempo_speed_change_keeps_thread_alive() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+
+        // Reproduces the Windows regression: applying a speed change
+        // (atempo filter) killed the audio thread silently.  Verifies the
+        // thread stays alive and produces samples at ~2x the 1x rate.
+        //
+        // All audio packets are collected into an unbounded channel first,
+        // so the demux reaching EOF cannot starve the decoder mid-test.
+        let mut demux = Demux::open("/tmp/test_av20.mp4", 0.0);
+        let _info = loop {
+            if let Some(r) = demux.poll_ready() {
+                break r.unwrap();
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        let (video_rx, audio_rx) = demux.take_channels().unwrap();
+        let _video_drain = thread::spawn(move || while video_rx.recv().is_ok() {});
+
+        let (pkt_tx, pkt_rx) = mpsc::channel::<ffmpeg::codec::packet::Packet>();
+        let _feed = thread::spawn(move || {
+            while let Ok(p) = audio_rx.recv() {
+                if pkt_tx.send(p).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCmd>();
+        // Simulate the production ring buffer: the sink blocks when the
+        // queue is full (1.2s), a consumer drains it at device rate
+        // (960 samples per 10ms at 48 kHz / 2 ch).
+        let ring: Arc<Mutex<std::collections::VecDeque<f32>>> =
+            Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let produced: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+        let produced_sink = produced.clone();
+        let ring_sink = ring.clone();
+        let sink = move |samples: Vec<f32>| {
+            let mut r = ring_sink.lock().unwrap();
+            while r.len() + samples.len() > 115_200 {
+                drop(r);
+                thread::sleep(Duration::from_millis(5));
+                r = ring_sink.lock().unwrap();
+            }
+            let n = samples.len() as u64;
+            r.extend(samples);
+            *produced_sink.lock().unwrap() += n;
+        };
+        let _consumer = {
+            let ring_c = ring.clone();
+            thread::spawn(move || {
+                loop {
+                    let mut r = ring_c.lock().unwrap();
+                    let take = 960.min(r.len());
+                    r.drain(..take);
+                    drop(r);
+                    thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
+
+        let handle = thread::spawn(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                decode_audio_packets("/tmp/test_av20.mp4", pkt_rx, cmd_rx, 48000, 2, 0.0, sink)
+            }));
+            match r {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(format!("decode err: {e}")),
+                Err(p) => Some(format!(
+                    "PANIC: {}",
+                    p.downcast_ref::<&str>().copied().unwrap_or("?")
+                )),
+            }
+        });
+
+        // Wait for the first samples.
+        let dl = std::time::Instant::now() + Duration::from_secs(5);
+        while *produced.lock().unwrap() == 0 && std::time::Instant::now() < dl {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(*produced.lock().unwrap() > 0, "no samples at 1x");
+
+        // Baseline: the decoder must keep producing at 1x.
+        let t0 = *produced.lock().unwrap();
+        thread::sleep(Duration::from_secs(1));
+        let base = *produced.lock().unwrap() - t0;
+        assert!(base > 0, "no baseline production");
+
+        // Switch to 2x — the production regression killed the thread here.
+        let _ = cmd_tx.send(AudioCmd::Speed(2.0));
+        thread::sleep(Duration::from_millis(500)); // let atempo engage
+
+        // The thread must still be alive and producing after the change.
+        let t0 = *produced.lock().unwrap();
+        thread::sleep(Duration::from_secs(1));
+        let after = *produced.lock().unwrap() - t0;
+        assert!(
+            !handle.is_finished(),
+            "audio thread died during speed change: {:?}",
+            handle.join().ok().flatten()
+        );
+        assert!(
+            after > 0,
+            "audio stopped producing after speed change (baseline was {base})"
+        );
+
         let _ = cmd_tx.send(AudioCmd::Stop);
         let _ = handle.join();
     }
