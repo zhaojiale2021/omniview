@@ -179,8 +179,11 @@ impl AudioPipeline {
         // ── Command channel ───────────────────────────────────────
         let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCmd>();
 
-        // ── Ring buffer backpressure: 200ms cap ───────────────────
-        let buf_cap = (sample_rate as usize) * (channels as usize) * 200 / 1000;
+        // ── Ring buffer backpressure: 600ms cap ───────────────────
+        // A larger buffer absorbs decode-thread hiccups (demux I/O, thread
+        // scheduling) so the cpal callback never underruns — an underrun
+        // stalls the audio master clock and stutters video with it.
+        let buf_cap = (sample_rate as usize) * (channels as usize) * 600 / 1000;
         let sh_sink = shared.clone();
 
         // Sink closure: push interleaved f32 into ring buffer.

@@ -10,6 +10,13 @@ use crate::media::demux::Demux;
 use crate::media::types::{Command, PlaybackState, VideoFrame};
 use crate::media::video::{DecoderCmd, VideoDecoder};
 
+/// Video frames are selected with a small lookahead (about one 60 Hz vsync)
+/// so the texture swap lands on a stable 2-vsync cadence for 30 fps content
+/// on a 60 Hz display.  Without it, audio-clock delivery jitter (± one
+/// audio callback period) makes the swap alternate between 2 and 3 vsyncs,
+/// which is visible as a judder every few seconds.
+const SELECTION_LOOKAHEAD: f64 = 1.0 / 60.0;
+
 pub struct PlaybackController {
     state: PlaybackState,
     volume: f32,
@@ -103,7 +110,10 @@ impl PlaybackController {
     /// newest of those (older ones are skipped when the clock is ahead, e.g.
     /// after a speed change).  Frames ahead of the clock stay buffered.
     pub fn next_video_frame(&mut self) -> Option<VideoFrame> {
-        let clock_pos = self.clock.position();
+        // Look ahead by about one vsync: the texture change takes effect at
+        // the next present, so selecting the frame due at that vsync keeps a
+        // stable cadence instead of alternating 2/3 vsyncs.
+        let clock_pos = self.clock.position() + SELECTION_LOOKAHEAD;
         let (chosen, remaining) = match self.video {
             Some(ref video) => video.drain_upto(clock_pos),
             None => (None, 0),

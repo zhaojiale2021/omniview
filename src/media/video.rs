@@ -208,6 +208,16 @@ fn decode_packets_loop(
 
     let mut nv12 = frame::Video::empty();
 
+    // Frame pool: 8 reusable plane-buffer slots.  The queue holds at most 6
+    // frames plus one held by the renderer, so a slot's Arc is private again
+    // by the time we cycle back to it — `Arc::make_mut` reuses the
+    // allocation and we never allocate/free ~10 MB per frame (large-block
+    // allocator churn causes periodic hitches).
+    let mut frame_pool: Vec<(Arc<Vec<u8>>, Arc<Vec<u8>>)> = (0..8)
+        .map(|_| (Arc::new(Vec::new()), Arc::new(Vec::new())))
+        .collect();
+    let mut next_slot = 0usize;
+
     'outer: loop {
         // Drain commands (non-blocking).
         loop {
@@ -295,23 +305,32 @@ fn decode_packets_loop(
                 continue;
             }
 
-            let (y, y_stride) = pad_plane(
+            let slot = next_slot;
+            next_slot = (next_slot + 1) % frame_pool.len();
+            let (y_arc, uv_arc) = &mut frame_pool[slot];
+            let y_buf = Arc::make_mut(y_arc);
+            y_buf.clear();
+            let y_stride = pad_plane_into(
                 nv12.data(0),
                 nv12.stride(0),
                 nv12.height(),
                 nv12.width() as usize,
+                y_buf,
             );
+            let uv_buf = Arc::make_mut(uv_arc);
+            uv_buf.clear();
             let uv_width = ((nv12.width() + 1) / 2) as usize;
             let uv_height = (nv12.height() + 1) / 2;
-            let (uv, uv_stride) = pad_plane(
+            let uv_stride = pad_plane_into(
                 nv12.data(1),
                 nv12.stride(1),
                 uv_height,
                 uv_width * 2,
+                uv_buf,
             );
             let frame_out = VideoFrame {
-                y: Arc::new(y),
-                uv: Arc::new(uv),
+                y: frame_pool[slot].0.clone(),
+                uv: frame_pool[slot].1.clone(),
                 width: nv12.width(),
                 height: nv12.height(),
                 y_stride,
@@ -326,22 +345,26 @@ fn decode_packets_loop(
     tracing::debug!("Video decoder thread (packets) finished");
 }
 
-/// Copy a decoded plane row-by-row into a buffer whose rows are aligned to
-/// 256 bytes — the alignment `wgpu::Queue::write_texture` requires for
-/// `bytes_per_row`.  Decoder line sizes are only 32/64-byte aligned, so the
-/// copy is cheap (plain memcpy per row, no pixel work).
-fn pad_plane(
+/// Copy a decoded plane row-by-row into `out` with rows aligned to 256
+/// bytes — the alignment `wgpu::Queue::write_texture` requires for
+/// `bytes_per_row`.  The output buffer comes from the decoder's frame pool,
+/// so steady-state playback performs no per-frame allocations.
+fn pad_plane_into(
     src: &[u8],
     src_stride: usize,
     height: u32,
     row_bytes: usize,
-) -> (Vec<u8>, u32) {
+    out: &mut Vec<u8>,
+) -> u32 {
     debug_assert!(row_bytes <= src_stride, "row_bytes {row_bytes} > src_stride {src_stride}");
     let padded = (row_bytes + 255) / 256 * 256;
-    let mut out = vec![0u8; padded * height as usize];
+    let need = padded * height as usize;
+    if out.len() < need {
+        out.resize(need, 0);
+    }
     for r in 0..height as usize {
         out[r * padded..r * padded + row_bytes]
             .copy_from_slice(&src[r * src_stride..r * src_stride + row_bytes]);
     }
-    (out, padded as u32)
+    padded as u32
 }

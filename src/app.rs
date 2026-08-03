@@ -139,7 +139,13 @@ impl App {
                 }
             }
             if let Ok(json) = serde_json::to_string(&self.state) {
-                let _ = std::fs::write(&self.state_path, json);
+                // Write on a background thread: a synchronous file write on
+                // the render thread every STATE_SAVE_INTERVAL causes a
+                // visible periodic hitch ("plays a few seconds, stutters").
+                let path = self.state_path.clone();
+                std::thread::spawn(move || {
+                    let _ = std::fs::write(&path, json);
+                });
             }
         }
     }
