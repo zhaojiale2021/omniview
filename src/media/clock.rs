@@ -24,6 +24,12 @@ pub struct MediaClock {
     start_pos: f64,
     paused_pos: f64,
     audio_clock: Option<AudioClockRef>,
+    /// Baseline for the audio master clock: the sample counter value and the
+    /// position it maps to.  Re-anchored on attach/play/reset/set_speed so
+    /// the audio branch behaves like the Instant branch (baseline + delta),
+    /// giving position discontinuities-free speed changes and seeks.
+    audio_base_samples: u64,
+    audio_base_pos: f64,
 }
 
 impl MediaClock {
@@ -35,6 +41,8 @@ impl MediaClock {
             start_pos: 0.0,
             paused_pos: 0.0,
             audio_clock: None,
+            audio_base_samples: 0,
+            audio_base_pos: 0.0,
         }
     }
 
@@ -47,7 +55,11 @@ impl MediaClock {
         sample_rate: u32,
         channels: u16,
     ) {
+        let base_samples = samples_played.load(Ordering::Relaxed);
+        let base_pos = self.position();
         self.audio_clock = Some(AudioClockRef { samples_played, sample_rate, channels });
+        self.audio_base_samples = base_samples;
+        self.audio_base_pos = base_pos;
     }
 
     /// Detach the audio master clock, falling back to the Instant path.
@@ -65,12 +77,24 @@ impl MediaClock {
             self.start = Some(Instant::now());
             self.start_pos = pos;
         }
+        // Re-anchor the audio master clock at the same counter value with the
+        // OLD position so a live speed change is seamless (no jump).
+        if let Some(a) = &self.audio_clock {
+            self.audio_base_samples = a.samples_played.load(Ordering::Relaxed);
+            self.audio_base_pos = pos;
+        }
     }
 
     pub fn play(&mut self, pos: f64) {
         self.playing = true;
         self.start = Some(Instant::now());
         self.start_pos = pos;
+        // Re-anchor so the audio branch starts at `pos` from the current
+        // counter value (seeks at speed != 1 land on `pos`, not pos*speed).
+        if let Some(a) = &self.audio_clock {
+            self.audio_base_samples = a.samples_played.load(Ordering::Relaxed);
+            self.audio_base_pos = pos;
+        }
     }
 
     pub fn pause(&mut self) {
@@ -88,8 +112,13 @@ impl MediaClock {
     pub fn position(&self) -> f64 {
         if self.playing {
             if let Some(a) = &self.audio_clock {
-                let played = a.samples_played.load(Ordering::Relaxed) as f64;
-                (played / (a.sample_rate as f64 * a.channels as f64)) * self.speed
+                let played = a.samples_played.load(Ordering::Relaxed);
+                // Baseline + delta, mirroring the Instant branch.  `played`
+                // is monotonic and `audio_base_samples` was captured from it,
+                // so saturating_sub guards any transient skew.
+                let delta = played.saturating_sub(self.audio_base_samples) as f64;
+                self.audio_base_pos
+                    + delta / (a.sample_rate as f64 * a.channels as f64) * self.speed
             } else {
                 match self.start {
                     Some(t) => self.start_pos + t.elapsed().as_secs_f64() * self.speed,
@@ -110,6 +139,12 @@ impl MediaClock {
         if self.playing {
             self.start = Some(Instant::now());
             self.start_pos = pos;
+        }
+        // Re-anchor the audio master clock at `pos` from the current counter
+        // (open/seek at speed != 1 must not multiply the target by speed).
+        if let Some(a) = &self.audio_clock {
+            self.audio_base_samples = a.samples_played.load(Ordering::Relaxed);
+            self.audio_base_pos = pos;
         }
     }
 }
@@ -138,5 +173,54 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         let p2 = c.position();
         assert!((p2 - p1) > 0.3); // 2x over 200ms ≈ 0.4s
+    }
+
+    #[test]
+    fn audio_clock_speed_change_is_continuous() {
+        // Fake audio master clock: no cpal device needed.  48 kHz / 2 ch.
+        let rate = 48000u32;
+        let ch = 2u16;
+        let sec = rate as u64 * ch as u64; // samples per second
+        let counter = Arc::new(AtomicU64::new(0));
+
+        let mut c = MediaClock::new();
+        c.attach_audio(counter.clone(), rate, ch);
+        c.play(0.0);
+
+        // Simulate 10s played at 1x: counter = 10s of samples.
+        counter.store(10 * sec, Ordering::Relaxed);
+        assert!((c.position() - 10.0).abs() < 0.001, "10s @ 1x");
+
+        // Live speed change to 2x must NOT jump to 20s — it stays at 10s
+        // (continuity), and subsequent samples advance at 2x.
+        c.set_speed(2.0);
+        assert!(
+            (c.position() - 10.0).abs() < 0.001,
+            "position must stay ≈10s after set_speed(2.0), got {}",
+            c.position()
+        );
+
+        // Advance the counter by 1 more second of samples → +1s × 2.0 = +2s.
+        counter.store(11 * sec, Ordering::Relaxed);
+        assert!(
+            (c.position() - 12.0).abs() < 0.001,
+            "10s + 1s at 2x must be ≈12s, got {}",
+            c.position()
+        );
+
+        // reset() re-anchors: position must jump to the target, not
+        // target × speed, and stay put until the counter advances.
+        c.reset(5.0);
+        assert!(
+            (c.position() - 5.0).abs() < 0.001,
+            "reset(5.0) at speed 2.0 must be ≈5s, got {}",
+            c.position()
+        );
+        counter.store(12 * sec, Ordering::Relaxed); // +1s of samples
+        assert!(
+            (c.position() - 7.0).abs() < 0.001,
+            "5s + 1s at 2x must be ≈7s, got {}",
+            c.position()
+        );
     }
 }

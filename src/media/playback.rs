@@ -23,6 +23,8 @@ pub struct PlaybackController {
     speed: f64,
     duration: f64,
     file_path: Option<String>,
+    /// PTS of the last displayed frame.  Sentinel -1.0 so a first frame at
+    /// pts 0.0 is displayed (the dedupe threshold is |pts - last_pts| < 0.001).
     last_pts: f64,
     pending: Option<VideoFrame>,
 }
@@ -42,7 +44,7 @@ impl PlaybackController {
             speed: 1.0,
             duration: 0.0,
             file_path: None,
-            last_pts: 0.0,
+            last_pts: -1.0,
             pending: None,
         }
     }
@@ -284,7 +286,7 @@ impl PlaybackController {
         self.teardown();
         self.clock = MediaClock::new();
         self.state = PlaybackState::Idle;
-        self.last_pts = 0.0;
+        self.last_pts = -1.0;
         self.pending = None;
         self.duration = 0.0;
         self.file_path = None;
@@ -374,14 +376,27 @@ impl PlaybackController {
         };
 
         // ── Video ────────────────────────────────────────────────
-        let (video, video_cmd) = VideoDecoder::from_packets(path, video_rx, pos);
+        // Only spawn the video decoder when the file actually has a video
+        // stream.  `decode_packets_loop` early-returns on "No video stream"
+        // (dropping its packet receiver); the demux's next video send would
+        // then hit Disconnected, break 'outer, and silently starve the audio
+        // decoder while the controller stays Playing.  With has_video ==
+        // false we keep video None — the demux never routes video packets (no
+        // video stream index), so no Disconnected is ever observed.
+        let (video, video_cmd) = if info.has_video {
+            let (v, c) = VideoDecoder::from_packets(path, video_rx, pos);
+            (Some(v), Some(c))
+        } else {
+            // Drop the (never-fed) video receiver immediately.
+            (None, None)
+        };
 
         self.demux = Some(demux);
-        self.video = Some(video);
-        self.video_cmd = Some(video_cmd);
+        self.video = video;
+        self.video_cmd = video_cmd;
         self.audio = audio;
         self.clock.reset(pos);
-        self.last_pts = 0.0;
+        self.last_pts = -1.0;
         self.pending = None;
 
         Ok(())

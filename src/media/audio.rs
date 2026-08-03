@@ -95,17 +95,32 @@ impl AudioPipeline {
                     &cfg,
                     move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
                         // NEVER panic in the callback.
-                        let n = data.len() as u64;
                         if sh.paused.load(Ordering::Relaxed) {
                             data.fill(0.0);
                             return; // do NOT advance samples_played — pause freezes the master clock
                         }
-                        sh.samples_played.fetch_add(n, Ordering::Relaxed);
                         let vol = sh.volume.lock().map(|v| *v).unwrap_or(1.0);
                         match sh.buffer.lock() {
                             Ok(mut buf) => {
+                                // Advance the master clock only for REAL
+                                // samples popped from the ring buffer, NOT
+                                // for zero-fill silence played while the
+                                // buffer is still filling (startup underflow)
+                                // or mid-stream.  Counting `data.len()` makes
+                                // the clock run ahead of the audible track by
+                                // the buffer latency, permanently.
+                                let mut real = 0u64;
                                 for sample in data.iter_mut() {
-                                    *sample = buf.pop_front().unwrap_or(0.0) * vol;
+                                    match buf.pop_front() {
+                                        Some(s) => {
+                                            *sample = s * vol;
+                                            real += 1;
+                                        }
+                                        None => *sample = 0.0,
+                                    }
+                                }
+                                if real > 0 {
+                                    sh.samples_played.fetch_add(real, Ordering::Relaxed);
                                 }
                             }
                             Err(_) => data.fill(0.0),
@@ -386,7 +401,17 @@ fn decode_audio_packets(
                                     match build_atempo(&decoder, s) {
                                         Ok(g) => atempo = Some(g),
                                         Err(e) => {
-                                            tracing::warn!("atempo rebuild: {e}");
+                                            // Loud, diagnosable failure: the
+                                            // clock still multiplies by speed
+                                            // even when atempo is None, so a
+                                            // silent None desyncs A/V at
+                                            // speed != 1.
+                                            tracing::error!(
+                                                "atempo filter build failed (codec={}, speed={:.3}): {}",
+                                                decoder.format().name(),
+                                                s,
+                                                e
+                                            );
                                             atempo = None;
                                         }
                                     }
@@ -405,7 +430,12 @@ fn decode_audio_packets(
                         match build_atempo(&decoder, s) {
                             Ok(g) => atempo = Some(g),
                             Err(e) => {
-                                tracing::warn!("atempo rebuild: {e}");
+                                tracing::error!(
+                                    "atempo filter build failed (codec={}, speed={:.3}): {}",
+                                    decoder.format().name(),
+                                    s,
+                                    e
+                                );
                                 atempo = None;
                             }
                         }
@@ -621,8 +651,15 @@ mod tests {
         };
         assert!(info.has_audio, "test file must have an audio stream");
 
-        // Take the channels; we only need audio.
-        let (_video_rx, audio_rx) = demux.take_channels().unwrap();
+        // Take the channels; we only need audio.  The video receiver MUST be
+        // drained: the demux's video channel (cap 64) otherwise fills, the
+        // demux enters its hold-and-retry loop and never reaches EOF, the
+        // audio thread parks on pkt_rx.recv(), and the Stop command below is
+        // never processed — handle.join() hangs forever.  A background drain
+        // lets the demux route both streams to EOF so the audio thread
+        // decodes a real chunk and exits on EOF.
+        let (video_rx, audio_rx) = demux.take_channels().unwrap();
+        let _video_drain = thread::spawn(move || while video_rx.recv().is_ok() {});
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCmd>();
         let collected: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
