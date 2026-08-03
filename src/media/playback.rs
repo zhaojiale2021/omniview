@@ -10,12 +10,6 @@ use crate::media::demux::Demux;
 use crate::media::types::{Command, PlaybackState, VideoFrame};
 use crate::media::video::{DecoderCmd, VideoDecoder};
 
-/// Video frames are selected with a small lookahead (about one 60 Hz vsync)
-/// so the texture swap lands on a stable 2-vsync cadence for 30 fps content
-/// on a 60 Hz display.  Without it, audio-clock delivery jitter (± one
-/// audio callback period) makes the swap alternate between 2 and 3 vsyncs,
-/// which is visible as a judder every few seconds.
-const SELECTION_LOOKAHEAD: f64 = 1.0 / 60.0;
 
 pub struct PlaybackController {
     state: PlaybackState,
@@ -89,6 +83,16 @@ impl PlaybackController {
         self.file_path.as_deref()
     }
 
+    /// Ring-buffer underflow count of the audio pipeline (diagnostics).
+    pub fn audio_underruns(&self) -> u64 {
+        self.audio.as_ref().map(|a| a.underruns()).unwrap_or(0)
+    }
+
+    /// Decoded video frames waiting ahead of the clock (diagnostics).
+    pub fn buffered_frames(&self) -> usize {
+        self.video.as_ref().map(|v| v.buffered()).unwrap_or(0)
+    }
+
     /// Apply a command: validate, drive the pipeline, and update state.
     pub fn apply(&mut self, cmd: Command) -> Result<(), String> {
         match cmd {
@@ -109,11 +113,14 @@ impl PlaybackController {
     /// queue pops every frame the media clock has reached and returns the
     /// newest of those (older ones are skipped when the clock is ahead, e.g.
     /// after a speed change).  Frames ahead of the clock stay buffered.
-    pub fn next_video_frame(&mut self) -> Option<VideoFrame> {
-        // Look ahead by about one vsync: the texture change takes effect at
-        // the next present, so selecting the frame due at that vsync keeps a
-        // stable cadence instead of alternating 2/3 vsyncs.
-        let clock_pos = self.clock.position() + SELECTION_LOOKAHEAD;
+    /// Select the frame to display this cycle.
+    ///
+    /// `lookahead` is the media time until the texture swap takes effect
+    /// (about one vsync on a 60 Hz display, scaled by playback speed).  The
+    /// app measures the vsync phase so the swap lands on a stable cadence
+    /// instead of alternating 2/3 vsyncs as the audio clock jitters.
+    pub fn next_video_frame(&mut self, lookahead: f64) -> Option<VideoFrame> {
+        let clock_pos = self.clock.position() + lookahead;
         let (chosen, remaining) = match self.video {
             Some(ref video) => video.drain_upto(clock_pos),
             None => (None, 0),
@@ -536,7 +543,7 @@ mod tests {
         let mut frame = None;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while frame.is_none() && std::time::Instant::now() < deadline {
-            frame = ctl.next_video_frame();
+            frame = ctl.next_video_frame(1.0 / 60.0);
             if frame.is_none() {
                 thread::sleep(Duration::from_millis(20));
             }
@@ -560,7 +567,7 @@ mod tests {
         let mut frames_after_toggle = 0u32;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while frames_after_toggle < 2 && std::time::Instant::now() < deadline {
-            if ctl.next_video_frame().is_some() {
+            if ctl.next_video_frame(1.0 / 60.0).is_some() {
                 frames_after_toggle += 1;
             }
             thread::sleep(Duration::from_millis(20));
@@ -588,7 +595,7 @@ mod tests {
                 break;
             }
             // Drain frames to keep the pipeline moving.
-            let _ = ctl.next_video_frame();
+            let _ = ctl.next_video_frame(1.0 / 60.0);
             thread::sleep(Duration::from_millis(20));
         }
         assert!(
@@ -601,7 +608,7 @@ mod tests {
         let mut frame_after_seek = None;
         let dl = std::time::Instant::now() + Duration::from_secs(5);
         while frame_after_seek.is_none() && std::time::Instant::now() < dl {
-            frame_after_seek = ctl.next_video_frame();
+            frame_after_seek = ctl.next_video_frame(1.0 / 60.0);
             if frame_after_seek.is_none() {
                 thread::sleep(Duration::from_millis(20));
             }
@@ -639,7 +646,7 @@ mod tests {
         let mut samples: Vec<(f64, f64, f64)> = Vec::new(); // (pts, pos, t)
         let deadline = t0 + Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
-            if let Some(f) = ctl.next_video_frame() {
+            if let Some(f) = ctl.next_video_frame(1.0 / 60.0) {
                 samples.push((f.pts_secs, ctl.position(), t0.elapsed().as_secs_f64()));
             }
             thread::sleep(Duration::from_millis(20));
@@ -705,7 +712,7 @@ mod tests {
         let mut saw_frame = false;
         let dl = std::time::Instant::now() + Duration::from_secs(5);
         while !saw_frame && std::time::Instant::now() < dl {
-            saw_frame = ctl.next_video_frame().is_some();
+            saw_frame = ctl.next_video_frame(1.0 / 60.0).is_some();
             if !saw_frame {
                 thread::sleep(Duration::from_millis(20));
             }
@@ -724,7 +731,7 @@ mod tests {
                 pos_near = true;
                 break;
             }
-            let _ = ctl.next_video_frame(); // keep the pipeline moving
+            let _ = ctl.next_video_frame(1.0 / 60.0); // keep the pipeline moving
             thread::sleep(Duration::from_millis(20));
         }
         assert!(
@@ -738,7 +745,7 @@ mod tests {
         let mut frame = None;
         let dl = std::time::Instant::now() + Duration::from_secs(5);
         while frame.is_none() && std::time::Instant::now() < dl {
-            frame = ctl.next_video_frame();
+            frame = ctl.next_video_frame(1.0 / 60.0);
             if frame.is_none() {
                 thread::sleep(Duration::from_millis(20));
             }
@@ -773,7 +780,7 @@ mod tests {
         let dl = std::time::Instant::now() + Duration::from_millis(300);
         let mut frames_seen = 0u32;
         while std::time::Instant::now() < dl {
-            if ctl.next_video_frame().is_some() {
+            if ctl.next_video_frame(1.0 / 60.0).is_some() {
                 frames_seen += 1;
             }
             thread::sleep(Duration::from_millis(20));
@@ -805,7 +812,7 @@ mod tests {
         let mut resumed_frame = false;
         let dl = std::time::Instant::now() + Duration::from_secs(5);
         while !resumed_frame && std::time::Instant::now() < dl {
-            resumed_frame = ctl.next_video_frame().is_some();
+            resumed_frame = ctl.next_video_frame(1.0 / 60.0).is_some();
             if !resumed_frame {
                 thread::sleep(Duration::from_millis(20));
             }
@@ -839,7 +846,7 @@ mod tests {
         // Drive the (virtual) render loop until the controller reports Ended.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while ctl.state() != &PlaybackState::Ended && std::time::Instant::now() < deadline {
-            let _ = ctl.next_video_frame();
+            let _ = ctl.next_video_frame(1.0 / 60.0);
             thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(

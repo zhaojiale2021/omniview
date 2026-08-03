@@ -25,7 +25,7 @@ use crate::media::types::VideoFrame;
 /// Bounded jitter buffer with peek semantics: the renderer pops only the
 /// frames whose PTS has been reached by the media clock and leaves the rest
 /// queued, so decode-ahead never causes frames to be discarded.
-const FRAME_QUEUE_CAP: usize = 6;
+const FRAME_QUEUE_CAP: usize = 8;
 
 pub struct VideoQueue {
     frames: Mutex<VecDeque<VideoFrame>>,
@@ -52,6 +52,11 @@ impl VideoQueue {
         }
         q.push_back(frame);
         self.space.notify_one();
+    }
+
+    /// Number of frames currently buffered ahead of the clock.
+    pub fn len(&self) -> usize {
+        self.frames.lock().unwrap().len()
     }
 
     /// Pop every frame whose PTS is at/before `clock` and return the newest
@@ -121,6 +126,11 @@ impl VideoDecoder {
     /// Pop the frames the media clock has reached.
     pub fn drain_upto(&self, clock: f64) -> (Option<VideoFrame>, usize) {
         self.queue.drain_upto(clock)
+    }
+
+    /// Number of decoded frames waiting ahead of the clock (diagnostics).
+    pub fn buffered(&self) -> usize {
+        self.queue.len()
     }
 
     /// Wake the decoder thread if it is blocked waiting for queue space.
@@ -213,7 +223,8 @@ fn decode_packets_loop(
     // by the time we cycle back to it — `Arc::make_mut` reuses the
     // allocation and we never allocate/free ~10 MB per frame (large-block
     // allocator churn causes periodic hitches).
-    let mut frame_pool: Vec<(Arc<Vec<u8>>, Arc<Vec<u8>>)> = (0..8)
+    // 12 slots > queue cap 8 + one frame in the renderer + one in flight.
+    let mut frame_pool: Vec<(Arc<Vec<u8>>, Arc<Vec<u8>>)> = (0..12)
         .map(|_| (Arc::new(Vec::new()), Arc::new(Vec::new())))
         .collect();
     let mut next_slot = 0usize;

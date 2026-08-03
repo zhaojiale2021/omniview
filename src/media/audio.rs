@@ -39,6 +39,10 @@ struct Shared {
     paused: AtomicBool,
     stopped: AtomicBool,
     samples_played: Arc<AtomicU64>,
+    /// Count of callback periods that had to zero-fill (ring underflow).
+    /// Reported periodically so a "stutters every few seconds" issue can be
+    /// attributed to audio starvation vs video/render starvation.
+    underruns: AtomicU64,
 }
 
 // ── Public pipeline ──────────────────────────────────────────────────
@@ -84,6 +88,7 @@ impl AudioPipeline {
             paused: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             samples_played: samples_played.clone(),
+            underruns: AtomicU64::new(0),
         });
 
         // ── cpal output stream ────────────────────────────────────
@@ -124,6 +129,9 @@ impl AudioPipeline {
                                 }
                                 if real > 0 {
                                     sh.samples_played.fetch_add(real, Ordering::Relaxed);
+                                }
+                                if real < data.len() as u64 {
+                                    sh.underruns.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
                             Err(_) => data.fill(0.0),
@@ -179,11 +187,12 @@ impl AudioPipeline {
         // ── Command channel ───────────────────────────────────────
         let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCmd>();
 
-        // ── Ring buffer backpressure: 600ms cap ───────────────────
-        // A larger buffer absorbs decode-thread hiccups (demux I/O, thread
-        // scheduling) so the cpal callback never underruns — an underrun
-        // stalls the audio master clock and stutters video with it.
-        let buf_cap = (sample_rate as usize) * (channels as usize) * 600 / 1000;
+        // ── Ring buffer backpressure: 1200ms cap ──────────────────
+        // A large buffer absorbs decode-thread hiccups (demux I/O, thread
+        // scheduling, Windows timer slop) so the cpal callback never
+        // underruns — an underrun stalls the audio master clock and
+        // stutters video with it.
+        let buf_cap = (sample_rate as usize) * (channels as usize) * 1200 / 1000;
         let sh_sink = shared.clone();
 
         // Sink closure: push interleaved f32 into ring buffer.
@@ -268,6 +277,11 @@ impl AudioPipeline {
     pub fn stop(&self) {
         self.shared.stopped.store(true, Ordering::Relaxed);
         let _ = self.cmd_tx.send(AudioCmd::Stop);
+    }
+
+    /// Total ring-buffer underflow periods since start.
+    pub fn underruns(&self) -> u64 {
+        self.shared.underruns.load(Ordering::Relaxed)
     }
 }
 
@@ -455,10 +469,16 @@ fn decode_audio_packets(
             Err(_) => break, // EOF / channel closed
         };
 
-        // (3) Send packet to decoder.
-        decoder
-            .send_packet(&packet)
-            .map_err(|e| format!("send packet: {e}"))?;
+        // (3) Send packet to decoder.  A single bad packet must not kill
+        // the thread (that would silence the stream and freeze the master
+        // clock permanently); log and skip it.
+        if let Err(e) = decoder.send_packet(&packet) {
+            if matches!(e, ffmpeg::Error::Eof) {
+                break;
+            }
+            tracing::warn!("audio send_packet: {e}");
+            continue;
+        }
 
         // (4) Receive decoded frames.
         while decoder.receive_frame(&mut decoded).is_ok() {
@@ -497,9 +517,10 @@ fn decode_audio_packets(
 
             for f in frames_to_resample {
                 // Resample to interleaved f32 @ target rate/channels.
-                resampler
-                    .run(&f, &mut resampled)
-                    .map_err(|e| format!("swr run: {e}"))?;
+                if let Err(e) = resampler.run(&f, &mut resampled) {
+                    tracing::warn!("audio swr run: {e}");
+                    continue;
+                }
 
                 // Extract interleaved f32 samples from the resampled frame.
                 // data(0) is the interleaved f32 plane.

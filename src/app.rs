@@ -45,6 +45,15 @@ pub struct App {
     state_path: PathBuf,
     last_state_save: Instant,
 
+    // ── Stutter diagnostics ─────────────────────────────────────
+    /// Last `about_to_wait` time; a large gap while playing means the main
+    /// thread was blocked (the classic "stutters every few seconds").
+    last_render: Option<Instant>,
+    /// Throttles diagnostic log spam.
+    last_diag_log: Instant,
+    /// Audio ring-underflow count seen at the last check.
+    last_underruns: u64,
+
     // ── Screenshots ────────────────────────────────────────────
     shot_dir: PathBuf,
 
@@ -67,6 +76,9 @@ impl App {
             state: HashMap::new(),
             state_path: PathBuf::from("player_state.json"),
             last_state_save: Instant::now(),
+            last_render: None,
+            last_diag_log: Instant::now(),
+            last_underruns: 0,
             shot_dir: PathBuf::from("."),
             error_logged: false,
         }
@@ -329,9 +341,51 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         // ── Receive latest video frame ──────────────────────────
         // The upload happens inside render() (after surface acquire),
-        // so a failing surface can't leak staging buffers.
-        let mut frame: Option<VideoFrame> = self.ctl.next_video_frame();
+        // so a failing surface can't leak staging buffers.  The lookahead
+        // is the time until the next present (the texture swap takes
+        // effect at that vsync), scaled by playback speed.
+        let vsync_ahead = self
+            .renderer
+            .as_ref()
+            .map(|r| r.next_vsync_in())
+            .unwrap_or(1.0 / 60.0);
+        let mut frame: Option<VideoFrame> = self
+            .ctl
+            .next_video_frame(vsync_ahead * self.ctl.speed());
         let frame_uploaded = frame.is_some();
+
+        // ── Stutter diagnostics (periodic, throttled) ─────────────
+        if let Some(t) = self.last_render {
+            let gap = t.elapsed();
+            if gap > Duration::from_millis(100)
+                && self.last_diag_log.elapsed() > Duration::from_secs(10)
+                && !self.ctl.paused()
+            {
+                tracing::warn!(
+                    "render gap: {}ms | video_buffered={} | audio_underruns={}",
+                    gap.as_millis(),
+                    self.ctl.buffered_frames(),
+                    self.ctl.audio_underruns()
+                );
+                self.last_diag_log = Instant::now();
+            }
+        }
+        // Playing but no frame available and nothing buffered ahead means
+        // the decoder cannot keep up with the media clock.
+        if !self.ctl.paused()
+            && frame.is_none()
+            && self.ctl.buffered_frames() == 0
+            && !matches!(
+                self.ctl.state(),
+                PlaybackState::Ended | PlaybackState::Error(_)
+            )
+            && self.last_diag_log.elapsed() > Duration::from_secs(10)
+        {
+            tracing::warn!(
+                "video starvation: no frame and empty queue while playing"
+            );
+            self.last_diag_log = Instant::now();
+        }
 
         // ── Sync UI state from controller (skip fields driven by UI) ──
         let seeking = self.ui.as_ref().map(|u| u.seeking).unwrap_or(false);
@@ -505,5 +559,18 @@ impl ApplicationHandler for App {
             self.last_state_save = Instant::now();
             self.save_state();
         }
+
+        // ── Audio underflow diagnostics ─────────────────────────
+        let u = self.ctl.audio_underruns();
+        if u > self.last_underruns {
+            tracing::warn!(
+                "audio underflows: {} total (+{} since last check)",
+                u,
+                u - self.last_underruns
+            );
+            self.last_underruns = u;
+        }
+
+        self.last_render = Some(Instant::now());
     }
 }

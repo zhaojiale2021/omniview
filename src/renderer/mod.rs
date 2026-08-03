@@ -51,6 +51,10 @@ pub struct Renderer {
     y_stride: u32,
     /// Uploaded stride (bytes per row) of the current UV plane.
     uv_stride: u32,
+    /// When the last frame was presented — vsync-phase estimate.
+    last_present: Option<std::time::Instant>,
+    /// Estimated vsync period in seconds (EWMA of present intervals).
+    vsync_period: f64,
     pub egui_state: egui_winit::State,
     pub egui_renderer: egui_wgpu::Renderer,
 
@@ -387,6 +391,8 @@ impl Renderer {
             video_bind_group: None,
             placeholder_bind_group, camera,
             y_stride: 0, uv_stride: 0,
+            last_present: None,
+            vsync_period: 1.0 / 60.0,
             egui_state, egui_renderer,
             capture_path,
             capture_staging,
@@ -413,6 +419,18 @@ impl Renderer {
         let aspect = self.size.0 as f32 / self.size.1.max(1) as f32;
         let vp = self.camera.view_proj_matrix(aspect);
         self.update_camera(&vp);
+    }
+
+    /// Estimated seconds until the next vsync.  A texture uploaded now is
+    /// presented at that vsync, so the render loop uses this as the
+    /// media-time lookahead for frame selection (stable 2-vsync cadence for
+    /// 30 fps content on 60 Hz displays).
+    pub fn next_vsync_in(&self) -> f64 {
+        let since = self
+            .last_present
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        (self.vsync_period - since).max(0.0)
     }
 
     /// Upload an NV12 video frame into the GPU textures.  YUV→RGB is left
@@ -652,6 +670,18 @@ impl Renderer {
 
         self.queue.submit(extra_cbs.into_iter().chain(std::iter::once(encoder.finish())));
         output.present();
+
+        // Track the present cadence to estimate the vsync period.
+        // present() returns at (or just after) a vsync, so consecutive
+        // intervals approximate the display refresh.
+        let now = std::time::Instant::now();
+        if let Some(prev) = self.last_present {
+            let dt = now.duration_since(prev).as_secs_f64();
+            if dt > 0.004 && dt < 0.050 {
+                self.vsync_period = self.vsync_period * 0.8 + dt * 0.2;
+            }
+        }
+        self.last_present = Some(now);
 
         if capture_now {
             if let (Some(staging), Some(path)) = (&self.capture_staging, &self.capture_path) {
