@@ -3,10 +3,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod app;
-mod audio;
-mod decoder;
 mod media;
-mod player;
 mod renderer;
 mod ui;
 
