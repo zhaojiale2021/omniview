@@ -238,6 +238,7 @@ impl AudioPipeline {
             ) {
                 tracing::error!("Audio decoder: {e}");
             }
+            tracing::info!("Audio: decoder thread finished");
             // Signal the cpal callback to stop expecting data.
             sh_thread.stopped.store(true, Ordering::Relaxed);
         });
@@ -316,6 +317,7 @@ fn decode_audio_packets(
         .streams()
         .best(media::Type::Audio)
         .ok_or_else(|| "no audio stream".to_string())?;
+    tracing::info!("Audio: opened file, audio stream index={}", audio_stream.index());
 
     let ctx = codec::context::Context::from_parameters(audio_stream.parameters())
         .map_err(|e| format!("audio codec context: {e}"))?;
@@ -338,6 +340,7 @@ fn decode_audio_packets(
         sample_rate,
     )
     .map_err(|e| format!("swr context: {e}"))?;
+    tracing::info!("Audio: swr ready -> {sample_rate} Hz / {channels} ch");
 
     // ── Atempo filter graph (None when speed == 1.0) ──────────────
     let mut atempo: Option<filter::Graph> = None;
@@ -396,6 +399,8 @@ fn decode_audio_packets(
     let mut decoded = frame::Audio::empty();
     let mut resampled = frame::Audio::empty();
     let mut filtered = frame::Audio::empty();
+    let mut first_packet = true;
+    let mut pushed_batches = 0u64;
 
     loop {
         // (1) Drain commands (non-blocking).
@@ -465,8 +470,20 @@ fn decode_audio_packets(
 
         // (2) Get the next packet from the demuxer.
         let packet = match pkt_rx.recv() {
-            Ok(p) => p,
-            Err(_) => break, // EOF / channel closed
+            Ok(p) => {
+                if first_packet {
+                    first_packet = false;
+                    tracing::info!(
+                        "Audio: first packet received ({} bytes)",
+                        p.data().map(|d| d.len()).unwrap_or(0)
+                    );
+                }
+                p
+            }
+            Err(_) => {
+                tracing::warn!("Audio: packet channel closed (demux stopped or EOF)");
+                break;
+            }
         };
 
         // (3) Send packet to decoder.  A single bad packet must not kill
@@ -531,6 +548,10 @@ fn decode_audio_packets(
                     .collect();
 
                 if !samples.is_empty() {
+                    pushed_batches += 1;
+                    if pushed_batches == 1 {
+                        tracing::info!("Audio: first samples pushed");
+                    }
                     sink(samples);
                 }
 

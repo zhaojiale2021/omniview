@@ -32,6 +32,10 @@ pub struct PlaybackController {
     /// When the frame queue last delivered a frame; drives the EOF grace
     /// period so buffered frames are shown before `Ended` fires.
     last_frame_at: Option<Instant>,
+    /// Audio-clock stall guard state: last observed clock position.
+    last_clock_pos: f64,
+    /// Audio-clock stall guard state: when that position was observed.
+    last_clock_at: Option<Instant>,
 }
 
 impl PlaybackController {
@@ -52,6 +56,8 @@ impl PlaybackController {
             last_pts: -1.0,
             eof_seen: false,
             last_frame_at: None,
+            last_clock_pos: 0.0,
+            last_clock_at: None,
         }
     }
 
@@ -120,6 +126,36 @@ impl PlaybackController {
     /// app measures the vsync phase so the swap lands on a stable cadence
     /// instead of alternating 2/3 vsyncs as the audio clock jitters.
     pub fn next_video_frame(&mut self, lookahead: f64) -> Option<VideoFrame> {
+        // Audio-clock stall guard: if the audio master clock has not
+        // advanced for a full second while playing, the audio pipeline is
+        // dead (silent ring buffer).  Fall back to the wall clock so the
+        // video keeps playing instead of freezing forever.
+        if self.has_audio && self.state == PlaybackState::Playing {
+            let pos = self.clock.position();
+            if (pos - self.last_clock_pos).abs() < 0.001 {
+                let stalled = self
+                    .last_clock_at
+                    .map(|t| t.elapsed() >= Duration::from_secs(1))
+                    .unwrap_or(false);
+                if stalled {
+                    let stalled_for = self
+                        .last_clock_at
+                        .map(|t| t.elapsed().as_secs())
+                        .unwrap_or(0);
+                    tracing::warn!(
+                        "audio clock stalled for {stalled_for}s; switching video to wall clock"
+                    );
+                    self.clock.detach_audio();
+                    self.has_audio = false;
+                    self.clock.play(pos);
+                    self.last_clock_pos = pos;
+                    self.last_clock_at = None;
+                }
+            } else {
+                self.last_clock_pos = pos;
+                self.last_clock_at = Some(Instant::now());
+            }
+        }
         let clock_pos = self.clock.position() + lookahead;
         let (chosen, remaining) = match self.video {
             Some(ref video) => video.drain_upto(clock_pos),
@@ -338,6 +374,8 @@ impl PlaybackController {
         self.last_pts = -1.0;
         self.eof_seen = false;
         self.last_frame_at = None;
+        self.last_clock_pos = 0.0;
+        self.last_clock_at = None;
         self.duration = 0.0;
         self.file_path = None;
         Ok(())
@@ -449,6 +487,8 @@ impl PlaybackController {
         self.last_pts = -1.0;
         self.eof_seen = false;
         self.last_frame_at = None;
+        self.last_clock_pos = pos;
+        self.last_clock_at = Some(Instant::now());
 
         Ok(())
     }

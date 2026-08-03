@@ -217,6 +217,8 @@ fn decode_packets_loop(
     // are discarded below.
 
     let mut nv12 = frame::Video::empty();
+    let mut first_packet = true;
+    let mut frames_sent = 0u64;
 
     // Frame pool: 8 reusable plane-buffer slots.  The queue holds at most 6
     // frames plus one held by the renderer, so a slot's Arc is private again
@@ -262,8 +264,17 @@ fn decode_packets_loop(
 
         // Read the next packet from the demux channel.
         let packet = match pkt_rx.recv() {
-            Ok(p) => p,
-            Err(_) => break, // channel closed (demux stopped / EOF)
+            Ok(p) => {
+                if first_packet {
+                    first_packet = false;
+                    tracing::info!("Video: first packet received");
+                }
+                p
+            }
+            Err(_) => {
+                tracing::warn!("Video: packet channel closed (demux stopped or EOF)");
+                break;
+            }
         };
         if let Err(e) = decoder.send_packet(&packet) {
             if matches!(e, ffmpeg::Error::Eof) {
@@ -339,6 +350,7 @@ fn decode_packets_loop(
                 uv_width * 2,
                 uv_buf,
             );
+            frames_sent += 1;
             let frame_out = VideoFrame {
                 y: frame_pool[slot].0.clone(),
                 uv: frame_pool[slot].1.clone(),
@@ -353,7 +365,7 @@ fn decode_packets_loop(
     }
 
     let _ = decoder.send_eof();
-    tracing::debug!("Video decoder thread (packets) finished");
+    tracing::info!("Video: decode loop finished (frames_sent={frames_sent})");
 }
 
 /// Copy a decoded plane row-by-row into `out` with rows aligned to 256

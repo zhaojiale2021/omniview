@@ -18,8 +18,12 @@ fn main() {
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("player.log")))
         .unwrap_or_else(|| std::path::PathBuf::from("player.log"));
+    // Default filter: our own info logs, but keep wgpu/egui internals at
+    // warn so the log file isn't flooded with per-frame maintain noise.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info".into());
+        .unwrap_or_else(|_| {
+            "info,my_project=info,wgpu_core=warn,wgpu_hal=warn,egui_wgpu=warn".into()
+        });
     match std::fs::File::create(&log_path) {
         Ok(f) => {
             tracing_subscriber::registry()

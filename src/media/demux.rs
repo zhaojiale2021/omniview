@@ -235,8 +235,11 @@ fn demux_loop(
 
     // ── Main packet-routing loop ───────────────────────────────────
 
-    let mut packets = input.packets();
     let mut reached_eof = false;
+    let mut routed_video = 0u64;
+    let mut routed_audio = 0u64;
+    let mut read_errors = 0u64;
+    let mut route_log = std::time::Instant::now();
     'outer: loop {
         // (1) Drain commands BEFORE reading the next packet.
         loop {
@@ -247,16 +250,25 @@ fn demux_loop(
             }
         }
 
-        // (2) Read the next packet from the container.
-        let (stream, packet) = match packets.next() {
-            Some(p) => p,
-            None => {
+        // (2) Read the next packet from the container.  The iterator API
+        // spins silently on any non-EOF error, so read manually: EOF ends
+        // the loop, other errors are logged and retried.
+        let mut packet = ffmpeg::codec::packet::Packet::empty();
+        match packet.read(&mut input) {
+            Ok(()) => {}
+            Err(ffmpeg::Error::Eof) => {
                 reached_eof = true;
                 break; // EOF
             }
-        };
+            Err(e) => {
+                read_errors += 1;
+                tracing::warn!("demux read error (retrying): {e}");
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+        }
 
-        let stream_index = stream.index();
+        let stream_index = packet.stream();
 
         // Select the target channel for this packet.
         let tx: &mpsc::SyncSender<ffmpeg::Packet> =
@@ -292,12 +304,27 @@ fn demux_loop(
                 Err(mpsc::TrySendError::Disconnected(_)) => break 'outer,
             }
         }
+
+        // Route accounting (diagnostics).
+        if Some(stream_index) == video_stream_index {
+            routed_video += 1;
+        } else {
+            routed_audio += 1;
+        }
+        if route_log.elapsed().as_secs() >= 5 {
+            tracing::info!(
+                "Demux routing: video={routed_video} audio={routed_audio} (read_errors={read_errors})"
+            );
+            route_log = std::time::Instant::now();
+        }
     }
 
     if reached_eof {
         let _ = eof_tx.send(());
     }
-    tracing::debug!("Demux thread finished");
+    tracing::info!(
+        "Demux thread finished: eof={reached_eof} video_pkts={routed_video} audio_pkts={routed_audio} read_errors={read_errors}"
+    );
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

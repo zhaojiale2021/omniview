@@ -554,21 +554,21 @@ impl ApplicationHandler for App {
             let _ = self.ctl.apply(Command::SetVolume(vol));
         }
 
-        // ── Persist resume position periodically ─────────────────
+        // ── Persist resume position + periodic diagnostics ──────
         if self.last_state_save.elapsed() >= STATE_SAVE_INTERVAL {
             self.last_state_save = Instant::now();
             self.save_state();
-        }
 
-        // ── Audio underflow diagnostics ─────────────────────────
-        let u = self.ctl.audio_underruns();
-        if u > self.last_underruns {
-            tracing::warn!(
-                "audio underflows: {} total (+{} since last check)",
-                u,
-                u - self.last_underruns
-            );
-            self.last_underruns = u;
+            // ── Audio underflow diagnostics ─────────────────────
+            let u = self.ctl.audio_underruns();
+            if u > self.last_underruns {
+                tracing::warn!(
+                    "audio underflows: {} total (+{} since last check)",
+                    u,
+                    u - self.last_underruns
+                );
+                self.last_underruns = u;
+            }
         }
 
         self.last_render = Some(Instant::now());
