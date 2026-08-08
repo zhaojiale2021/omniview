@@ -576,12 +576,10 @@ fn decode_audio_packets(
                 }
 
                 // Extract interleaved f32 samples from the resampled frame.
-                // data(0) is the interleaved f32 plane.
-                let bytes = resampled.data(0);
-                sample_buf.clear();
-                sample_buf.extend(bytes.chunks_exact(4).map(|b| {
-                    f32::from_le_bytes([b[0], b[1], b[2], b[3]])
-                }));
+                // Only the first samples()*channels samples are valid —
+                // data(0) spans the whole linesize (capacity), whose tail
+                // holds stale data from previous frames on buffer reuse.
+                valid_f32_samples(&resampled, &mut sample_buf);
 
                 if !sample_buf.is_empty() {
                     pushed_batches += 1;
@@ -619,11 +617,7 @@ fn decode_audio_packets(
                             tracing::warn!("audio swr flush: {e}");
                             continue;
                         }
-                        let bytes = resampled.data(0);
-                        sample_buf.clear();
-                        sample_buf.extend(bytes.chunks_exact(4).map(|b| {
-                            f32::from_le_bytes([b[0], b[1], b[2], b[3]])
-                        }));
+                        valid_f32_samples(&resampled, &mut sample_buf);
                         if !sample_buf.is_empty() {
                             sink(&sample_buf);
                         }
@@ -639,11 +633,7 @@ fn decode_audio_packets(
                 tracing::warn!("audio swr flush: {e}");
                 continue;
             }
-            let bytes = resampled.data(0);
-            sample_buf.clear();
-            sample_buf.extend(bytes.chunks_exact(4).map(|b| {
-                f32::from_le_bytes([b[0], b[1], b[2], b[3]])
-            }));
+            valid_f32_samples(&resampled, &mut sample_buf);
             if !sample_buf.is_empty() {
                 sink(&sample_buf);
             }
@@ -662,11 +652,7 @@ fn decode_audio_packets(
                         tracing::warn!("audio swr flush: {e}");
                         continue;
                     }
-                    let bytes = resampled.data(0);
-                    sample_buf.clear();
-                    sample_buf.extend(bytes.chunks_exact(4).map(|b| {
-                        f32::from_le_bytes([b[0], b[1], b[2], b[3]])
-                    }));
+                    valid_f32_samples(&resampled, &mut sample_buf);
                     if !sample_buf.is_empty() {
                         sink(&sample_buf);
                     }
@@ -687,11 +673,7 @@ fn decode_audio_packets(
                 if resampled.samples() == 0 {
                     break;
                 }
-                let flush_bytes = resampled.data(0);
-                sample_buf.clear();
-                sample_buf.extend(flush_bytes.chunks_exact(4).map(|b| {
-                    f32::from_le_bytes([b[0], b[1], b[2], b[3]])
-                }));
+                valid_f32_samples(&resampled, &mut sample_buf);
                 if !sample_buf.is_empty() {
                     sink(&sample_buf);
                 }
@@ -726,6 +708,26 @@ fn new_resampler(
         sample_rate,
     )
     .map_err(|e| format!("swr context: {e}"))
+}
+
+/// Extract only the VALID interleaved f32 samples from a resampled frame.
+///
+/// `frame.data(0)` returns a slice whose length is the buffer's `linesize`
+/// (capacity), not the number of valid samples.  The swr context reuses the
+/// output frame's buffer across calls, so the tail of that slice contains
+/// stale data from previous frames — feeding the whole slice to the ring
+/// duplicates samples and floods the pipeline (observed ~2.5x
+/// over-production → ring full → sink blocked → demux stall → freeze).
+/// Only the first `samples() * channels` samples are valid.
+fn valid_f32_samples(frame: &ffmpeg::frame::Audio, out: &mut Vec<f32>) {
+    let valid = frame.samples() as usize * frame.channels() as usize * 4;
+    let bytes = frame.data(0);
+    out.clear();
+    out.extend(
+        bytes[..valid.min(bytes.len())]
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+    );
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
