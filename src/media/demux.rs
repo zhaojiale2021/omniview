@@ -121,6 +121,17 @@ impl Demux {
 
 // ── Demux loop (runs in background thread) ─────────────────────────
 
+/// Drain pending commands (non-blocking).  Returns `true` when the demux
+/// thread should stop: a `Stop` command arrived, or the command channel
+/// disconnected (the controller dropped `cmd_tx`).
+fn drain_cmds(cmd_rx: &mpsc::Receiver<DemuxCmd>) -> bool {
+    match cmd_rx.try_recv() {
+        Ok(DemuxCmd::Stop) => true,
+        Err(mpsc::TryRecvError::Empty) => false,
+        Err(mpsc::TryRecvError::Disconnected) => true,
+    }
+}
+
 /// Send as many stashed packets as the channel accepts.
 fn flush_stash(
     tx: &mpsc::SyncSender<ffmpeg::Packet>,
@@ -246,7 +257,7 @@ fn demux_loop(
                 input.as_mut_ptr(),
                 -1,
                 ts,
-                ffmpeg::ffi::AVSEEK_FLAG_BACKWARD as i32,
+                ffmpeg::ffi::AVSEEK_FLAG_BACKWARD,
             )
         };
         if rc < 0 {
@@ -274,12 +285,8 @@ fn demux_loop(
 
     'outer: loop {
         // (1) Drain commands BEFORE reading the next packet.
-        loop {
-            match cmd_rx.try_recv() {
-                Ok(DemuxCmd::Stop) => break 'outer,
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => break 'outer,
-            }
+        if drain_cmds(&cmd_rx) {
+            break 'outer;
         }
 
         // (1b) Flush stashed packets whose channels have space again.
@@ -339,12 +346,8 @@ fn demux_loop(
                         break; // keep reading — other stream flows
                     }
                     pkt = p; // channel + stash full: wait for space
-                    loop {
-                        match cmd_rx.try_recv() {
-                            Ok(DemuxCmd::Stop) => break 'outer,
-                            Err(mpsc::TryRecvError::Empty) => break,
-                            Err(mpsc::TryRecvError::Disconnected) => break 'outer,
-                        }
+                    if drain_cmds(&cmd_rx) {
+                        break 'outer;
                     }
                     thread::sleep(Duration::from_millis(2));
                 }
@@ -392,6 +395,6 @@ mod tests {
             })
             .unwrap();
         assert!(info.width > 0 && info.height > 0 && info.duration > 0.0);
-        assert_eq!(info.has_video, true);
+        assert!(info.has_video);
     }
 }

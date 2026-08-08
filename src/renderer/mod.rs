@@ -18,13 +18,6 @@ pub struct CameraUniform {
     pub view_proj: [[f32; 4]; 4],
 }
 
-#[allow(dead_code)]
-impl CameraUniform {
-    pub fn new() -> Self {
-        Self { view_proj: glam::Mat4::IDENTITY.to_cols_array_2d() }
-    }
-}
-
 pub struct Renderer {
     pub surface: wgpu::Surface<'static>,
     pub device: wgpu::Device,
@@ -416,6 +409,13 @@ impl Renderer {
     }
 
     pub fn update_camera_uniform(&mut self) {
+        // Skip the per-frame `write_buffer` when nothing moved: the render
+        // loop calls this every frame, but the uniform only changes when
+        // the camera or the window aspect ratio changes.
+        if !self.camera.dirty {
+            return;
+        }
+        self.camera.dirty = false;
         let aspect = self.size.0 as f32 / self.size.1.max(1) as f32;
         let vp = self.camera.view_proj_matrix(aspect);
         self.update_camera(&vp);
@@ -441,8 +441,8 @@ impl Renderer {
         if width == 0 || height == 0 {
             return;
         }
-        let uv_w = (width + 1) / 2;
-        let uv_h = (height + 1) / 2;
+        let uv_w = width.div_ceil(2);
+        let uv_h = height.div_ceil(2);
 
         // Ensure the video textures exist and are the correct size.
         let needs_new = match &self.y_texture {
@@ -548,12 +548,7 @@ impl Renderer {
         frame: Option<VideoFrame>,
     ) -> Result<(), wgpu::SurfaceError> {
         self.update_camera_uniform();
-        let output = match self.surface.get_current_texture() {
-            Ok(o) => o,
-            // Surface lost/outdated — skip this frame entirely.  The
-            // frame is NOT uploaded, so nothing accumulates.
-            Err(e) => return Err(e),
-        };
+        let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Encoder") });
@@ -640,10 +635,10 @@ impl Renderer {
             && self.capture_staging.is_some()
             && {
                 self.capture_counter += 1;
-                self.capture_counter % 20 == 0
+                self.capture_counter.is_multiple_of(20)
             };
-        if capture_now {
-            if let (Some(staging), Some(_)) = (&self.capture_staging, &self.capture_path) {
+        if capture_now
+            && let (Some(staging), Some(_)) = (&self.capture_staging, &self.capture_path) {
                 encoder.copy_texture_to_buffer(
                     wgpu::ImageCopyTexture {
                         texture: &output.texture,
@@ -666,7 +661,6 @@ impl Renderer {
                     },
                 );
             }
-        }
 
         self.queue.submit(extra_cbs.into_iter().chain(std::iter::once(encoder.finish())));
         output.present();
@@ -683,8 +677,8 @@ impl Renderer {
         }
         self.last_present = Some(now);
 
-        if capture_now {
-            if let (Some(staging), Some(path)) = (&self.capture_staging, &self.capture_path) {
+        if capture_now
+            && let (Some(staging), Some(path)) = (&self.capture_staging, &self.capture_path) {
                 let slice = staging.slice(..);
                 let (tx, rx) = std::sync::mpsc::channel();
                 slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
@@ -702,7 +696,6 @@ impl Renderer {
                 }
                 staging.unmap();
             }
-        }
 
         Ok(())
     }
@@ -719,8 +712,8 @@ impl Renderer {
         };
         let (w, h) = (y_tex.width(), y_tex.height());
         let uv_h = uv_tex.height();
-        let y_stride = self.y_stride.max(((w + 255) / 256) * 256);
-        let uv_stride = self.uv_stride.max(((uv_tex.width() * 2 + 255) / 256) * 256);
+        let y_stride = self.y_stride.max(w.div_ceil(256) * 256);
+        let uv_stride = self.uv_stride.max((uv_tex.width() * 2).div_ceil(256) * 256);
         let y_size = y_stride as u64 * h as u64;
         let uv_size = uv_stride as u64 * uv_h as u64;
         let total = y_size + uv_size;

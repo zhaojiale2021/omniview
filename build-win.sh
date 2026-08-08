@@ -28,8 +28,8 @@ REL="target/x86_64-pc-windows-gnu/release"
 # Audio is decoded in-process now, so ffmpeg.exe/ffprobe.exe are no longer
 # needed at runtime.
 cp "$BIN"/*.dll "$REL"/
-echo "Staged runtime FFmpeg DLLs from $BIN"
+echo "Staged $(ls "$BIN"/*.dll | wc -l) runtime FFmpeg DLLs from $BIN"
 
 echo
-echo "Built: $REL/my-project.exe"
+echo "Built: $REL/omniview.exe ($(du -h "$REL/omniview.exe" | cut -f1))"
 

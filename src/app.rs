@@ -122,12 +122,11 @@ impl App {
     }
 
     fn load_state(&mut self) {
-        if let Ok(s) = std::fs::read_to_string(&self.state_path) {
-            if let Ok(map) = serde_json::from_str::<HashMap<String, f64>>(&s) {
+        if let Ok(s) = std::fs::read_to_string(&self.state_path)
+            && let Ok(map) = serde_json::from_str::<HashMap<String, f64>>(&s) {
                 self.state = map;
                 tracing::info!("Loaded {} resume positions", self.state.len());
             }
-        }
     }
 
     /// Persist the current playback position so the next session can
@@ -163,7 +162,7 @@ impl App {
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
-            .with_title("Media Player")
+            .with_title("Omniview")
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
         let renderer = pollster::block_on(Renderer::new(window.clone()));
@@ -201,12 +200,13 @@ impl ApplicationHandler for App {
         }
 
         // ── Resize ─────────────────────────────────────────────
-        if let WindowEvent::Resized(s) = &event {
-            if let Some(r) = &mut self.renderer {
+        if let WindowEvent::Resized(s) = &event
+            && let Some(r) = &mut self.renderer {
                 r.resize(s.width, s.height);
+                // Aspect ratio changed — force a uniform refresh.
+                r.camera.dirty = true;
                 r.update_camera_uniform();
             }
-        }
 
         // ── Mouse input BEFORE egui (so drag works even over UI) ──
         if let WindowEvent::MouseInput { state, button: MouseButton::Left, .. } = &event {
@@ -218,39 +218,34 @@ impl ApplicationHandler for App {
 
         // ── Cursor movement BEFORE egui ────────────────────────
         if let WindowEvent::CursorMoved { position, .. } = &event {
-            if self.dragging {
-                if let Some(r) = &mut self.renderer {
-                    if r.is_360 {
+            if self.dragging
+                && let Some(r) = &mut self.renderer
+                    && r.is_360 {
                         let dx = position.x - self.last_cursor.map(|p| p.x).unwrap_or(position.x);
                         let dy = position.y - self.last_cursor.map(|p| p.y).unwrap_or(position.y);
                         r.camera.handle_mouse(dx, dy, r.size.0 as f64);
                         r.update_camera_uniform();
                     }
-                }
-            }
             self.last_cursor = Some(*position);
         }
 
         // ── Mouse wheel = zoom (360 mode) ──────────────────────
-        if let WindowEvent::MouseWheel { delta, .. } = &event {
-            if let Some(r) = &mut self.renderer {
-                if r.is_360 {
+        if let WindowEvent::MouseWheel { delta, .. } = &event
+            && let Some(r) = &mut self.renderer
+                && r.is_360 {
                     let d = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => *y as f32,
+                        MouseScrollDelta::LineDelta(_, y) => *y,
                         MouseScrollDelta::PixelDelta(p) => p.y as f32 / 50.0,
                     };
                     r.camera.handle_scroll(d);
                     r.update_camera_uniform();
                 }
-            }
-        }
 
         // ── Drag & drop a video file onto the window ───────────
-        if let WindowEvent::DroppedFile(p) = &event {
-            if let Some(s) = p.to_str() {
+        if let WindowEvent::DroppedFile(p) = &event
+            && let Some(s) = p.to_str() {
                 self.open_file(s);
             }
-        }
 
         // ── egui input ─────────────────────────────────────────
         let consumed = if let (Some(w), Some(r)) = (&self.window, &mut self.renderer) {
@@ -264,76 +259,73 @@ impl ApplicationHandler for App {
         }
 
         // ── Keyboard shortcuts ─────────────────────────────────
-        match event {
-            WindowEvent::KeyboardInput {
+        if let WindowEvent::KeyboardInput {
                 event: KeyEvent { physical_key: PhysicalKey::Code(kc), state: ElementState::Pressed, .. },
                 ..
-            } => match kc {
-                KeyCode::KeyO => {
-                    if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("Video", &["mp4", "webm", "mkv", "avi", "mov", "m4v"])
-                        .pick_file()
-                    {
-                        self.open_file(&p.to_string_lossy());
-                    }
+            } = event { match kc {
+            KeyCode::KeyO => {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Video", &["mp4", "webm", "mkv", "avi", "mov", "m4v"])
+                    .pick_file()
+                {
+                    self.open_file(&p.to_string_lossy());
                 }
-                KeyCode::Space => {
-                    let _ = self.ctl.apply(Command::Toggle);
+            }
+            KeyCode::Space => {
+                let _ = self.ctl.apply(Command::Toggle);
+            }
+            KeyCode::KeyF => {
+                self.toggle_fullscreen();
+            }
+            KeyCode::KeyR => {
+                if let Some(r) = &mut self.renderer {
+                    r.camera.reset();
+                    r.update_camera_uniform();
                 }
-                KeyCode::KeyF => {
+            }
+            KeyCode::KeyS => {
+                self.screenshot();
+            }
+            KeyCode::KeyM => {
+                if let Some(ref mut ui) = self.ui {
+                    ui.mute_clicked = true;
+                }
+            }
+            KeyCode::ArrowLeft => {
+                let pos = (self.ctl.position() - SEEK_STEP).clamp(0.0, self.ctl.duration());
+                let _ = self.ctl.apply(Command::Seek(pos));
+            }
+            KeyCode::ArrowRight => {
+                let pos = (self.ctl.position() + SEEK_STEP).clamp(0.0, self.ctl.duration());
+                let _ = self.ctl.apply(Command::Seek(pos));
+            }
+            KeyCode::ArrowUp => {
+                let v = (self.ctl.volume() + VOLUME_STEP).min(1.0);
+                let _ = self.ctl.apply(Command::SetVolume(v));
+                if let Some(ref mut ui) = self.ui {
+                    ui.volume = v;
+                    if v > 0.0 { ui.muted = false; }
+                }
+            }
+            KeyCode::ArrowDown => {
+                let v = (self.ctl.volume() - VOLUME_STEP).max(0.0);
+                let _ = self.ctl.apply(Command::SetVolume(v));
+                if let Some(ref mut ui) = self.ui {
+                    ui.volume = v;
+                    if v <= 0.001 { ui.muted = true; }
+                }
+            }
+            KeyCode::Escape => {
+                // Exit fullscreen first; a second Escape quits.
+                if self.window.as_ref().map(|w| w.fullscreen().is_some()).unwrap_or(false) {
                     self.toggle_fullscreen();
+                } else {
+                    self.save_state();
+                    event_loop.exit();
                 }
-                KeyCode::KeyR => {
-                    if let Some(r) = &mut self.renderer {
-                        r.camera.reset();
-                        r.update_camera_uniform();
-                    }
-                }
-                KeyCode::KeyS => {
-                    self.screenshot();
-                }
-                KeyCode::KeyM => {
-                    if let Some(ref mut ui) = self.ui {
-                        ui.mute_clicked = true;
-                    }
-                }
-                KeyCode::ArrowLeft => {
-                    let pos = (self.ctl.position() - SEEK_STEP).clamp(0.0, self.ctl.duration());
-                    let _ = self.ctl.apply(Command::Seek(pos));
-                }
-                KeyCode::ArrowRight => {
-                    let pos = (self.ctl.position() + SEEK_STEP).clamp(0.0, self.ctl.duration());
-                    let _ = self.ctl.apply(Command::Seek(pos));
-                }
-                KeyCode::ArrowUp => {
-                    let v = (self.ctl.volume() + VOLUME_STEP).min(1.0);
-                    let _ = self.ctl.apply(Command::SetVolume(v));
-                    if let Some(ref mut ui) = self.ui {
-                        ui.volume = v;
-                        if v > 0.0 { ui.muted = false; }
-                    }
-                }
-                KeyCode::ArrowDown => {
-                    let v = (self.ctl.volume() - VOLUME_STEP).max(0.0);
-                    let _ = self.ctl.apply(Command::SetVolume(v));
-                    if let Some(ref mut ui) = self.ui {
-                        ui.volume = v;
-                        if v <= 0.001 { ui.muted = true; }
-                    }
-                }
-                KeyCode::Escape => {
-                    // Exit fullscreen first; a second Escape quits.
-                    if self.window.as_ref().map(|w| w.fullscreen().is_some()).unwrap_or(false) {
-                        self.toggle_fullscreen();
-                    } else {
-                        self.save_state();
-                        event_loop.exit();
-                    }
-                }
-                _ => {}
-            },
+            }
             _ => {}
-        }
+        } }
     }
 
     fn device_event(&mut self, _el: &ActiveEventLoop, _id: winit::event::DeviceId, _event: winit::event::DeviceEvent) {}
@@ -504,8 +496,8 @@ impl ApplicationHandler for App {
             } else {
                 _event_loop.set_control_flow(ControlFlow::Wait);
             }
-        } else if let Some(r) = &mut self.renderer {
-            if let Err(e) = r.render(&[], &egui::TexturesDelta::default(), 1.0, None) {
+        } else if let Some(r) = &mut self.renderer
+            && let Err(e) = r.render(&[], &egui::TexturesDelta::default(), 1.0, None) {
                 match e {
                     wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
                         let s = r.size;
@@ -515,24 +507,22 @@ impl ApplicationHandler for App {
                     wgpu::SurfaceError::Timeout => {}
                 }
             }
-        }
 
         self.input_seen = false;
 
         // ── Apply actions ────────────────────────────────────────
-        if open_action {
-            if let Some(p) = rfd::FileDialog::new()
+        if open_action
+            && let Some(p) = rfd::FileDialog::new()
                 .add_filter("Video", &["mp4", "webm", "mkv", "avi", "mov", "m4v"])
                 .pick_file()
             {
                 self.open_file(&p.to_string_lossy());
             }
-        }
         if fullscreen_action {
             self.toggle_fullscreen();
         }
-        if resume_action {
-            if let Some(pos) = self
+        if resume_action
+            && let Some(pos) = self
                 .ctl
                 .file_path()
                 .and_then(|p| self.state.get(p).copied())
@@ -540,7 +530,6 @@ impl ApplicationHandler for App {
                 let _ = self.ctl.apply(Command::Seek(pos));
                 let _ = self.ctl.apply(Command::Play);
             }
-        }
         if let Some(pos) = seek_action {
             let _ = self.ctl.apply(Command::Seek(pos));
         }

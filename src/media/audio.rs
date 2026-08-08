@@ -117,15 +117,17 @@ impl AudioPipeline {
                                 // or mid-stream.  Counting `data.len()` makes
                                 // the clock run ahead of the audible track by
                                 // the buffer latency, permanently.
-                                let mut real = 0u64;
-                                for sample in data.iter_mut() {
-                                    match buf.pop_front() {
-                                        Some(s) => {
-                                            *sample = s * vol;
-                                            real += 1;
-                                        }
-                                        None => *sample = 0.0,
-                                    }
+                                //
+                                // Pop available samples in one batch and
+                                // apply volume in a single pass instead of a
+                                // per-sample lock-and-pop loop.
+                                let take = data.len().min(buf.len());
+                                for (i, s) in buf.drain(..take).enumerate() {
+                                    data[i] = s * vol;
+                                }
+                                let real = take as u64;
+                                for s in &mut data[take..] {
+                                    *s = 0.0;
                                 }
                                 if real > 0 {
                                     sh.samples_played.fetch_add(real, Ordering::Relaxed);
@@ -196,7 +198,7 @@ impl AudioPipeline {
         let sh_sink = shared.clone();
 
         // Sink closure: push interleaved f32 into ring buffer.
-        let sink = move |samples: Vec<f32>| {
+        let sink = move |samples: &[f32]| {
             if samples.is_empty() {
                 return;
             }
@@ -209,7 +211,7 @@ impl AudioPipeline {
                     if buf.len() + samples.len() <= buf_cap
                         || sh_sink.stopped.load(Ordering::Relaxed)
                     {
-                        buf.extend(&samples);
+                        buf.extend(samples.iter().copied());
                         return;
                     }
                 }
@@ -321,7 +323,7 @@ fn decode_audio_packets(
     sample_rate: u32,
     channels: u16,
     start_pos: f64,
-    mut sink: impl FnMut(Vec<f32>) + Send,
+    mut sink: impl FnMut(&[f32]) + Send,
 ) -> Result<(), String> {
     ffmpeg::init().map_err(|e| format!("ffmpeg init: {e}"))?;
 
@@ -408,6 +410,10 @@ fn decode_audio_packets(
     let mut filtered = frame::Audio::empty();
     let mut first_packet = true;
     let mut pushed_batches = 0u64;
+    // Reusable sample buffer: filled per decoded frame and handed to the
+    // sink by reference, so steady-state audio makes no per-frame heap
+    // allocations (previously a fresh ~4 KB Vec per 10 ms block).
+    let mut sample_buf: Vec<f32> = Vec::new();
 
     loop {
         // (1) Drain commands (non-blocking).
@@ -510,8 +516,8 @@ fn decode_audio_packets(
             // BACKWARD to a keyframe, and without this filter the ring plays
             // pre-target audio, leaving A/V desynced by the keyframe
             // distance after every seek.
-            if start_pos > 0.01 {
-                if let Some(pts) = decoded.timestamp().or(decoded.pts()) {
+            if start_pos > 0.01
+                && let Some(pts) = decoded.timestamp().or(decoded.pts()) {
                     let pts_secs = pts as f64
                         * audio_time_base.numerator() as f64
                         / audio_time_base.denominator() as f64;
@@ -519,7 +525,6 @@ fn decode_audio_packets(
                         continue;
                     }
                 }
-            }
             // Process the decoded frame through atempo filter (if active),
             // then resample to target format.
             let frames_to_resample: Vec<frame::Audio> = if let Some(ref mut graph) = atempo {
@@ -573,17 +578,17 @@ fn decode_audio_packets(
                 // Extract interleaved f32 samples from the resampled frame.
                 // data(0) is the interleaved f32 plane.
                 let bytes = resampled.data(0);
-                let samples: Vec<f32> = bytes
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                    .collect();
+                sample_buf.clear();
+                sample_buf.extend(bytes.chunks_exact(4).map(|b| {
+                    f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+                }));
 
-                if !samples.is_empty() {
+                if !sample_buf.is_empty() {
                     pushed_batches += 1;
                     if pushed_batches == 1 {
                         tracing::info!("Audio: first samples pushed");
                     }
-                    sink(samples);
+                    sink(&sample_buf);
                 }
 
                 // NOTE: no per-frame swr flush here.  ffmpeg-next's
@@ -615,12 +620,12 @@ fn decode_audio_packets(
                             continue;
                         }
                         let bytes = resampled.data(0);
-                        let samples: Vec<f32> = bytes
-                            .chunks_exact(4)
-                            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                            .collect();
-                        if !samples.is_empty() {
-                            sink(samples);
+                        sample_buf.clear();
+                        sample_buf.extend(bytes.chunks_exact(4).map(|b| {
+                            f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+                        }));
+                        if !sample_buf.is_empty() {
+                            sink(&sample_buf);
                         }
                     }
                     Err(ffmpeg::Error::Other { errno: error::EAGAIN }) => break,
@@ -635,12 +640,12 @@ fn decode_audio_packets(
                 continue;
             }
             let bytes = resampled.data(0);
-            let samples: Vec<f32> = bytes
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect();
-            if !samples.is_empty() {
-                sink(samples);
+            sample_buf.clear();
+            sample_buf.extend(bytes.chunks_exact(4).map(|b| {
+                f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            }));
+            if !sample_buf.is_empty() {
+                sink(&sample_buf);
             }
         }
     }
@@ -658,12 +663,12 @@ fn decode_audio_packets(
                         continue;
                     }
                     let bytes = resampled.data(0);
-                    let samples: Vec<f32> = bytes
-                        .chunks_exact(4)
-                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                        .collect();
-                    if !samples.is_empty() {
-                        sink(samples);
+                    sample_buf.clear();
+                    sample_buf.extend(bytes.chunks_exact(4).map(|b| {
+                        f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+                    }));
+                    if !sample_buf.is_empty() {
+                        sink(&sample_buf);
                     }
                 }
                 Err(ffmpeg::Error::Other { errno: error::EAGAIN }) => break,
@@ -674,8 +679,7 @@ fn decode_audio_packets(
     }
 
     // Flush swr internal frames.
-    loop {
-        let Some(resampler) = resampler.as_mut() else { break };
+    while let Some(resampler) = resampler.as_mut() {
         match resampler.flush(&mut resampled) {
             Ok(Some(_)) => {
                 // Guard against ffmpeg-next's flush quirk: an empty output
@@ -684,12 +688,12 @@ fn decode_audio_packets(
                     break;
                 }
                 let flush_bytes = resampled.data(0);
-                let flush_samples: Vec<f32> = flush_bytes
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                    .collect();
-                if !flush_samples.is_empty() {
-                    sink(flush_samples);
+                sample_buf.clear();
+                sample_buf.extend(flush_bytes.chunks_exact(4).map(|b| {
+                    f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+                }));
+                if !sample_buf.is_empty() {
+                    sink(&sample_buf);
                 }
             }
             Ok(None) => break,
@@ -760,9 +764,9 @@ mod tests {
         let collected_clone = collected.clone();
 
         // Sink: just accumulate all decoded samples.
-        let sink = move |samples: Vec<f32>| {
+        let sink = move |samples: &[f32]| {
             if let Ok(mut v) = collected_clone.lock() {
-                v.extend(&samples);
+                v.extend_from_slice(samples);
             }
         };
 
@@ -829,7 +833,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCmd>();
         let produced: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
         let produced_sink = produced.clone();
-        let sink = move |samples: Vec<f32>| {
+        let sink = move |samples: &[f32]| {
             *produced_sink.lock().unwrap() += samples.len() as u64;
         };
         let handle = thread::spawn(move || {
@@ -896,7 +900,7 @@ mod tests {
         let produced: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
         let produced_sink = produced.clone();
         let ring_sink = ring.clone();
-        let sink = move |samples: Vec<f32>| {
+        let sink = move |samples: &[f32]| {
             let mut r = ring_sink.lock().unwrap();
             while r.len() + samples.len() > 115_200 {
                 drop(r);
@@ -904,7 +908,7 @@ mod tests {
                 r = ring_sink.lock().unwrap();
             }
             let n = samples.len() as u64;
-            r.extend(samples);
+            r.extend(samples.iter().copied());
             *produced_sink.lock().unwrap() += n;
         };
         let _consumer = {

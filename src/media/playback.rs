@@ -200,11 +200,10 @@ impl PlaybackController {
         if self.state != PlaybackState::Playing {
             return;
         }
-        if let Some(ref demux) = self.demux {
-            if demux.poll_eof() {
+        if let Some(ref demux) = self.demux
+            && demux.poll_eof() {
                 self.eof_seen = true;
             }
-        }
         if !self.eof_seen {
             return;
         }

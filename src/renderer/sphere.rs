@@ -62,8 +62,8 @@ impl Sphere {
                 let first = i * (sectors + 1) + j;
                 let second = first + sectors + 1;
                 indices.extend_from_slice(&[
-                    first as u32, second as u32, (first + 1) as u32,
-                    second as u32, (second + 1) as u32, (first + 1) as u32,
+                    first, second, (first + 1),
+                    second, (second + 1), (first + 1),
                 ]);
             }
         }

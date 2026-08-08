@@ -4,11 +4,15 @@ pub struct OrbitCamera {
     pub yaw: f32,
     pub pitch: f32,
     pub fov: f32,
+    /// Set by any mutating operation (drag/scroll/reset) and cleared after
+    /// the uniform is re-uploaded, so the render loop skips the per-frame
+    /// `write_buffer` when the camera has not moved.
+    pub dirty: bool,
 }
 
 impl OrbitCamera {
     pub fn new() -> Self {
-        Self { yaw: 0.0, pitch: 0.0, fov: 90.0 }
+        Self { yaw: 0.0, pitch: 0.0, fov: 90.0, dirty: true }
     }
 
     pub fn view_proj_matrix(&self, aspect: f32) -> [[f32; 4]; 4] {
@@ -24,15 +28,18 @@ impl OrbitCamera {
         self.yaw += (delta_x as f32) * scale as f32;
         self.pitch += (delta_y as f32) * scale as f32;
         self.pitch = self.pitch.clamp(-89.0, 89.0);
+        self.dirty = true;
     }
 
     pub fn handle_scroll(&mut self, delta: f32) {
         self.fov = (self.fov - delta * 2.0).clamp(30.0, 120.0);
+        self.dirty = true;
     }
 
     pub fn reset(&mut self) {
         self.yaw = 0.0;
         self.pitch = 0.0;
         self.fov = 90.0;
+        self.dirty = true;
     }
 }

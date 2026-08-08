@@ -41,7 +41,6 @@ fn main() {
 
     let ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
         .expect("codec context");
-    drop(stream);
     let mut decoder = ctx.decoder().video().expect("video decoder");
     let (width, height) = (decoder.width(), decoder.height());
 
@@ -84,13 +83,12 @@ fn main() {
         }
         let mut decoded = frame::Video::empty();
         while decoder.receive_frame(&mut decoded).is_ok() {
-            if let Some(sc) = scaler.as_mut() {
-                if sc.run(&decoded, &mut out).is_ok() {
+            if let Some(sc) = scaler.as_mut()
+                && sc.run(&decoded, &mut out).is_ok() {
                     for p in 0..out.planes() {
                         bytes += out.data(p).len() as u64;
                     }
                 }
-            }
             frames += 1;
         }
 
@@ -108,13 +106,12 @@ fn main() {
     let _ = decoder.send_eof();
     let mut decoded = frame::Video::empty();
     while decoder.receive_frame(&mut decoded).is_ok() {
-        if let Some(sc) = scaler.as_mut() {
-            if sc.run(&decoded, &mut out).is_ok() {
+        if let Some(sc) = scaler.as_mut()
+            && sc.run(&decoded, &mut out).is_ok() {
                 for p in 0..out.planes() {
                     bytes += out.data(p).len() as u64;
                 }
             }
-        }
         frames += 1;
     }
 

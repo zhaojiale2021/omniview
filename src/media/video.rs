@@ -27,6 +27,9 @@ use crate::media::types::VideoFrame;
 /// queued, so decode-ahead never causes frames to be discarded.
 const FRAME_QUEUE_CAP: usize = 8;
 
+/// A reusable NV12 plane allocation (one Y or UV plane), shared via `Arc`.
+type PlaneBuffer = Arc<Vec<u8>>;
+
 pub struct VideoQueue {
     frames: Mutex<VecDeque<VideoFrame>>,
     space: Condvar,
@@ -226,7 +229,7 @@ fn decode_packets_loop(
     // allocation and we never allocate/free ~10 MB per frame (large-block
     // allocator churn causes periodic hitches).
     // 12 slots > queue cap 8 + one frame in the renderer + one in flight.
-    let mut frame_pool: Vec<(Arc<Vec<u8>>, Arc<Vec<u8>>)> = (0..12)
+    let mut frame_pool: Vec<(PlaneBuffer, PlaneBuffer)> = (0..12)
         .map(|_| (Arc::new(Vec::new()), Arc::new(Vec::new())))
         .collect();
     let mut next_slot = 0usize;
@@ -341,8 +344,8 @@ fn decode_packets_loop(
             );
             let uv_buf = Arc::make_mut(uv_arc);
             uv_buf.clear();
-            let uv_width = ((nv12.width() + 1) / 2) as usize;
-            let uv_height = (nv12.height() + 1) / 2;
+            let uv_width = nv12.width().div_ceil(2) as usize;
+            let uv_height = nv12.height().div_ceil(2);
             let uv_stride = pad_plane_into(
                 nv12.data(1),
                 nv12.stride(1),
@@ -380,7 +383,7 @@ fn pad_plane_into(
     out: &mut Vec<u8>,
 ) -> u32 {
     debug_assert!(row_bytes <= src_stride, "row_bytes {row_bytes} > src_stride {src_stride}");
-    let padded = (row_bytes + 255) / 256 * 256;
+    let padded = row_bytes.div_ceil(256) * 256;
     let need = padded * height as usize;
     if out.len() < need {
         out.resize(need, 0);

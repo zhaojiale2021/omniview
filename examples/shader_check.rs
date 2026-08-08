@@ -2,8 +2,12 @@
 //!
 //! The GUI cannot run in this environment, but pipeline creation compiles
 //! the shaders with naga — so this catches syntax/layout errors early.
+//!
+//! The vertex types are pulled in via `include!` below (the binary's
+//! modules aren't exposed as a lib), so the whole file comes along even
+//! though only `desc()` is used here.
+#![allow(dead_code)]
 
-use wgpu::util::DeviceExt;
 
 fn main() {
     pollster::block_on(async {
@@ -84,12 +88,12 @@ fn main() {
             (
                 "equirect.wgsl",
                 "vs_main",
-                &[my_project_renderer::sphere::Vertex::desc()][..],
+                &[omniview_renderer::sphere::Vertex::desc()][..],
             ),
             (
                 "quad.wgsl",
                 "vs_main",
-                &[my_project_renderer::quad::QuadVertex::desc()][..],
+                &[omniview_renderer::quad::QuadVertex::desc()][..],
             ),
         ] {
             let src = std::fs::read_to_string(format!("{root}/src/renderer/{name}")).unwrap();
@@ -129,7 +133,7 @@ fn main() {
 
 // The crate's binary modules aren't exposed as a lib, so re-expose the
 // vertex types through a tiny shim module by including the files.
-mod my_project_renderer {
+mod omniview_renderer {
     pub mod sphere {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/renderer/sphere.rs"));
     }

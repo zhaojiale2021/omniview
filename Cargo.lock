@@ -1745,27 +1745,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "my-project"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "cpal",
- "egui",
- "egui-wgpu",
- "egui-winit",
- "ffmpeg-next",
- "glam",
- "image",
- "pollster",
- "rfd",
- "serde_json",
- "tracing",
- "tracing-subscriber",
- "wgpu",
- "winit",
-]
-
-[[package]]
 name = "naga"
 version = "22.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2217,6 +2196,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c8bb09a4a2b1d668170cfe0a7d5bc103f8999fb316c98099b6a9939c9f2e79d"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "omniview"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "cpal",
+ "egui",
+ "egui-wgpu",
+ "egui-winit",
+ "ffmpeg-next",
+ "glam",
+ "image",
+ "pollster",
+ "rfd",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "wgpu",
+ "winit",
 ]
 
 [[package]]
