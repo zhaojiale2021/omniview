@@ -60,6 +60,11 @@ pub struct Renderer {
     capture_counter: u32,
     /// Buffer used for on-demand screenshot readbacks.
     png_staging: Option<wgpu::Buffer>,
+    /// Scratch buffer expanding packed NV12 UV (2 B/px) to RGBA (4 B/px)
+    /// for upload: some GPU drivers misbehave with Rg8Unorm texture
+    /// uploads, producing random color artifacts.  Rgba8Unorm is the most
+    /// universally supported format, at the cost of 2x upload bytes.
+    uv_rgba: Vec<u8>,
 }
 
 impl Renderer {
@@ -389,6 +394,7 @@ impl Renderer {
             egui_state, egui_renderer,
             capture_path,
             capture_staging,
+            uv_rgba: Vec::new(),
             capture_counter: 0,
             png_staging: None,
         }
@@ -469,7 +475,9 @@ impl Renderer {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rg8Unorm,
+                // Rgba8Unorm rather than Rg8Unorm: some GPU drivers
+                // produce random artifacts sampling/uploading Rg8Unorm.
+                format: wgpu::TextureFormat::Rgba8Unorm,
                 usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
@@ -531,6 +539,13 @@ impl Renderer {
             },
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
+        // Expand packed UV (2 B/px interleaved CbCr) to RGBA (4 B/px) and
+        // upload to the Rgba8Unorm texture.
+        self.uv_rgba.clear();
+        self.uv_rgba.reserve(frame.uv.len() * 2);
+        for pair in frame.uv.chunks_exact(2) {
+            self.uv_rgba.extend_from_slice(&[pair[0], pair[1], 0, 255]);
+        }
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: self.uv_texture.as_ref().unwrap(),
@@ -538,10 +553,10 @@ impl Renderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &frame.uv,
+            &self.uv_rgba,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(frame.uv_stride),
+                bytes_per_row: Some(frame.uv_stride * 2),
                 rows_per_image: Some(uv_h),
             },
             wgpu::Extent3d { width: uv_w, height: uv_h, depth_or_array_layers: 1 },
