@@ -278,10 +278,13 @@ fn demux_loop(
     // is never starved by audio backpressure.  Without this, the demux
     // holds a full audio packet and video packets behind it stop flowing —
     // video freezes at 2x while the audio ring drains.
+    // Stash cap 32 (~1s of packets per stream at 30fps) plus the 64-slot
+    // channels give the decoders several seconds of headroom when one
+    // stream's backpressure stalls the single demux thread.
     let mut video_stash: std::collections::VecDeque<ffmpeg::Packet> =
-        std::collections::VecDeque::with_capacity(8);
+        std::collections::VecDeque::with_capacity(32);
     let mut audio_stash: std::collections::VecDeque<ffmpeg::Packet> =
-        std::collections::VecDeque::with_capacity(8);
+        std::collections::VecDeque::with_capacity(32);
 
     'outer: loop {
         // (1) Drain commands BEFORE reading the next packet.
@@ -341,7 +344,7 @@ fn demux_loop(
                     break; // sent — go read next packet
                 }
                 Err(mpsc::TrySendError::Full(p)) => {
-                    if stash.len() < 8 {
+                    if stash.len() < 32 {
                         stash.push_back(p);
                         break; // keep reading — other stream flows
                     }

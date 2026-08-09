@@ -25,7 +25,7 @@ use crate::media::types::VideoFrame;
 /// Bounded jitter buffer with peek semantics: the renderer pops only the
 /// frames whose PTS has been reached by the media clock and leaves the rest
 /// queued, so decode-ahead never causes frames to be discarded.
-const FRAME_QUEUE_CAP: usize = 8;
+const FRAME_QUEUE_CAP: usize = 48;
 
 /// A reusable NV12 plane allocation (one Y or UV plane), shared via `Arc`.
 type PlaneBuffer = Arc<Vec<u8>>;

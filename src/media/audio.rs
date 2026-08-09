@@ -194,7 +194,7 @@ impl AudioPipeline {
         // scheduling, Windows timer slop) so the cpal callback never
         // underruns — an underrun stalls the audio master clock and
         // stutters video with it.
-        let buf_cap = (sample_rate as usize) * (channels as usize) * 1200 / 1000;
+        let buf_cap = (sample_rate as usize) * (channels as usize) * 2400 / 1000;
         let sh_sink = shared.clone();
 
         // Sink closure: push interleaved f32 into ring buffer.
