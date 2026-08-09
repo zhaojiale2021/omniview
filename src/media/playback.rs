@@ -36,6 +36,9 @@ pub struct PlaybackController {
     last_clock_pos: f64,
     /// Audio-clock stall guard state: when that position was observed.
     last_clock_at: Option<Instant>,
+    /// Suppresses transient starvation diagnostics right after open/seek
+    /// while fresh decoders produce their first frames.
+    startup_grace_until: Option<Instant>,
 }
 
 impl PlaybackController {
@@ -58,6 +61,7 @@ impl PlaybackController {
             last_frame_at: None,
             last_clock_pos: 0.0,
             last_clock_at: None,
+            startup_grace_until: None,
         }
     }
 
@@ -92,6 +96,15 @@ impl PlaybackController {
     /// Ring-buffer underflow count of the audio pipeline (diagnostics).
     pub fn audio_underruns(&self) -> u64 {
         self.audio.as_ref().map(|a| a.underruns()).unwrap_or(0)
+    }
+
+    /// True for a few seconds right after open/seek, while the fresh
+    /// decoders are still producing their first frames.  Used to suppress
+    /// transient starvation diagnostics and to show a buffering hint.
+    pub fn startup_grace(&self) -> bool {
+        self.startup_grace_until
+            .map(|t| t > std::time::Instant::now())
+            .unwrap_or(false)
     }
 
     /// Decoded video frames waiting ahead of the clock (diagnostics).
@@ -220,6 +233,7 @@ impl PlaybackController {
     // ── Command handlers ──────────────────────────────────────────
 
     fn do_open(&mut self, path: &str) -> Result<(), String> {
+        self.startup_grace_until = Some(std::time::Instant::now() + Duration::from_secs(3));
         self.teardown();
 
         self.file_path = Some(path.to_string());
@@ -315,6 +329,7 @@ impl PlaybackController {
         let clamped = pos.clamp(0.0, self.duration);
         let was_playing = self.state == PlaybackState::Playing;
 
+        self.startup_grace_until = Some(std::time::Instant::now() + Duration::from_secs(3));
         self.state = PlaybackState::Seeking;
         self.teardown();
 

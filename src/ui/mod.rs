@@ -34,6 +34,9 @@ pub struct PlayerUI {
     pub resume_position: f64,
     /// Set when the user clicks the resume button.
     pub resume_clicked: bool,
+    /// True while playing with an empty frame queue (buffering after
+    /// open/seek, or a transient stall).  Shown as a hint over the video.
+    pub buffering: bool,
     file_name: String,
     /// Position saved at drag start, used to detect actual changes.
     drag_start_pos: f64,
@@ -58,6 +61,7 @@ impl PlayerUI {
             speed_changed: false,
             volume_changed: false,
             seeking: false,
+            buffering: false,
             is_fullscreen: false,
             ui_visible: true,
             fullscreen_clicked: false,
@@ -196,6 +200,13 @@ impl PlayerUI {
                 ..Default::default()
             })
             .show(ctx, |ui| {
+                // ── Buffering hint (first frames after open/seek) ──
+                if self.buffering {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(egui::RichText::new("缓冲中…").size(13.0));
+                    });
+                }
                 // ── Seek bar (full width strip) ──────────────────
                 let dur = self.duration.max(1.0);
                 let mut slider_val = self.position;

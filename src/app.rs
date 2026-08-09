@@ -363,7 +363,8 @@ impl ApplicationHandler for App {
             }
         }
         // Playing but no frame available and nothing buffered ahead means
-        // the decoder cannot keep up with the media clock.
+        // the decoder cannot keep up with the media clock.  Exempt the
+        // first seconds after open/seek while fresh decoders fill up.
         if !self.ctl.paused()
             && frame.is_none()
             && self.ctl.buffered_frames() == 0
@@ -371,6 +372,7 @@ impl ApplicationHandler for App {
                 self.ctl.state(),
                 PlaybackState::Ended | PlaybackState::Error(_)
             )
+            && !self.ctl.startup_grace()
             && self.last_diag_log.elapsed() > Duration::from_secs(10)
         {
             tracing::warn!(
@@ -398,6 +400,11 @@ impl ApplicationHandler for App {
             ui.speed = self.ctl.speed();
             ui.resume_available = resume_pos.is_some();
             ui.resume_position = resume_pos.unwrap_or(0.0);
+            // Buffering: playing but the frame queue is empty (decoders
+            // still filling after open/seek, or a transient stall).
+            ui.buffering = !self.ctl.paused()
+                && !ended
+                && self.ctl.buffered_frames() == 0;
         }
 
         let paused = self.ctl.paused() || ended;
