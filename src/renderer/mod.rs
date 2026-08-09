@@ -223,7 +223,10 @@ impl Renderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rg8Unorm,
+            // Rgba8Unorm (not Rg8Unorm): some GPU drivers sample Rg8Unorm
+            // unreliably and the placeholder is visible before the first
+            // video frame is uploaded.
+            format: wgpu::TextureFormat::Rgba8Unorm,
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -249,10 +252,10 @@ impl Renderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &[128u8, 128],
+            &[128u8, 128, 0, 255],
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(2),
+                bytes_per_row: Some(4),
                 rows_per_image: Some(1),
             },
             wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
