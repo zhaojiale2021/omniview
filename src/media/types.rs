@@ -33,4 +33,19 @@ pub struct VideoFrame {
     /// Bytes per row of `uv` (multiple of 256).
     pub uv_stride: u32,
     pub pts_secs: f64,
+    /// FNV-1a checksum of the Y plane computed when the frame was pushed;
+    /// the renderer recomputes it before upload to detect data corruption
+    /// (a mismatch means buffer reuse raced the producer).  Diagnostics.
+    pub y_checksum: u64,
+}
+
+/// FNV-1a 64-bit hash (fast, no dependencies).  Used to fingerprint frame
+/// plane data so corruption can be detected across thread boundaries.
+pub fn fnv1a(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }

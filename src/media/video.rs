@@ -223,13 +223,13 @@ fn decode_packets_loop(
     let mut first_packet = true;
     let mut frames_sent = 0u64;
 
-    // Frame pool: 8 reusable plane-buffer slots.  The queue holds at most 6
-    // frames plus one held by the renderer, so a slot's Arc is private again
-    // by the time we cycle back to it — `Arc::make_mut` reuses the
-    // allocation and we never allocate/free ~10 MB per frame (large-block
-    // allocator churn causes periodic hitches).
-    // 12 slots > queue cap 8 + one frame in the renderer + one in flight.
-    let mut frame_pool: Vec<(PlaneBuffer, PlaneBuffer)> = (0..12)
+    // Frame pool: reusable plane-buffer slots.  The queue holds up to
+    // FRAME_QUEUE_CAP frames plus one held by the renderer, so a slot's
+    // Arc is private again by the time we cycle back to it — `Arc::make_mut`
+    // reuses the allocation and we never allocate/free ~3 MB per frame
+    // (large-block allocator churn causes periodic hitches).
+    // 52 slots > queue cap 48 + one frame in the renderer + one in flight.
+    let mut frame_pool: Vec<(PlaneBuffer, PlaneBuffer)> = (0..52)
         .map(|_| (Arc::new(Vec::new()), Arc::new(Vec::new())))
         .collect();
     let mut next_slot = 0usize;
@@ -288,7 +288,24 @@ fn decode_packets_loop(
         }
 
         let mut decoded = frame::Video::empty();
+        let mut corrupt_dropped = 0u64;
+        let mut corrupt_log = std::time::Instant::now();
         while decoder.receive_frame(&mut decoded).is_ok() {
+            // Skip frames the decoder flagged as corrupt (missing/broken
+            // references).  Showing them produces green/blocky artifacts;
+            // dropping them just skips a frame.  Some encodes (B-frame
+            // heavy streams) flag these intermittently.
+            if decoded.flags().contains(ffmpeg::util::frame::flag::Flags::CORRUPT) {
+                corrupt_dropped += 1;
+                if corrupt_log.elapsed().as_secs() >= 5 {
+                    tracing::warn!(
+                        "Video: dropped {corrupt_dropped} corrupt frames in last 5s"
+                    );
+                    corrupt_dropped = 0;
+                    corrupt_log = std::time::Instant::now();
+                }
+                continue;
+            }
             // Drain commands mid-frame (like the file-based decode loop).
             loop {
                 match command_rx.try_recv() {
@@ -354,14 +371,16 @@ fn decode_packets_loop(
                 uv_buf,
             );
             frames_sent += 1;
+            let y_checksum = crate::media::types::fnv1a(y_buf);
             let frame_out = VideoFrame {
-                y: frame_pool[slot].0.clone(),
-                uv: frame_pool[slot].1.clone(),
+                y: y_arc.clone(),
+                uv: uv_arc.clone(),
                 width: nv12.width(),
                 height: nv12.height(),
                 y_stride,
                 uv_stride,
                 pts_secs,
+                y_checksum,
             };
             queue.push(frame_out, &stopped);
         }

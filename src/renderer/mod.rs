@@ -500,6 +500,22 @@ impl Renderer {
             self.video_bind_group = Some(bind_group);
         }
 
+        // ── 诊断(临时):帧数据完整性校验(定位花屏后移除)──
+        let actual = crate::media::types::fnv1a(&frame.y);
+        if actual != frame.y_checksum {
+            static MISMATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = MISMATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n <= 5 {
+                tracing::error!(
+                    "FRAME DATA CORRUPTION: y_checksum mismatch (expect {:016x}, got {:016x}) \
+                     at pts={:.3}s — buffer reuse raced the decoder",
+                    frame.y_checksum,
+                    actual,
+                    frame.pts_secs
+                );
+            }
+        }
+
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: self.y_texture.as_ref().unwrap(),

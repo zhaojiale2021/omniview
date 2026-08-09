@@ -400,9 +400,12 @@ impl ApplicationHandler for App {
             ui.speed = self.ctl.speed();
             ui.resume_available = resume_pos.is_some();
             ui.resume_position = resume_pos.unwrap_or(0.0);
-            // Buffering: playing but the frame queue is empty (decoders
-            // still filling after open/seek, or a transient stall).
-            ui.buffering = !self.ctl.paused()
+            // Buffering: only right after open/seek (startup grace) while
+            // the frame queue is still empty.  During steady playback the
+            // queue legitimately drains to 0 between pops, so showing the
+            // hint then would just flicker.
+            ui.buffering = self.ctl.startup_grace()
+                && !self.ctl.paused()
                 && !ended
                 && self.ctl.buffered_frames() == 0;
         }

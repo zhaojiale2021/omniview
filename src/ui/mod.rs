@@ -200,13 +200,6 @@ impl PlayerUI {
                 ..Default::default()
             })
             .show(ctx, |ui| {
-                // ── Buffering hint (first frames after open/seek) ──
-                if self.buffering {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(egui::RichText::new("缓冲中…").size(13.0));
-                    });
-                }
                 // ── Seek bar (full width strip) ──────────────────
                 let dur = self.duration.max(1.0);
                 let mut slider_val = self.position;
@@ -343,6 +336,18 @@ impl PlayerUI {
                     });
                 });
             });
+
+        // ── Buffering hint: centered over the video ────────────
+        if self.buffering {
+            egui::Area::new(egui::Id::new("buffering_hint"))
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(egui::RichText::new("缓冲中…").size(18.0).strong());
+                    });
+                });
+        }
 
         ctx.end_pass()
     }
