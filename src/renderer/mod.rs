@@ -113,7 +113,11 @@ impl Renderer {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: PresentMode::AutoVsync,
+            // Fifo (hard vsync) — a media player has no use for uncapped
+            // frames: AutoVsync resolved to an uncapped mode on this
+            // driver (165 fps), which wastes GPU and can produce display
+            // artifacts (tearing/glitches) on some monitors.
+            present_mode: PresentMode::Fifo,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -237,10 +241,10 @@ impl Renderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &[255u8, 255, 255, 255],
+            &[255u8],
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(4),
+                bytes_per_row: Some(1),
                 rows_per_image: Some(1),
             },
             wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
@@ -669,7 +673,9 @@ impl Renderer {
             && self.capture_staging.is_some()
             && {
                 self.capture_counter += 1;
-                self.capture_counter.is_multiple_of(20)
+                // 诊断(临时):启动期每帧捕获,之后每 20 帧
+                self.capture_counter <= 120
+                    || self.capture_counter.is_multiple_of(20)
             };
         if capture_now
             && let (Some(staging), Some(_)) = (&self.capture_staging, &self.capture_path) {
