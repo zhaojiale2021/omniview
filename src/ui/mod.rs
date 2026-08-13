@@ -1,5 +1,80 @@
 use egui::Context;
 
+/// Install a system CJK font as a fallback so Chinese UI text ("缓冲中…",
+/// "续播") renders instead of tofu boxes.  egui's default fonts have no
+/// CJK glyphs, so we load a single-face TTF/OTF from the usual system
+/// locations.  Windows fonts are also reachable from WSL via /mnt/c.
+/// Note: .ttc collections are skipped — ab_glyph (egui's font backend)
+/// cannot parse them.  Returns the path that was loaded.
+pub fn install_cjk_font(ctx: &egui::Context) -> Option<std::path::PathBuf> {
+    const CANDIDATES: &[&str] = &[
+        // Windows (native build)
+        "C:\\Windows\\Fonts\\msyh.ttf",
+        "C:\\Windows\\Fonts\\simhei.ttf",
+        "C:\\Windows\\Fonts\\Deng.ttf",
+        // WSL (Windows fonts are mounted under /mnt/c)
+        "/mnt/c/Windows/Fonts/msyh.ttf",
+        "/mnt/c/Windows/Fonts/simhei.ttf",
+        "/mnt/c/Windows/Fonts/Deng.ttf",
+        // Linux
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.otf",
+        "/usr/share/fonts/opentype/source-han-sans/SourceHanSansSC-Regular.otf",
+    ];
+
+    for path in CANDIDATES {
+        let Ok(bytes) = std::fs::read(path) else { continue };
+        // A real CJK font is megabytes; anything smaller is not it.
+        if bytes.len() < 500_000 {
+            continue;
+        }
+        // Skip font collections ('ttcf') and anything that is not a
+        // single-face sfnt container — egui would panic later on bad data.
+        let magic = &bytes[..4];
+        if magic == b"ttcf" || magic == b"wOFF" || magic == b"wOF2" {
+            continue;
+        }
+        if magic != &[0x00, 0x01, 0x00, 0x00]
+            && magic != b"OTTO"
+            && magic != b"true"
+            && magic != b"typ1"
+        {
+            continue;
+        }
+        let mut fonts = egui::FontDefinitions::default();
+        fonts
+            .font_data
+            .insert("cjk".to_owned(), egui::FontData::from_owned(bytes));
+        // Push to the END of each family so Latin text keeps the default
+        // fonts and only missing (CJK) glyphs fall through to this one.
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .push("cjk".to_owned());
+        }
+        ctx.set_fonts(fonts);
+        return Some(std::path::PathBuf::from(path));
+    }
+    tracing::warn!("no system CJK font found; Chinese UI text will render as boxes");
+    None
+}
+
+/// One-shot diagnostic: log which UI glyphs the current font stack can
+/// render (runs right after font installation).
+pub fn audit_glyphs(ctx: &egui::Context) {
+    for s in [
+        "缓冲中…", "续播", "🎬", "📂", "⏸", "▶", "🔇", "🔉", "🔊", "⛶", "×", "360°",
+    ] {
+        let ok = ctx.fonts(|f| {
+            f.has_glyphs(&egui::FontId::new(14.0, egui::FontFamily::Proportional), s)
+        });
+        tracing::info!("glyph {s:?} renderable: {ok}");
+    }
+}
+
 /// Player controls laid out like Windows Media Player:
 /// - top bar: title · open · speed · 360° toggle
 /// - bottom transport bar (single row): play/pause · seek bar ·
@@ -38,6 +113,8 @@ pub struct PlayerUI {
     /// open/seek, or a transient stall).  Shown as a hint over the video.
     pub buffering: bool,
     file_name: String,
+    /// Glyph audit has run once (fonts only exist after the first pass).
+    audited: bool,
     /// Position saved at drag start, used to detect actual changes.
     drag_start_pos: f64,
     /// Mute state; clicking the volume icon toggles it.
@@ -48,6 +125,10 @@ pub struct PlayerUI {
 
 impl PlayerUI {
     pub fn new(ctx: &Context) -> Self {
+        if let Some(path) = install_cjk_font(ctx) {
+            tracing::info!("CJK font loaded from {}", path.display());
+        }
+
         Self {
             ctx: ctx.clone(),
             playing: false,
@@ -69,11 +150,17 @@ impl PlayerUI {
             resume_available: false,
             resume_position: 0.0,
             resume_clicked: false,
+            audited: false,
             file_name: String::new(),
             drag_start_pos: 0.0,
             muted: false,
             last_volume: 0.8,
         }
+    }
+
+    /// Set the media file name shown in the top bar.
+    pub fn set_file_name(&mut self, name: String) {
+        self.file_name = name;
     }
 
     fn fmt_time(secs: f64) -> String {
@@ -103,6 +190,13 @@ impl PlayerUI {
     }
 
     pub fn update(&mut self) -> egui::FullOutput {
+        // One-shot glyph audit: fonts only exist after the first egui
+        // pass, so this cannot run from `new`.
+        if !self.audited {
+            self.audited = true;
+            audit_glyphs(&self.ctx);
+        }
+
         // Process a pending mute toggle before borrowing ctx.
         if self.mute_clicked {
             self.mute_clicked = false;
@@ -338,14 +432,27 @@ impl PlayerUI {
             });
 
         // ── Buffering hint: centered over the video ────────────
+        // Drawn on a dark rounded panel so it stays readable over any
+        // video content.
         if self.buffering {
             egui::Area::new(egui::Id::new("buffering_hint"))
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
                 .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(egui::RichText::new("缓冲中…").size(18.0).strong());
-                    });
+                    egui::Frame::popup(ui.style())
+                        .fill(egui::Color32::from_black_alpha(180))
+                        .rounding(egui::Rounding::same(8.0))
+                        .inner_margin(egui::Margin::symmetric(20.0, 12.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.add_space(10.0);
+                                ui.label(
+                                    egui::RichText::new("缓冲中…")
+                                        .size(16.0)
+                                        .strong(),
+                                );
+                            });
+                        });
                 });
         }
 

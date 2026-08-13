@@ -403,6 +403,14 @@ impl ApplicationHandler for App {
             ui.speed = self.ctl.speed();
             ui.resume_available = resume_pos.is_some();
             ui.resume_position = resume_pos.unwrap_or(0.0);
+            // Top-bar title: show the actual file name.
+            ui.set_file_name(
+                self.ctl
+                    .file_path()
+                    .and_then(|p| std::path::Path::new(p).file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            );
             // Buffering: only right after open/seek (startup grace) while
             // the frame queue is still empty.  During steady playback the
             // queue legitimately drains to 0 between pops, so showing the
