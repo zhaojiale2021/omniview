@@ -763,8 +763,10 @@ impl Renderer {
                     let data = slice.get_mapped_range();
                     let (w, h) = (self.size.0, self.size.1);
                     let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+                    // The surface is BGRA (Bgra8Unorm*), so reorder to RGB
+                    // for the P6 writer.
                     for px in data.chunks_exact(4) {
-                        ppm.extend_from_slice(&px[..3]);
+                        ppm.extend_from_slice(&[px[2], px[1], px[0]]);
                     }
                     let p = format!("{path}_{}", self.capture_counter);
                     let _ = std::fs::write(&p, ppm);

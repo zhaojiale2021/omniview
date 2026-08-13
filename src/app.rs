@@ -39,6 +39,8 @@ pub struct App {
     last_input: Instant,
     /// File to open once the window is ready.
     pending_file: Option<String>,
+    /// Whether the OS cursor is currently visible.
+    cursor_visible: bool,
 
     // ── Resume position (remembered across sessions) ────────────
     state: HashMap<String, f64>,
@@ -73,6 +75,7 @@ impl App {
             input_seen: false,
             last_input: Instant::now(),
             pending_file: initial_file,
+            cursor_visible: true,
             state: HashMap::new(),
             state_path: PathBuf::from("player_state.json"),
             last_state_save: Instant::now(),
@@ -161,8 +164,17 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // Window title from the command-line file.  Set at CREATION: a
+        // runtime set_title is flaky on WSLg/X11 (the property change
+        // occasionally kills the X connection and the event loop).
+        let title = self
+            .pending_file
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).file_name())
+            .map(|n| format!("{} — Omniview", n.to_string_lossy()))
+            .unwrap_or_else(|| "Omniview".to_string());
         let attrs = Window::default_attributes()
-            .with_title("Omniview")
+            .with_title(title)
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
         let renderer = pollster::block_on(Renderer::new(window.clone()));
@@ -411,6 +423,7 @@ impl ApplicationHandler for App {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default(),
             );
+
             // Buffering: only right after open/seek (startup grace) while
             // the frame queue is still empty.  During steady playback the
             // queue legitimately drains to 0 between pops, so showing the
@@ -450,6 +463,15 @@ impl ApplicationHandler for App {
             || seeking
             || self.dragging
             || self.last_input.elapsed() < UI_HIDE_DELAY;
+
+        // ── Hide the cursor with the bars in idle fullscreen ──────
+        let cursor_visible = !(fullscreen && !ui_visible && !paused);
+        if self.cursor_visible != cursor_visible {
+            if let Some(w) = &self.window {
+                w.set_cursor_visible(cursor_visible);
+            }
+            self.cursor_visible = cursor_visible;
+        }
 
         // ── Gather UI actions ────────────────────────────────────
         let mut open_action = false;

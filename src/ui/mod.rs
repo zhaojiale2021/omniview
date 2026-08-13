@@ -62,6 +62,25 @@ pub fn install_cjk_font(ctx: &egui::Context) -> Option<std::path::PathBuf> {
     None
 }
 
+/// Player style: blue accent, slider trailing fill, slightly beefier
+/// slider rail and consistent widget rounding.
+fn apply_style(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    let accent = egui::Color32::from_rgb(66, 146, 255);
+    style.visuals.selection.bg_fill = accent;
+    style.visuals.hyperlink_color = accent;
+    // NOTE: egui 0.29 only offers TRAILING slider fill (colors the part
+    // after the handle) — the opposite of the player convention where the
+    // played portion is filled.  Keep it off; the handle itself takes the
+    // accent color.
+    style.visuals.slider_trailing_fill = false;
+    style.visuals.widgets.inactive.rounding = egui::Rounding::same(4.0);
+    style.visuals.widgets.hovered.rounding = egui::Rounding::same(4.0);
+    style.visuals.widgets.active.rounding = egui::Rounding::same(4.0);
+    style.spacing.slider_rail_height = 6.0;
+    ctx.set_style(style);
+}
+
 /// One-shot diagnostic: log which UI glyphs the current font stack can
 /// render (runs right after font installation).
 pub fn audit_glyphs(ctx: &egui::Context) {
@@ -128,6 +147,7 @@ impl PlayerUI {
         if let Some(path) = install_cjk_font(ctx) {
             tracing::info!("CJK font loaded from {}", path.display());
         }
+        apply_style(ctx);
 
         Self {
             ctx: ctx.clone(),
@@ -195,6 +215,21 @@ impl PlayerUI {
         if !self.audited {
             self.audited = true;
             audit_glyphs(&self.ctx);
+        }
+
+        // Invisible full-screen click layer: double-click toggles
+        // fullscreen (skipped in 360 mode where drag rotates the camera).
+        if !self.is_360 {
+            let bg_id = egui::Id::new("video_bg_click");
+            let resp = egui::Area::new(bg_id)
+                .order(egui::Order::Background)
+                .show(&self.ctx, |ui| {
+                    ui.allocate_rect(self.ctx.screen_rect(), egui::Sense::click())
+                })
+                .inner;
+            if resp.double_clicked() {
+                self.fullscreen_clicked = true;
+            }
         }
 
         // Process a pending mute toggle before borrowing ctx.
@@ -294,48 +329,105 @@ impl PlayerUI {
                 ..Default::default()
             })
             .show(ctx, |ui| {
-                // ── Seek bar (full width strip) ──────────────────
+                // ── Seek bar (custom, full width strip) ─────────────
+                // Hand-painted instead of egui::Slider: egui 0.29 only
+                // supports TRAILING fill (colors the part after the
+                // handle) while a media player should fill the PLAYED
+                // portion.  Click or drag anywhere on the bar to seek.
                 let dur = self.duration.max(1.0);
-                let mut slider_val = self.position;
-                // Slider always allocates `spacing.slider_width`, so
-                // widen it to the panel width here.
-                ui.spacing_mut().slider_width = ui.available_width().max(1.0);
-                let seek_response = ui.add(
-                    egui::Slider::new(&mut slider_val, 0.0..=dur)
-                        .text("")
-                        .show_value(false)
-                        .custom_formatter(|n, _| {
-                            let m = (n as u64) / 60;
-                            let s = (n as u64) % 60;
-                            format!("{m}:{s:02}")
-                        })
-                        .custom_parser(|s| {
-                            let parts: Vec<&str> = s.split(':').collect();
-                            if parts.len() == 2 {
-                                Some(
-                                    parts[0].parse::<f64>().unwrap_or(0.0) * 60.0
-                                        + parts[1].parse::<f64>().unwrap_or(0.0),
-                                )
-                            } else {
-                                None
-                            }
-                        }),
+                let (bar_rect, seek_response) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width().max(1.0), 18.0),
+                    egui::Sense::click_and_drag(),
                 );
+
+                let accent = ui.visuals().selection.bg_fill;
+                let base_frac =
+                    ((self.position / dur).clamp(0.0, 1.0)) as f32;
+                let mut target_frac = base_frac;
 
                 if seek_response.drag_started() {
                     self.seeking = true;
-                    self.drag_start_pos = self.position; // save pre-drag position
+                    self.drag_start_pos = self.position; // pre-drag position
                 }
-                // Update position in real-time during drag for time display
                 if self.seeking {
-                    self.position = slider_val;
+                    if let Some(p) = seek_response.interact_pointer_pos() {
+                        target_frac = ((p.x - bar_rect.left())
+                            / bar_rect.width().max(1.0))
+                        .clamp(0.0, 1.0);
+                        // Live-update the time display during the drag.
+                        self.position = target_frac as f64 * dur;
+                    }
                 }
-                // Only trigger seek when user releases the slider
                 if seek_response.drag_stopped() {
                     self.seeking = false;
-                    // Compare against position before drag, not during-drag value
-                    if (slider_val - self.drag_start_pos).abs() > 0.2 {
-                        self.seek_to = Some(slider_val);
+                    // Compare against the pre-drag position.
+                    if (self.position - self.drag_start_pos).abs() > 0.2 {
+                        self.seek_to = Some(self.position);
+                    }
+                }
+
+                // ── Paint: rail, played fill, handle ──────────────
+                let rail_h = 6.0;
+                let rail = egui::Rect::from_center_size(
+                    bar_rect.center(),
+                    egui::vec2(bar_rect.width(), rail_h),
+                );
+                let rounding = egui::Rounding::same(rail_h / 2.0);
+                ui.painter()
+                    .rect_filled(rail, rounding, ui.visuals().widgets.inactive.bg_fill);
+                let played_w = (bar_rect.width() * target_frac).max(rail_h / 2.0);
+                let played = egui::Rect::from_min_max(
+                    rail.min,
+                    egui::pos2(rail.min.x + played_w, rail.max.y),
+                );
+                ui.painter().rect_filled(played, rounding, accent);
+                let hovered = seek_response.hovered() || self.seeking;
+                let handle_r = if hovered { 7.0 } else { 5.0 };
+                let cx = rail.min.x + bar_rect.width() * target_frac;
+                let handle_c = egui::pos2(cx, bar_rect.center().y);
+                ui.painter().circle_filled(handle_c, handle_r, accent);
+                if hovered {
+                    ui.painter().circle_stroke(
+                        handle_c,
+                        handle_r + 2.0,
+                        egui::Stroke::new(1.5, egui::Color32::WHITE),
+                    );
+                }
+
+                // ── Seek time bubble (hover + drag) ───────────────
+                // Follows the pointer above the bar with the target time.
+                let show_preview = self.seeking || seek_response.hovered();
+                if show_preview {
+                    let pointer = seek_response
+                        .hover_pos()
+                        .or_else(|| ctx.pointer_latest_pos());
+                    if let Some(p) = pointer {
+                        // Value at the pointer: map x across the rail.
+                        let rect = seek_response.rect;
+                        let frac =
+                            ((p.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+                        let t = if self.seeking {
+                            self.position
+                        } else {
+                            frac as f64 * dur
+                        };
+                        let bubble_pos = egui::pos2(p.x, rect.top() - 46.0);
+                        egui::Area::new(egui::Id::new("seek_preview"))
+                            .fixed_pos(bubble_pos)
+                            .order(egui::Order::Foreground)
+                            .show(ctx, |ui| {
+                                egui::Frame::popup(ui.style())
+                                    .fill(egui::Color32::from_black_alpha(210))
+                                    .rounding(egui::Rounding::same(4.0))
+                                    .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new(Self::fmt_time(t))
+                                                .family(egui::FontFamily::Monospace)
+                                                .size(12.0),
+                                        );
+                                    });
+                            });
                     }
                 }
 
@@ -386,7 +478,7 @@ impl PlayerUI {
                             egui::Slider::new(&mut self.volume, 0.0..=1.0)
                                 .show_value(false)
                                 .text(""),
-                        );
+                        ).on_hover_text(format!("音量 {}%", (self.volume * 100.0).round() as i32));
                         if vol.drag_started() || vol.changed() {
                             if self.volume > 0.0 {
                                 self.muted = false;
@@ -420,6 +512,7 @@ impl PlayerUI {
                                 Self::fmt_time(self.position),
                                 Self::fmt_time(self.duration),
                             ))
+                            .family(egui::FontFamily::Monospace)
                             .size(12.0)
                             .color(if is_dark {
                                 egui::Color32::LIGHT_GRAY
