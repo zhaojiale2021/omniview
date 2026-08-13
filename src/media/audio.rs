@@ -19,6 +19,160 @@ use ffmpeg_next as ffmpeg;
 use ffmpeg::codec::packet::Packet;
 use ffmpeg::{channel_layout::ChannelLayout, codec, filter, format, frame, media, software, error};
 
+/// Send handle to the audio actor thread.  The actor owns the cpal output
+/// stream (cpal streams are !Send, so they live on the thread that built
+/// them); every field here is safe to share and to move across threads.
+#[derive(Clone)]
+pub struct AudioHandle {
+    /// Master-clock counter (advanced only for real samples popped from
+    /// the ring by the cpal callback).
+    pub samples_played: Arc<AtomicU64>,
+    pub sample_rate: u32,
+    pub channels: u16,
+    cmd_tx: mpsc::Sender<AudioCmd>,
+    shared: Arc<Shared>,
+    underruns: Arc<AtomicU64>,
+    ring: Arc<Mutex<VecDeque<f32>>>,
+}
+
+impl AudioHandle {
+    pub fn set_paused(&self, p: bool) {
+        let _ = self.cmd_tx.send(AudioCmd::Pause(p));
+    }
+
+    pub fn set_speed(&self, s: f64) {
+        let _ = self.cmd_tx.send(AudioCmd::Speed(s));
+    }
+
+    pub fn set_volume(&self, v: f32) {
+        if let Ok(mut vol) = self.shared.volume.lock() {
+            *vol = v.clamp(0.0, 1.0);
+        }
+        let _ = self.cmd_tx.send(AudioCmd::Volume);
+    }
+
+    pub fn start_stream(&self) {
+        let _ = self.cmd_tx.send(AudioCmd::StartStream);
+    }
+
+    /// Re-sync the audio master clock to `pos` seconds: drop older ring
+    /// samples and advance the counter so the clock reads `pos` at the
+    /// current sample position (used after a wall-clock fallback).
+    pub fn trim_to(&self, pos: f64) {
+        let _ = self.cmd_tx.send(AudioCmd::Trim(pos));
+    }
+
+    pub fn stop(&self) {
+        let _ = self.cmd_tx.send(AudioCmd::Stop);
+    }
+
+    /// Samples waiting in the ring (pipeline pre-roll / diagnostics).
+    pub fn buffered_samples(&self) -> usize {
+        self.ring.lock().map(|b| b.len()).unwrap_or(0)
+    }
+
+    pub fn underruns(&self) -> u64 {
+        self.underruns.load(Ordering::Relaxed)
+    }
+}
+
+/// Payload of a successful audio actor start.
+pub struct AudioReady {
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub samples_played: Arc<AtomicU64>,
+    pub shared: Arc<Shared>,
+    pub underruns: Arc<AtomicU64>,
+}
+
+/// Spawn the audio actor thread: it builds the cpal pipeline (stream
+/// included) on its own thread and then services control commands.  Reports
+/// readiness on `ready_tx`:
+/// * `Ok(AudioReady)` — the stream is attached and the ring is pre-filling;
+///   wrap it with `AudioHandle::new` and use the handle for all control.
+/// * `Err(e)` / no message — no usable output device: the actor keeps
+///   draining audio packets until the demux stops routing, so the video
+///   stream never stalls.
+pub fn spawn_audio_actor(
+    path: String,
+    dev: cpal::Device,
+    pkt_rx: mpsc::Receiver<Packet>,
+    start_pos: f64,
+) -> (
+    mpsc::Sender<AudioCmd>,
+    mpsc::Receiver<Result<AudioReady, String>>,
+    thread::JoinHandle<()>,
+) {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCmd>();
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<AudioReady, String>>();
+
+    let handle = thread::spawn(move || {
+        let pipeline = match AudioPipeline::start(&path, &dev, pkt_rx, start_pos) {
+            Ok(p) => p,
+            Err((e, rx)) => {
+                let _ = ready_tx.send(Err(e));
+                // Drain packets until the demux stops routing (or EOF):
+                // if the audio channel disconnects, the demux breaks its
+                // routing loop and starves the video stream too.
+                while rx.recv().is_ok() {
+                    // discard
+                }
+                return;
+            }
+        };
+
+        let ready = AudioReady {
+            sample_rate: pipeline.sample_rate,
+            channels: pipeline.channels,
+            samples_played: pipeline.samples_played.clone(),
+            shared: pipeline.shared.clone(),
+            underruns: pipeline.shared.underruns.clone(),
+        };
+        let _ = ready_tx.send(Ok(ready));
+
+        loop {
+            match cmd_rx.recv() {
+                Ok(AudioCmd::Pause(b)) => pipeline.set_paused(b),
+                Ok(AudioCmd::Speed(s)) => pipeline.set_speed(s),
+                Ok(AudioCmd::Volume) => {} // value applied via shared state
+                Ok(AudioCmd::StartStream) => pipeline.start_stream(),
+                Ok(AudioCmd::Trim(pos)) => pipeline.trim_to(pos),
+                Ok(AudioCmd::Stop) => {
+                    pipeline.stop();
+                    break;
+                }
+                Err(_) => {
+                    // Controller gone: tear down.
+                    pipeline.stop();
+                    break;
+                }
+            }
+        }
+        // `pipeline` drops here: stream stopped, decoder thread signalled.
+    });
+
+    (cmd_tx, ready_rx, handle)
+}
+
+impl AudioHandle {
+    /// Wrap the pieces returned by a successful `spawn_audio_actor`.
+    pub fn new(
+        cmd_tx: mpsc::Sender<AudioCmd>,
+        ready: AudioReady,
+    ) -> Self {
+        let ring = ready.shared.buffer.clone();
+        Self {
+            samples_played: ready.samples_played,
+            sample_rate: ready.sample_rate,
+            channels: ready.channels,
+            cmd_tx,
+            shared: ready.shared,
+            underruns: ready.underruns,
+            ring,
+        }
+    }
+}
+
 // ── Commands ─────────────────────────────────────────────────────────
 
 pub enum AudioCmd {
@@ -29,12 +183,19 @@ pub enum AudioCmd {
     // happened so it can wake from its command-drain loop.
     Volume,
     Stop,
+    /// Begin audible playback (the stream is built paused so audio starts
+    /// at the same instant as the media clock).
+    StartStream,
+    /// Drop ring samples older than `pos` seconds and advance the master
+    /// counter to match — used to re-sync the audio master clock with the
+    /// video position after a wall-clock fallback.
+    Trim(f64),
 }
 
 // ── Shared state (cpal callback + decoder thread) ────────────────────
 
-struct Shared {
-    buffer: Mutex<VecDeque<f32>>,
+pub struct Shared {
+    buffer: Arc<Mutex<VecDeque<f32>>>,
     volume: Mutex<f32>,
     paused: AtomicBool,
     stopped: AtomicBool,
@@ -42,7 +203,7 @@ struct Shared {
     /// Count of callback periods that had to zero-fill (ring underflow).
     /// Reported periodically so a "stutters every few seconds" issue can be
     /// attributed to audio starvation vs video/render starvation.
-    underruns: AtomicU64,
+    underruns: Arc<AtomicU64>,
 }
 
 // ── Public pipeline ──────────────────────────────────────────────────
@@ -53,7 +214,9 @@ pub struct AudioPipeline {
     pub channels: u16,
     pub cmd_tx: mpsc::Sender<AudioCmd>,
     shared: Arc<Shared>,
-    _stream: cpal::Stream,
+    /// The cpal output stream.  Starts PAUSED so audio playback begins
+    /// exactly when the controller starts the media clock (`start_stream`).
+    stream: cpal::Stream,
     _decoder_thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -83,12 +246,12 @@ impl AudioPipeline {
         // samples_played is seeded after we determine sample_rate/channels.
         let samples_played = Arc::new(AtomicU64::new(0));
         let shared = Arc::new(Shared {
-            buffer: Mutex::new(VecDeque::new()),
+            buffer: Arc::new(Mutex::new(VecDeque::new())),
             volume: Mutex::new(0.8),
             paused: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             samples_played: samples_played.clone(),
-            underruns: AtomicU64::new(0),
+            underruns: Arc::new(AtomicU64::new(0)),
         });
 
         // ── cpal output stream ────────────────────────────────────
@@ -181,10 +344,14 @@ impl AudioPipeline {
             (start_pos * sample_rate as f64 * channels as f64) as u64;
         samples_played.store(initial_offset, Ordering::Relaxed);
 
-        stream.play().map_err(|e| {
-            let msg = format!("cpal play: {e}");
-            (msg, pkt_rx.take().unwrap())
-        })?;
+        // Build paused: the ring fills with post-seek samples while the
+        // controller finishes installing; `start_stream` begins audible
+        // playback at the same instant the media clock starts, so video and
+        // audio begin together instead of the audio running ahead during
+        // the (slow) open/seek window.
+        if let Err(e) = stream.pause() {
+            tracing::warn!("cpal pause after build: {e}");
+        }
 
         // ── Command channel ───────────────────────────────────────
         let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCmd>();
@@ -266,7 +433,7 @@ impl AudioPipeline {
             channels,
             cmd_tx,
             shared,
-            _stream: stream,
+            stream,
             _decoder_thread: Some(decoder_thread),
         })
     }
@@ -284,23 +451,40 @@ impl AudioPipeline {
         let _ = self.cmd_tx.send(AudioCmd::Speed(s));
     }
 
-    /// Set output volume.  Applied in the cpal callback via shared state.
-    pub fn set_volume(&self, v: f32) {
-        let clamped = v.clamp(0.0, 1.0);
-        *self.shared.volume.lock().unwrap() = clamped;
-        let _ = self.cmd_tx.send(AudioCmd::Volume);
-    }
-
     /// Stop playback: signal the decode thread and cpal callback.
     pub fn stop(&self) {
         self.shared.stopped.store(true, Ordering::Relaxed);
         let _ = self.cmd_tx.send(AudioCmd::Stop);
     }
 
-    /// Total ring-buffer underflow periods since start.
-    pub fn underruns(&self) -> u64 {
-        self.shared.underruns.load(Ordering::Relaxed)
+    /// Start the output stream.  The stream is built paused so the audio
+    /// decoder can pre-fill the ring; calling this makes the first real
+    /// samples audible, synchronized with the media clock start.
+    pub fn start_stream(&self) {
+        if let Err(e) = self.stream.play() {
+            tracing::error!("cpal play: {e}");
+        }
     }
+
+    /// Drop ring samples older than `pos_secs` and advance the master
+    /// counter to match, so the audio clock reads `pos_secs` from the next
+    /// popped sample.  Never rewinds: if the audio is already ahead of
+    /// `pos_secs`, this is a no-op.
+    pub fn trim_to(&self, pos_secs: f64) {
+        let rate_ch = self.sample_rate as u64 * self.channels as u64;
+        let target = (pos_secs.max(0.0) * rate_ch as f64) as u64;
+        let cur = self.samples_played.load(Ordering::Relaxed);
+        if target <= cur {
+            return;
+        }
+        let drop = (target - cur) as usize;
+        if let Ok(mut buf) = self.shared.buffer.lock() {
+            let n = drop.min(buf.len());
+            buf.drain(..n);
+        }
+        self.samples_played.store(target, Ordering::Relaxed);
+    }
+
 }
 
 // ── Decode thread (unit-testable without a device) ───────────────────
@@ -452,6 +636,8 @@ fn decode_audio_packets(
                             }
                             Ok(AudioCmd::Pause(true)) => {} // already paused — no-op
                             Ok(AudioCmd::Volume) => {} // applied in cpal callback
+                            Ok(AudioCmd::StartStream) => {} // handled by the actor
+                            Ok(AudioCmd::Trim(_)) => {} // handled by the actor
                             Err(mpsc::RecvError) => return Ok(()),
                         }
                     }
@@ -475,6 +661,8 @@ fn decode_audio_packets(
                     }
                 }
                 Ok(AudioCmd::Volume) => {} // applied in cpal callback
+                Ok(AudioCmd::StartStream) => {} // handled by the actor
+                Ok(AudioCmd::Trim(_)) => {} // handled by the actor
                 Ok(AudioCmd::Pause(false)) => {} // already playing — no-op
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
@@ -517,7 +705,7 @@ fn decode_audio_packets(
             // pre-target audio, leaving A/V desynced by the keyframe
             // distance after every seek.
             if start_pos > 0.01
-                && let Some(pts) = decoded.timestamp().or(decoded.pts()) {
+                && let Some(pts) = decoded.pts().or_else(|| decoded.timestamp()) {
                     let pts_secs = pts as f64
                         * audio_time_base.numerator() as f64
                         / audio_time_base.denominator() as f64;

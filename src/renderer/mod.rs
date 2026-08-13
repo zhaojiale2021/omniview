@@ -46,6 +46,8 @@ pub struct Renderer {
     uv_stride: u32,
     /// When the last frame was presented — vsync-phase estimate.
     last_present: Option<std::time::Instant>,
+    /// PTS of the last uploaded video frame (capture sidecar diagnostics).
+    last_upload_pts: Option<f64>,
     /// Estimated vsync period in seconds (EWMA of present intervals).
     vsync_period: f64,
     pub egui_state: egui_winit::State,
@@ -397,6 +399,7 @@ impl Renderer {
             placeholder_bind_group, camera,
             y_stride: 0, uv_stride: 0,
             last_present: None,
+            last_upload_pts: None,
             vsync_period: 1.0 / 60.0,
             egui_state, egui_renderer,
             capture_path,
@@ -570,6 +573,7 @@ impl Renderer {
         );
         self.y_stride = frame.y_stride;
         self.uv_stride = frame.uv_stride;
+        self.last_upload_pts = Some(frame.pts_secs);
     }
 
     /// Render the video frame + egui overlay.
@@ -591,6 +595,36 @@ impl Renderer {
         let mut encoder = self.device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Encoder") });
 
+        // Diagnostic: dump the CPU-side NV12 of the frame being uploaded so
+        // decode-side and render-side mismatches can be told apart
+        // (CAPTURE_PNG env).  Written before upload; YUV->RGB here is the
+        // reference conversion, independent of the GPU shader.  Downscaled
+        // 4x so the PNG encode doesn't distort the render timing.
+        let mut src_dump: Option<(Vec<u8>, u32, u32)> = None;
+        if let Some(frame) = &frame {
+            if self.capture_path.is_some() {
+                let (w, h) = (frame.width as usize, frame.height as usize);
+                let (dw, dh) = (w / 4, h / 4);
+                let y_stride = frame.y_stride as usize;
+                let uv_stride = frame.uv_stride as usize;
+                let mut rgba = Vec::with_capacity(dw * dh * 4);
+                for row in 0..dh {
+                    for col in 0..dw {
+                        let yv = frame.y[row * 4 * y_stride + col * 4] as f32 / 255.0;
+                        let u = frame.uv[(row * 2) * uv_stride + (col * 2) * 2] as f32 / 255.0;
+                        let v = frame.uv[(row * 2) * uv_stride + (col * 2) * 2 + 1] as f32 / 255.0;
+                        let y2 = (yv - 16.0 / 255.0) * (255.0 / 219.0);
+                        let u2 = (u - 128.0 / 255.0) * (255.0 / 224.0);
+                        let v2 = (v - 128.0 / 255.0) * (255.0 / 224.0);
+                        let r = (y2 + 1.5748 * v2).clamp(0.0, 1.0) * 255.0;
+                        let g = (y2 - 0.1873 * u2 - 0.4681 * v2).clamp(0.0, 1.0) * 255.0;
+                        let b = (y2 + 1.8556 * u2).clamp(0.0, 1.0) * 255.0;
+                        rgba.extend_from_slice(&[r as u8, g as u8, b as u8, 255]);
+                    }
+                }
+                src_dump = Some((rgba, dw as u32, dh as u32));
+            }
+        }
         if let Some(frame) = frame {
             self.upload_video_frame(&frame);
         }
@@ -673,8 +707,10 @@ impl Renderer {
             && self.capture_staging.is_some()
             && {
                 self.capture_counter += 1;
-                // 诊断(临时):启动期每帧捕获,之后每 20 帧
-                self.capture_counter <= 120
+                // Capture every frame when CAPTURE_ALL=1 (corruption
+                // hunting); otherwise startup frames + every 20th.
+                std::env::var_os("CAPTURE_ALL").is_some()
+                    || self.capture_counter <= 120
                     || self.capture_counter.is_multiple_of(20)
             };
         if capture_now
@@ -732,6 +768,34 @@ impl Renderer {
                     }
                     let p = format!("{path}_{}", self.capture_counter);
                     let _ = std::fs::write(&p, ppm);
+                    if let Some((rgba, dw, dh)) = &src_dump {
+                        let _ = image::save_buffer(
+                            &format!("{p}.src.png"),
+                            rgba,
+                            *dw,
+                            *dh,
+                            image::ColorType::Rgba8,
+                        );
+                    }
+                    // Sidecar: render counter, uploaded frame PTS, wall clock.
+                    let sidecar = format!("{path}.csv");
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&sidecar)
+                    {
+                        use std::io::Write;
+                        let _ = writeln!(
+                            f,
+                            "{},{:.6},{}",
+                            self.capture_counter,
+                            self.last_upload_pts.unwrap_or(-1.0),
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis())
+                                .unwrap_or(0)
+                        );
+                    }
                     tracing::info!("Captured UI frame to {p}");
                 }
                 staging.unmap();

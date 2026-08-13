@@ -336,9 +336,12 @@ fn decode_packets_loop(
                 continue;
             }
 
+            // Container pts first: best_effort_timestamp can drift
+            // after a seek+stall on VFR streams (observed ~0.57s label
+            // offset), while the packet pts is the ground truth.
             let pts_secs = decoded
-                .timestamp()
-                .or(decoded.pts())
+                .pts()
+                .or_else(|| decoded.timestamp())
                 .map(|p| p as f64 * time_base.numerator() as f64 / time_base.denominator() as f64)
                 .unwrap_or(0.0);
 

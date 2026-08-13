@@ -370,7 +370,10 @@ impl ApplicationHandler for App {
             && self.ctl.buffered_frames() == 0
             && !matches!(
                 self.ctl.state(),
-                PlaybackState::Ended | PlaybackState::Error(_)
+                PlaybackState::Ended
+                    | PlaybackState::Error(_)
+                    | PlaybackState::Loading
+                    | PlaybackState::Seeking
             )
             && !self.ctl.startup_grace()
             && self.last_diag_log.elapsed() > Duration::from_secs(10)
@@ -404,10 +407,13 @@ impl ApplicationHandler for App {
             // the frame queue is still empty.  During steady playback the
             // queue legitimately drains to 0 between pops, so showing the
             // hint then would just flicker.
-            ui.buffering = self.ctl.startup_grace()
+            ui.buffering = matches!(
+                self.ctl.state(),
+                PlaybackState::Loading | PlaybackState::Seeking
+            ) || (self.ctl.startup_grace()
                 && !self.ctl.paused()
                 && !ended
-                && self.ctl.buffered_frames() == 0;
+                && self.ctl.buffered_frames() == 0);
         }
 
         let paused = self.ctl.paused() || ended;

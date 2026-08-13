@@ -1,24 +1,211 @@
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
+use std::sync::mpsc::TryRecvError;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use cpal::traits::HostTrait;
 
-use crate::media::audio::AudioPipeline;
+use crate::media::audio::{spawn_audio_actor, AudioHandle};
 use crate::media::clock::MediaClock;
 use crate::media::demux::Demux;
 use crate::media::types::{Command, PlaybackState, VideoFrame};
 use crate::media::video::{DecoderCmd, VideoDecoder};
 
+/// A fully-built playback pipeline (demux + audio + video decoders).
+///
+/// Built on a worker thread (open/seek are slow: file probing, cpal device
+/// setup, decoder warm-up) and handed to the controller, which owns it.
+/// `Drop` tears every part down, so a pipeline that is discarded because a
+/// newer seek superseded it leaves no stray threads behind.
+struct Pipeline {
+    demux: Option<Demux>,
+    video: Option<VideoDecoder>,
+    video_cmd: Option<mpsc::Sender<DecoderCmd>>,
+    audio: Option<AudioHandle>,
+    /// The audio actor thread (owns the cpal stream).  Joined on teardown.
+    audio_actor: Option<thread::JoinHandle<()>>,
+    /// Drains audio packets when there is no audio device at all
+    /// (WSL2 / no output device) so the demux doesn't block.
+    audio_discard: Option<thread::JoinHandle<()>>,
+}
+
+impl Pipeline {
+    fn teardown(&mut self) {
+        // Stop video decoder.
+        if let Some(cmd) = self.video_cmd.take() {
+            let _ = cmd.send(DecoderCmd::Stop);
+        }
+        // Wake the decoder if it is blocked pushing into a full queue, so it
+        // can process the Stop command instead of leaking.
+        if let Some(video) = self.video.take() {
+            video.interrupt();
+        }
+
+        // Stop audio pipeline.
+        if let Some(audio) = self.audio.take() {
+            audio.stop();
+        }
+
+        // Stop demux.
+        if let Some(demux) = self.demux.take() {
+            demux.stop();
+        }
+
+        // Join the audio actor: the success path exits on Stop, the drain
+        // path exits once the (now stopped) demux stops routing.
+        if let Some(actor) = self.audio_actor.take() {
+            let _ = actor.join();
+        }
+
+        // Join the packet-discard thread (WSL2 path).
+        if let Some(handle) = self.audio_discard.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for Pipeline {
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
+/// Seconds of decoded audio the worker pre-rolls before declaring the
+/// pipeline ready.  The cpal stream starts paused, so the ring fills with
+/// the first samples after the seek target; starting playback then plays
+/// audio and video together from the same instant (no startup freeze, no
+/// A/V offset).  0.5s gives the ring headroom against the first demux I/O
+/// hiccup right after open/seek.
+const AUDIO_PREROLL_SECS: f64 = 0.5;
+/// Hard cap on the pre-roll wait: a slow disk or a slow decoder must not
+/// stall the open/seek forever.
+const PREROLL_TIMEOUT: Duration = Duration::from_millis(2000);
+
+/// Build the whole pipeline for `path` at `pos` seconds.  Runs on a worker
+/// thread and blocks until the demux probe completes and the decoders have
+/// pre-rolled data, so playback can start instantly when the controller
+/// installs the result.  Returns the pipeline and the media duration.
+fn build_pipeline(path: &str, pos: f64) -> Result<(Pipeline, f64), String> {
+    // ── Demux ────────────────────────────────────────────────
+    let mut demux = Demux::open(path, pos);
+
+    let info = {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match demux.poll_ready() {
+                Some(Ok(info)) => break info,
+                Some(Err(e)) => {
+                    return Err(format!("Demux probe: {e}"));
+                }
+                None => {
+                    if Instant::now() > deadline {
+                        return Err("Demux probe timeout".to_string());
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    };
+
+    let (video_rx, audio_rx) = match demux.take_channels() {
+        Some(ch) => ch,
+        None => return Err("Channels already taken".to_string()),
+    };
+
+    // ── Audio ────────────────────────────────────────────────
+    // The cpal output stream is !Send, so a dedicated actor thread builds
+    // and owns it; the controller talks to it through a Send handle.
+    let host = cpal::default_host();
+    let audio_device = host.default_output_device();
+
+    let (audio, audio_actor, audio_discard) = if let Some(dev) = audio_device {
+        let (cmd_tx, ready_rx, actor) =
+            spawn_audio_actor(path.to_string(), dev, audio_rx, pos);
+        match ready_rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(Ok(ready)) => {
+                let handle = AudioHandle::new(cmd_tx, ready);
+                (Some(handle), Some(actor), None)
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Audio pipeline failed: {e}; proceeding video-only");
+                // The actor drains packets internally until the demux stops.
+                (None, Some(actor), None)
+            }
+            Err(_) => {
+                tracing::warn!("Audio actor startup timed out; proceeding video-only");
+                (None, Some(actor), None)
+            }
+        }
+    } else {
+        // WSL2 / no audio device: drain audio packets so the demux
+        // doesn't block.
+        let handle = thread::spawn(move || {
+            while audio_rx.recv().is_ok() {
+                // discard
+            }
+        });
+        (None, None, Some(handle))
+    };
+
+    // ── Video ────────────────────────────────────────────────
+    // Only spawn the video decoder when the file actually has a video
+    // stream.  `decode_packets_loop` early-returns on "No video stream"
+    // (dropping its packet receiver); the demux's next video send would
+    // then hit Disconnected, break 'outer, and silently starve the audio
+    // decoder while the controller stays Playing.  With has_video ==
+    // false we keep video None — the demux never routes video packets (no
+    // video stream index), so no Disconnected is ever observed.
+    let (video, video_cmd) = if info.has_video {
+        let (v, c) = VideoDecoder::from_packets(path, video_rx, pos);
+        (Some(v), Some(c))
+    } else {
+        // Drop the (never-fed) video receiver immediately.
+        (None, None)
+    };
+
+    // ── Pre-roll ─────────────────────────────────────────────
+    // Wait until the audio ring holds real post-target samples and the
+    // video queue has at least one frame, so the transition to Playing is
+    // instant and both streams start from the same position.  The audio
+    // stream is paused, so nothing is audible until the controller starts
+    // playback.
+    let deadline = Instant::now() + PREROLL_TIMEOUT;
+    loop {
+        let audio_ready = match &audio {
+            Some(a) => {
+                let need = (a.sample_rate as f64 * a.channels as f64 * AUDIO_PREROLL_SECS) as usize;
+                a.buffered_samples() >= need
+            }
+            None => true, // video-only: nothing to pre-roll
+        };
+        let video_ready = match &video {
+            Some(v) => v.buffered() >= 1,
+            None => true, // audio-only: nothing to pre-roll
+        };
+        if (audio_ready && video_ready) || Instant::now() > deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    Ok((
+        Pipeline {
+            demux: Some(demux),
+            video,
+            video_cmd,
+            audio,
+            audio_actor,
+            audio_discard,
+        },
+        info.duration,
+    ))
+}
 
 pub struct PlaybackController {
     state: PlaybackState,
     volume: f32,
-    demux: Option<Demux>,
-    video: Option<VideoDecoder>,
-    video_cmd: Option<mpsc::Sender<DecoderCmd>>,
-    audio: Option<AudioPipeline>,
-    audio_discard: Option<thread::JoinHandle<()>>,
+    pipeline: Option<Pipeline>,
     clock: MediaClock,
     has_audio: bool,
     speed: f64,
@@ -32,13 +219,27 @@ pub struct PlaybackController {
     /// When the frame queue last delivered a frame; drives the EOF grace
     /// period so buffered frames are shown before `Ended` fires.
     last_frame_at: Option<Instant>,
-    /// Audio-clock stall guard state: last observed clock position.
-    last_clock_pos: f64,
-    /// Audio-clock stall guard state: when that position was observed.
+    /// Audio-clock stall guard state: last observed sample counter.
+    last_audio_counter: u64,
+    /// Audio-clock stall guard state: when the counter last advanced.
     last_clock_at: Option<Instant>,
+    /// True while the wall-clock fallback is active (audio ring dry).
+    audio_fallback: bool,
     /// Suppresses transient starvation diagnostics right after open/seek
     /// while fresh decoders produce their first frames.
     startup_grace_until: Option<Instant>,
+
+    // ── Async pipeline build (open/seek run on a worker thread so the
+    //    render thread never blocks on file I/O or device probing) ──
+    /// Handoff channel from the in-flight build worker.
+    pending: Option<mpsc::Receiver<(u64, Result<(Pipeline, f64), String>)>>,
+    /// Bumped on every teardown/stop: results from superseded workers are
+    /// discarded (their `Pipeline` Drop tears the discarded pipeline down).
+    generation: u64,
+    /// Resume playing once the in-flight open/seek pipeline installs.
+    pending_play: bool,
+    /// Position the pending pipeline is built for (0.0 on open, target on seek).
+    pending_pos: f64,
 }
 
 impl PlaybackController {
@@ -46,11 +247,7 @@ impl PlaybackController {
         Self {
             state: PlaybackState::Idle,
             volume: 0.8,
-            demux: None,
-            video: None,
-            video_cmd: None,
-            audio: None,
-            audio_discard: None,
+            pipeline: None,
             clock: MediaClock::new(),
             has_audio: false,
             speed: 1.0,
@@ -59,9 +256,14 @@ impl PlaybackController {
             last_pts: -1.0,
             eof_seen: false,
             last_frame_at: None,
-            last_clock_pos: 0.0,
+            last_audio_counter: 0,
             last_clock_at: None,
+            audio_fallback: false,
             startup_grace_until: None,
+            pending: None,
+            generation: 0,
+            pending_play: false,
+            pending_pos: 0.0,
         }
     }
 
@@ -95,25 +297,42 @@ impl PlaybackController {
 
     /// Ring-buffer underflow count of the audio pipeline (diagnostics).
     pub fn audio_underruns(&self) -> u64 {
-        self.audio.as_ref().map(|a| a.underruns()).unwrap_or(0)
+        self.pipeline
+            .as_ref()
+            .and_then(|p| p.audio.as_ref())
+            .map(|a| a.underruns())
+            .unwrap_or(0)
     }
 
-    /// True for a few seconds right after open/seek, while the fresh
-    /// decoders are still producing their first frames.  Used to suppress
-    /// transient starvation diagnostics and to show a buffering hint.
+    /// True for a few seconds right after a pipeline install, while the
+    /// fresh decoders are still producing their first frames.  Used to
+    /// suppress transient starvation diagnostics and to show a buffering
+    /// hint.
     pub fn startup_grace(&self) -> bool {
         self.startup_grace_until
-            .map(|t| t > std::time::Instant::now())
+            .map(|t| t > Instant::now())
             .unwrap_or(false)
+    }
+
+    /// Whether an audio pipeline is attached (used by diagnostics /
+    /// examples; the app infers this from behaviour).
+    #[allow(dead_code)]
+    pub fn has_audio(&self) -> bool {
+        self.has_audio
     }
 
     /// Decoded video frames waiting ahead of the clock (diagnostics).
     pub fn buffered_frames(&self) -> usize {
-        self.video.as_ref().map(|v| v.buffered()).unwrap_or(0)
+        self.pipeline
+            .as_ref()
+            .and_then(|p| p.video.as_ref())
+            .map(|v| v.buffered())
+            .unwrap_or(0)
     }
 
     /// Apply a command: validate, drive the pipeline, and update state.
     pub fn apply(&mut self, cmd: Command) -> Result<(), String> {
+        self.poll_pending();
         match cmd {
             Command::Open(path) => self.do_open(&path),
             Command::Play => self.do_play(),
@@ -126,52 +345,174 @@ impl PlaybackController {
         }
     }
 
+    /// Collect a finished open/seek worker and install its pipeline.  Called
+    /// from `apply` and `next_video_frame`; cheap when nothing is pending.
+    pub fn poll_pending(&mut self) {
+        let msg = match self.pending.as_ref() {
+            Some(rx) => match rx.try_recv() {
+                Ok(m) => m,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.pending = None;
+                    if matches!(self.state, PlaybackState::Loading | PlaybackState::Seeking) {
+                        self.state =
+                            PlaybackState::Error("pipeline worker died".to_string());
+                    }
+                    return;
+                }
+            },
+            None => return,
+        };
+        self.pending = None;
+        let (worker_gen, result) = msg;
+        if worker_gen != self.generation {
+            // Superseded by a newer open/seek: dropping the result drops the
+            // pipeline, whose Drop tears all its parts down.
+            return;
+        }
+        match result {
+            Ok((pipeline, duration)) => self.install(pipeline, duration),
+            Err(e) => {
+                tracing::error!("Pipeline build failed: {e}");
+                self.state = PlaybackState::Error(format!("Pipeline: {e}"));
+            }
+        }
+    }
+
+    /// Swap a freshly built pipeline in, re-anchor the clock to the target
+    /// position, and restore the play/pause state requested at issue time.
+    fn install(&mut self, pipeline: Pipeline, duration: f64) {
+        let pos = self.pending_pos;
+        let want_play = self.pending_play;
+        let was_loading = self.state == PlaybackState::Loading;
+
+        self.duration = duration;
+
+        // Attach the audio master clock before `reset` so position() derives
+        // from the audio counter from the start (reset re-anchors the
+        // baseline to `pos`).
+        if let Some(a) = &pipeline.audio {
+            self.clock
+                .attach_audio(a.samples_played.clone(), a.sample_rate, a.channels);
+            self.has_audio = true;
+        } else {
+            self.has_audio = false;
+        }
+
+        self.clock.reset(pos);
+        self.last_pts = -1.0;
+        self.eof_seen = false;
+        self.last_frame_at = None;
+        self.last_audio_counter = self
+            .pipeline
+            .as_ref()
+            .and_then(|p| p.audio.as_ref())
+            .map(|a| a.samples_played.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        self.last_clock_at = Some(Instant::now());
+        self.audio_fallback = false;
+        self.startup_grace_until = Some(Instant::now() + Duration::from_secs(3));
+
+        // Re-apply stored speed/volume to the fresh pipeline.
+        self.clock.set_speed(self.speed);
+        if let Some(a) = &pipeline.audio {
+            a.set_speed(self.speed);
+            a.set_volume(self.volume);
+        }
+
+        self.pipeline = Some(pipeline);
+
+        if want_play {
+            self.clock.play(pos);
+            if let Some(a) = self.pipeline.as_ref().and_then(|p| p.audio.as_ref()) {
+                a.start_stream();
+            }
+            if let Some(cmd) = self.pipeline.as_ref().and_then(|p| p.video_cmd.as_ref()) {
+                let _ = cmd.send(DecoderCmd::Resume);
+            }
+            self.state = PlaybackState::Playing;
+        } else {
+            self.clock.pause();
+            // Keep the fresh decoders idle (the audio stream stays paused;
+            // the video decoder is told not to pull packets).
+            if let Some(a) = self.pipeline.as_ref().and_then(|p| p.audio.as_ref()) {
+                a.set_paused(true);
+            }
+            if let Some(cmd) = self.pipeline.as_ref().and_then(|p| p.video_cmd.as_ref()) {
+                let _ = cmd.send(DecoderCmd::Pause);
+            }
+            self.state = if was_loading {
+                PlaybackState::Ready
+            } else {
+                PlaybackState::Paused
+            };
+        }
+    }
+
     /// Select the frame to display this cycle.
     ///
     /// The decoder keeps a bounded jitter buffer of decoded frames; the
     /// queue pops every frame the media clock has reached and returns the
     /// newest of those (older ones are skipped when the clock is ahead, e.g.
     /// after a speed change).  Frames ahead of the clock stay buffered.
-    /// Select the frame to display this cycle.
     ///
     /// `lookahead` is the media time until the texture swap takes effect
     /// (about one vsync on a 60 Hz display, scaled by playback speed).  The
     /// app measures the vsync phase so the swap lands on a stable cadence
     /// instead of alternating 2/3 vsyncs as the audio clock jitters.
     pub fn next_video_frame(&mut self, lookahead: f64) -> Option<VideoFrame> {
-        // Audio-clock stall guard: if the audio master clock has not
-        // advanced for a full second while playing, the audio pipeline is
-        // dead (silent ring buffer).  Fall back to the wall clock so the
-        // video keeps playing instead of freezing forever.
+        self.poll_pending();
+
+        // Audio-clock stall guard: if the audio sample counter has not
+        // advanced for 150ms while playing, the audio ring is dry.  Fall
+        // back to the wall clock so the video keeps advancing — a frozen
+        // video queue blocks the decoder, which blocks the demux, which
+        // starves the audio: the fallback breaks that backpressure loop
+        // instead of freezing for a full second.  When the counter moves
+        // again, trim the ring to the video position and re-attach the
+        // audio master clock (continuous position, re-synced audio).
         if self.has_audio && self.state == PlaybackState::Playing {
-            let pos = self.clock.position();
-            if (pos - self.last_clock_pos).abs() < 0.001 {
+            let counter = self
+                .pipeline
+                .as_ref()
+                .and_then(|p| p.audio.as_ref())
+                .map(|a| a.samples_played.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            if counter == self.last_audio_counter {
                 let stalled = self
                     .last_clock_at
-                    .map(|t| t.elapsed() >= Duration::from_secs(1))
+                    .map(|t| t.elapsed() >= Duration::from_millis(150))
                     .unwrap_or(false);
-                if stalled {
-                    let stalled_for = self
-                        .last_clock_at
-                        .map(|t| t.elapsed().as_secs())
-                        .unwrap_or(0);
-                    tracing::warn!(
-                        "audio clock stalled for {stalled_for}s; switching video to wall clock"
-                    );
+                if stalled && !self.audio_fallback {
+                    self.audio_fallback = true;
+                    let wall = self.clock.position();
                     self.clock.detach_audio();
-                    self.has_audio = false;
-                    self.clock.play(pos);
-                    self.last_clock_pos = pos;
-                    self.last_clock_at = None;
+                    self.clock.play(wall);
+                    tracing::warn!(
+                        "audio clock stalled (counter {counter}); falling back to wall clock at {wall:.2}s"
+                    );
                 }
             } else {
-                self.last_clock_pos = pos;
+                self.last_audio_counter = counter;
                 self.last_clock_at = Some(Instant::now());
+                if self.audio_fallback {
+                    self.audio_fallback = false;
+                    let pos = self.clock.position();
+                    if let Some(a) = self.pipeline.as_ref().and_then(|p| p.audio.as_ref()) {
+                        a.trim_to(pos);
+                        self.clock.attach_audio(
+                            a.samples_played.clone(),
+                            a.sample_rate,
+                            a.channels,
+                        );
+                    }
+                    tracing::info!("audio resumed; re-attached master clock at {pos:.2}s");
+                }
             }
         }
         let clock_pos = self.clock.position() + lookahead;
-        let (chosen, remaining) = match self.video {
-            Some(ref video) => video.drain_upto(clock_pos),
+        let (chosen, remaining) = match self.pipeline.as_ref().and_then(|p| p.video.as_ref()) {
+            Some(video) => video.drain_upto(clock_pos),
             None => (None, 0),
         };
         if chosen.is_some() || remaining > 0 {
@@ -213,10 +554,12 @@ impl PlaybackController {
         if self.state != PlaybackState::Playing {
             return;
         }
-        if let Some(ref demux) = self.demux
-            && demux.poll_eof() {
-                self.eof_seen = true;
-            }
+        if let Some(pipeline) = &self.pipeline
+            && let Some(demux) = &pipeline.demux
+                && demux.poll_eof()
+        {
+            self.eof_seen = true;
+        }
         if !self.eof_seen {
             return;
         }
@@ -233,26 +576,30 @@ impl PlaybackController {
     // ── Command handlers ──────────────────────────────────────────
 
     fn do_open(&mut self, path: &str) -> Result<(), String> {
-        self.startup_grace_until = Some(std::time::Instant::now() + Duration::from_secs(3));
         self.teardown();
 
         self.file_path = Some(path.to_string());
+        self.pending_pos = 0.0;
+        self.pending_play = false;
+        // Freeze the clock at 0 while the worker probes/decodes.
+        self.clock.pause();
+        self.clock.reset(0.0);
         self.state = PlaybackState::Loading;
 
-        self.open_pipeline(path, 0.0)?;
-        // Re-apply stored speed/volume to the fresh decoders.
-        self.do_set_speed(self.speed)?;
-        self.do_set_volume(self.volume)?;
-
-        self.state = PlaybackState::Ready;
+        self.spawn_pipeline_build(path, 0.0);
         Ok(())
     }
 
     fn do_play(&mut self) -> Result<(), String> {
         match &self.state {
+            PlaybackState::Loading | PlaybackState::Seeking => {
+                // The pipeline is still being built: remember to start
+                // playback the moment it installs.
+                self.pending_play = true;
+                return Ok(());
+            }
             PlaybackState::Ready
             | PlaybackState::Paused
-            | PlaybackState::Seeking
             | PlaybackState::Playing => {} // Playing: re-anchor clock, no-op otherwise
             PlaybackState::Ended => {
                 // Play after EOF restarts the media from the beginning.
@@ -261,11 +608,12 @@ impl PlaybackController {
                     .clone()
                     .ok_or_else(|| "No file open".to_string())?;
                 self.teardown();
-                self.open_pipeline(&path, 0.0)?;
-                self.do_set_speed(self.speed)?;
-                self.do_set_volume(self.volume)?;
-                self.clock.play(0.0);
-                self.state = PlaybackState::Playing;
+                self.pending_pos = 0.0;
+                self.pending_play = true;
+                self.clock.pause();
+                self.clock.reset(0.0);
+                self.state = PlaybackState::Loading;
+                self.spawn_pipeline_build(&path, 0.0);
                 return Ok(());
             }
             _ => return Err(format!("cannot play from {:?}", self.state)),
@@ -273,12 +621,14 @@ impl PlaybackController {
 
         self.clock.play(self.position());
 
-        if let Some(ref cmd) = self.video_cmd {
-            let _ = cmd.send(DecoderCmd::Resume);
-        }
-
-        if let Some(ref audio) = self.audio {
-            audio.set_paused(false);
+        if let Some(pipeline) = &self.pipeline {
+            if let Some(cmd) = &pipeline.video_cmd {
+                let _ = cmd.send(DecoderCmd::Resume);
+            }
+            if let Some(audio) = &pipeline.audio {
+                audio.set_paused(false);
+                audio.start_stream();
+            }
         }
 
         self.state = PlaybackState::Playing;
@@ -291,14 +641,16 @@ impl PlaybackController {
             _ => return Err(format!("cannot pause from {:?}", self.state)),
         }
 
+        self.pending_play = false;
         self.clock.pause();
 
-        if let Some(ref cmd) = self.video_cmd {
-            let _ = cmd.send(DecoderCmd::Pause);
-        }
-
-        if let Some(ref audio) = self.audio {
-            audio.set_paused(true);
+        if let Some(pipeline) = &self.pipeline {
+            if let Some(cmd) = &pipeline.video_cmd {
+                let _ = cmd.send(DecoderCmd::Pause);
+            }
+            if let Some(audio) = &pipeline.audio {
+                audio.set_paused(true);
+            }
         }
 
         self.state = PlaybackState::Paused;
@@ -311,7 +663,8 @@ impl PlaybackController {
             PlaybackState::Paused
             | PlaybackState::Ready
             | PlaybackState::Ended
-            | PlaybackState::Seeking => self.do_play(),
+            | PlaybackState::Seeking
+            | PlaybackState::Loading => self.do_play(),
             _ => Err(format!("cannot toggle from {:?}", self.state)),
         }
     }
@@ -322,15 +675,14 @@ impl PlaybackController {
             | PlaybackState::Paused
             | PlaybackState::Ready
             | PlaybackState::Ended
-            | PlaybackState::Seeking => {}
+            | PlaybackState::Seeking
+            | PlaybackState::Loading => {} // supersedes the in-flight open
             _ => return Err(format!("cannot seek from {:?}", self.state)),
         }
 
         let clamped = pos.clamp(0.0, self.duration);
         let was_playing = self.state == PlaybackState::Playing;
 
-        self.startup_grace_until = Some(std::time::Instant::now() + Duration::from_secs(3));
-        self.state = PlaybackState::Seeking;
         self.teardown();
 
         let path = match self.file_path.clone() {
@@ -341,33 +693,24 @@ impl PlaybackController {
             }
         };
 
-        self.open_pipeline(&path, clamped)?;
-        // Re-apply stored speed/volume to the fresh decoders.
-        self.do_set_speed(self.speed)?;
-        self.do_set_volume(self.volume)?;
+        self.pending_pos = clamped;
+        self.pending_play = was_playing;
+        // Freeze the clock at the target while the worker rebuilds: the
+        // transport bar shows the new position immediately.
+        self.clock.pause();
+        self.clock.reset(clamped);
+        self.state = PlaybackState::Seeking;
 
-        // Restore play/pause state after the restart.
-        if was_playing {
-            self.clock.play(self.position());
-            self.state = PlaybackState::Playing;
-        } else {
-            self.state = PlaybackState::Paused;
-            if let Some(ref cmd) = self.video_cmd {
-                let _ = cmd.send(DecoderCmd::Pause);
-            }
-            if let Some(ref audio) = self.audio {
-                audio.set_paused(true);
-            }
-            self.clock.pause();
-        }
-
+        self.spawn_pipeline_build(&path, clamped);
         Ok(())
     }
 
     fn do_set_speed(&mut self, s: f64) -> Result<(), String> {
         self.speed = s;
         self.clock.set_speed(s);
-        if let Some(ref audio) = self.audio {
+        if let Some(pipeline) = &self.pipeline
+            && let Some(audio) = &pipeline.audio
+        {
             audio.set_speed(s);
         }
         Ok(())
@@ -375,7 +718,9 @@ impl PlaybackController {
 
     fn do_set_volume(&mut self, v: f32) -> Result<(), String> {
         self.volume = v.clamp(0.0, 1.0);
-        if let Some(ref audio) = self.audio {
+        if let Some(pipeline) = &self.pipeline
+            && let Some(audio) = &pipeline.audio
+        {
             audio.set_volume(self.volume);
         }
         Ok(())
@@ -388,153 +733,41 @@ impl PlaybackController {
         self.last_pts = -1.0;
         self.eof_seen = false;
         self.last_frame_at = None;
-        self.last_clock_pos = 0.0;
+        self.last_audio_counter = 0;
         self.last_clock_at = None;
+        self.audio_fallback = false;
         self.duration = 0.0;
         self.file_path = None;
+        self.pending_play = false;
+        self.pending_pos = 0.0;
         Ok(())
     }
 
     // ── Pipeline lifecycle ───────────────────────────────────────
 
-    /// Set up demux, audio, and video for the given file at `pos` seconds.
-    /// Called by both `do_open` and `do_seek`.  The caller is responsible
-    /// for tearing down the old pipeline first and for setting the final
-    /// state after this returns.
-    fn open_pipeline(&mut self, path: &str, pos: f64) -> Result<(), String> {
-        // ── Demux ────────────────────────────────────────────────
-        let mut demux = Demux::open(path, pos);
-
-        let info = {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            loop {
-                match demux.poll_ready() {
-                    Some(Ok(info)) => break info,
-                    Some(Err(e)) => {
-                        self.state = PlaybackState::Error(format!("Demux probe: {e}"));
-                        return Err(format!("Demux probe: {e}"));
-                    }
-                    None => {
-                        if std::time::Instant::now() > deadline {
-                            self.state =
-                                PlaybackState::Error("Demux probe timeout".into());
-                            return Err("Demux probe timeout".to_string());
-                        }
-                        thread::sleep(Duration::from_millis(20));
-                    }
-                }
-            }
-        };
-
-        self.duration = info.duration;
-
-        let (video_rx, audio_rx) = match demux.take_channels() {
-            Some(ch) => ch,
-            None => {
-                self.state =
-                    PlaybackState::Error("Channels already taken".into());
-                return Err("Channels already taken".to_string());
-            }
-        };
-
-        // ── Audio ────────────────────────────────────────────────
-        let host = cpal::default_host();
-        let audio_device = host.default_output_device();
-
-        let audio = if let Some(ref dev) = audio_device {
-            match AudioPipeline::start(path, dev, audio_rx, pos) {
-                Ok(a) => {
-                    let sp = a.samples_played.clone();
-                    let rate = a.sample_rate;
-                    let ch = a.channels;
-                    self.clock.attach_audio(sp, rate, ch);
-                    self.has_audio = true;
-                    Some(a)
-                }
-                Err((e, rx)) => {
-                    tracing::warn!("Audio pipeline failed: {e}; proceeding video-only");
-                    // Drain audio packets so the demux doesn't block.
-                    self.has_audio = false;
-                    let handle = thread::spawn(move || {
-                        while rx.recv().is_ok() {
-                            // discard
-                        }
-                    });
-                    self.audio_discard = Some(handle);
-                    None
-                }
-            }
-        } else {
-            // WSL2 / no audio device: drain audio packets so the demux
-            // doesn't block.
-            self.has_audio = false;
-            let handle = thread::spawn(move || {
-                while audio_rx.recv().is_ok() {
-                    // discard
-                }
-            });
-            self.audio_discard = Some(handle);
-            None
-        };
-
-        // ── Video ────────────────────────────────────────────────
-        // Only spawn the video decoder when the file actually has a video
-        // stream.  `decode_packets_loop` early-returns on "No video stream"
-        // (dropping its packet receiver); the demux's next video send would
-        // then hit Disconnected, break 'outer, and silently starve the audio
-        // decoder while the controller stays Playing.  With has_video ==
-        // false we keep video None — the demux never routes video packets (no
-        // video stream index), so no Disconnected is ever observed.
-        let (video, video_cmd) = if info.has_video {
-            let (v, c) = VideoDecoder::from_packets(path, video_rx, pos);
-            (Some(v), Some(c))
-        } else {
-            // Drop the (never-fed) video receiver immediately.
-            (None, None)
-        };
-
-        self.demux = Some(demux);
-        self.video = video;
-        self.video_cmd = video_cmd;
-        self.audio = audio;
-        self.clock.reset(pos);
-        self.last_pts = -1.0;
-        self.eof_seen = false;
-        self.last_frame_at = None;
-        self.last_clock_pos = pos;
-        self.last_clock_at = Some(Instant::now());
-
-        Ok(())
+    /// Spawn the worker that builds the next pipeline.  The result is
+    /// collected by `poll_pending`; results from superseded generations are
+    /// discarded (and their pipelines torn down by `Drop`).
+    fn spawn_pipeline_build(&mut self, path: &str, pos: f64) {
+        let worker_gen = self.generation;
+        let (tx, rx) = mpsc::channel();
+        self.pending = Some(rx);
+        let p = path.to_string();
+        thread::spawn(move || {
+            let result = build_pipeline(&p, pos);
+            let _ = tx.send((worker_gen, result));
+        });
     }
 
     /// Tear down the entire pipeline: stop decoders, drop all handles,
-    /// join auxiliary threads, detach the audio clock.
+    /// join auxiliary threads, detach the audio clock.  Also invalidates
+    /// any in-flight worker (its result will be dropped on arrival).
     fn teardown(&mut self) {
-        // Stop video decoder.
-        if let Some(cmd) = self.video_cmd.take() {
-            let _ = cmd.send(DecoderCmd::Stop);
+        self.generation += 1;
+        self.pending = None;
+        if let Some(mut pipeline) = self.pipeline.take() {
+            pipeline.teardown();
         }
-        // Wake the decoder if it is blocked pushing into a full queue, so it
-        // can process the Stop command instead of leaking.
-        if let Some(video) = self.video.take() {
-            video.interrupt();
-        }
-
-        // Stop audio pipeline.
-        if let Some(audio) = self.audio.take() {
-            audio.stop();
-        }
-
-        // Stop demux.
-        if let Some(demux) = self.demux.take() {
-            demux.stop();
-        }
-
-        // Join the packet-discard thread (WSL2 path).
-        if let Some(handle) = self.audio_discard.take() {
-            let _ = handle.join();
-        }
-
         self.clock.detach_audio();
         self.has_audio = false;
     }
@@ -551,6 +784,16 @@ impl Drop for PlaybackController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drive `poll_pending` until the controller leaves `wait_states` (or
+    /// the deadline passes), so the async open/seek completes.
+    fn settle(ctl: &mut PlaybackController, wait_states: &[PlaybackState], timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while wait_states.contains(ctl.state()) && Instant::now() < deadline {
+            ctl.poll_pending();
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn state_transitions_are_validated() {
@@ -579,12 +822,13 @@ mod tests {
 
         let mut ctl = PlaybackController::new();
 
-        // ── Open ──────────────────────────────────────────────────
+        // ── Open (async: poll until Ready) ────────────────────────
         ctl.apply(Command::Open(test_path.into())).unwrap();
+        settle(&mut ctl, &[PlaybackState::Loading], Duration::from_secs(10));
         assert_eq!(
             ctl.state(),
             &PlaybackState::Ready,
-            "after Open the controller must be Ready"
+            "after Open completes the controller must be Ready"
         );
 
         // ── Play (and double-Play is valid) ───────────────────────
@@ -595,8 +839,8 @@ mod tests {
 
         // ── Drive next_video_frame until we get a frame ────────────
         let mut frame = None;
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while frame.is_none() && std::time::Instant::now() < deadline {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while frame.is_none() && Instant::now() < deadline {
             frame = ctl.next_video_frame(1.0 / 60.0);
             if frame.is_none() {
                 thread::sleep(Duration::from_millis(20));
@@ -619,8 +863,8 @@ mod tests {
         ctl.apply(Command::Toggle).unwrap();
         assert_eq!(ctl.state(), &PlaybackState::Playing);
         let mut frames_after_toggle = 0u32;
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while frames_after_toggle < 2 && std::time::Instant::now() < deadline {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while frames_after_toggle < 2 && Instant::now() < deadline {
             if ctl.next_video_frame(1.0 / 60.0).is_some() {
                 frames_after_toggle += 1;
             }
@@ -639,10 +883,16 @@ mod tests {
 
         // ── Seek to 1.0 → position ≈ 1.0, frames still flow ──────
         ctl.apply(Command::Seek(1.0)).unwrap();
+        settle(&mut ctl, &[PlaybackState::Seeking], Duration::from_secs(10));
+        assert_eq!(
+            ctl.state(),
+            &PlaybackState::Playing,
+            "seek while playing must return to Playing"
+        );
         // After seek with video-only (WSL2), poll until position is near 1.0.
-        let dl = std::time::Instant::now() + Duration::from_secs(5);
+        let dl = Instant::now() + Duration::from_secs(5);
         let mut near_target = false;
-        while std::time::Instant::now() < dl {
+        while Instant::now() < dl {
             let p = ctl.position();
             if (p - 1.0).abs() < 0.5 {
                 near_target = true;
@@ -660,8 +910,8 @@ mod tests {
 
         // Frames must flow after seek too.
         let mut frame_after_seek = None;
-        let dl = std::time::Instant::now() + Duration::from_secs(5);
-        while frame_after_seek.is_none() && std::time::Instant::now() < dl {
+        let dl = Instant::now() + Duration::from_secs(5);
+        while frame_after_seek.is_none() && Instant::now() < dl {
             frame_after_seek = ctl.next_video_frame(1.0 / 60.0);
             if frame_after_seek.is_none() {
                 thread::sleep(Duration::from_millis(20));
@@ -689,6 +939,7 @@ mod tests {
 
         let mut ctl = PlaybackController::new();
         ctl.apply(Command::Open(test_path.into())).unwrap();
+        settle(&mut ctl, &[PlaybackState::Loading], Duration::from_secs(10));
         assert_eq!(ctl.state(), &PlaybackState::Ready);
         ctl.apply(Command::Play).unwrap();
         assert_eq!(ctl.state(), &PlaybackState::Playing);
@@ -696,10 +947,10 @@ mod tests {
         // Poll for ~2s, recording (frame PTS, clock position) at the same
         // moment for every frame the controller hands to the (virtual)
         // renderer, plus the wall-clock capture time.
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         let mut samples: Vec<(f64, f64, f64)> = Vec::new(); // (pts, pos, t)
         let deadline = t0 + Duration::from_secs(2);
-        while std::time::Instant::now() < deadline {
+        while Instant::now() < deadline {
             if let Some(f) = ctl.next_video_frame(1.0 / 60.0) {
                 samples.push((f.pts_secs, ctl.position(), t0.elapsed().as_secs_f64()));
             }
@@ -759,13 +1010,14 @@ mod tests {
 
         let mut ctl = PlaybackController::new();
         ctl.apply(Command::Open(test_path.into())).unwrap();
+        settle(&mut ctl, &[PlaybackState::Loading], Duration::from_secs(10));
         ctl.apply(Command::Play).unwrap();
         assert_eq!(ctl.state(), &PlaybackState::Playing);
 
         // Wait for a frame so the pipeline is clearly running before seek.
         let mut saw_frame = false;
-        let dl = std::time::Instant::now() + Duration::from_secs(5);
-        while !saw_frame && std::time::Instant::now() < dl {
+        let dl = Instant::now() + Duration::from_secs(5);
+        while !saw_frame && Instant::now() < dl {
             saw_frame = ctl.next_video_frame(1.0 / 60.0).is_some();
             if !saw_frame {
                 thread::sleep(Duration::from_millis(20));
@@ -776,11 +1028,13 @@ mod tests {
         // Seek to 1.5s.  In WSL2 video-only the clock restarts from the
         // seek position, so it should be (near) 1.5 immediately.
         ctl.apply(Command::Seek(1.5)).unwrap();
+        settle(&mut ctl, &[PlaybackState::Seeking], Duration::from_secs(10));
+        assert_eq!(ctl.state(), &PlaybackState::Playing);
 
         // Poll until position is within 0.5s of the target.
-        let dl = std::time::Instant::now() + Duration::from_secs(5);
+        let dl = Instant::now() + Duration::from_secs(5);
         let mut pos_near = false;
-        while std::time::Instant::now() < dl {
+        while Instant::now() < dl {
             if (ctl.position() - 1.5).abs() < 0.5 {
                 pos_near = true;
                 break;
@@ -797,8 +1051,8 @@ mod tests {
         // The fresh decoder discards frames below the seek target, so the
         // next displayed frame should carry a PTS near 1.5s.
         let mut frame = None;
-        let dl = std::time::Instant::now() + Duration::from_secs(5);
-        while frame.is_none() && std::time::Instant::now() < dl {
+        let dl = Instant::now() + Duration::from_secs(5);
+        while frame.is_none() && Instant::now() < dl {
             frame = ctl.next_video_frame(1.0 / 60.0);
             if frame.is_none() {
                 thread::sleep(Duration::from_millis(20));
@@ -827,13 +1081,14 @@ mod tests {
 
         let mut ctl = PlaybackController::new();
         ctl.apply(Command::Open(test_path.into())).unwrap();
+        settle(&mut ctl, &[PlaybackState::Loading], Duration::from_secs(10));
         ctl.apply(Command::Play).unwrap();
         assert_eq!(ctl.state(), &PlaybackState::Playing);
 
         // Let playback run ~0.3s, then record the position.
-        let dl = std::time::Instant::now() + Duration::from_millis(300);
+        let dl = Instant::now() + Duration::from_millis(300);
         let mut frames_seen = 0u32;
-        while std::time::Instant::now() < dl {
+        while Instant::now() < dl {
             if ctl.next_video_frame(1.0 / 60.0).is_some() {
                 frames_seen += 1;
             }
@@ -864,8 +1119,8 @@ mod tests {
         );
 
         let mut resumed_frame = false;
-        let dl = std::time::Instant::now() + Duration::from_secs(5);
-        while !resumed_frame && std::time::Instant::now() < dl {
+        let dl = Instant::now() + Duration::from_secs(5);
+        while !resumed_frame && Instant::now() < dl {
             resumed_frame = ctl.next_video_frame(1.0 / 60.0).is_some();
             if !resumed_frame {
                 thread::sleep(Duration::from_millis(20));
@@ -890,16 +1145,18 @@ mod tests {
 
         let mut ctl = PlaybackController::new();
         ctl.apply(Command::Open(test_path.into())).unwrap();
+        settle(&mut ctl, &[PlaybackState::Loading], Duration::from_secs(10));
         assert_eq!(ctl.state(), &PlaybackState::Ready);
 
         // Seek near the end (2.8s of 3s) so the test reaches EOF quickly.
         ctl.apply(Command::Seek(2.8)).unwrap();
         ctl.apply(Command::Play).unwrap();
+        settle(&mut ctl, &[PlaybackState::Seeking], Duration::from_secs(10));
         assert_eq!(ctl.state(), &PlaybackState::Playing);
 
         // Drive the (virtual) render loop until the controller reports Ended.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while ctl.state() != &PlaybackState::Ended && std::time::Instant::now() < deadline {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ctl.state() != &PlaybackState::Ended && Instant::now() < deadline {
             let _ = ctl.next_video_frame(1.0 / 60.0);
             thread::sleep(Duration::from_millis(20));
         }
@@ -919,8 +1176,9 @@ mod tests {
             "position must freeze after Ended"
         );
 
-        // Play after Ended restarts from the beginning.
+        // Play after Ended restarts from the beginning (async rebuild).
         ctl.apply(Command::Play).unwrap();
+        settle(&mut ctl, &[PlaybackState::Loading], Duration::from_secs(10));
         assert_eq!(ctl.state(), &PlaybackState::Playing);
         assert!(
             ctl.position() < 1.0,

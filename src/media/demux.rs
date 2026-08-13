@@ -336,8 +336,35 @@ fn demux_loop(
         //     keeps flowing.  Only when the channel AND the stash are both
         //     full do we wait (draining commands so Stop/Seek stay
         //     responsive).  A full channel is normal during pause.
+        //
+        //     ORDER MATTERS: stashed packets are OLDER than the packet in
+        //     hand, so they are flushed first.  The old code sent the held
+        //     (newest) packet before the 32 older stashed ones — the
+        //     decoder then received out-of-order data, H.264 responded
+        //     with "illegal short term buffer state", ~0.5s of frames were
+        //     lost and the video froze ~1s after every open/seek.
         let mut pkt = packet;
         loop {
+            if drain_cmds(&cmd_rx) {
+                break 'outer;
+            }
+            // Flush stashed packets first (oldest first, order kept).
+            if !stash.is_empty() {
+                match stash.pop_front() {
+                    Some(front) => match tx.try_send(front) {
+                        Ok(()) => continue,
+                        Err(mpsc::TrySendError::Full(f)) => {
+                            stash.push_front(f);
+                        }
+                        Err(mpsc::TrySendError::Disconnected(_)) => {
+                            stash.clear();
+                            break 'outer;
+                        }
+                    },
+                    None => {}
+                }
+            }
+            // Stash empty (or channel full): send the current packet.
             match tx.try_send(pkt) {
                 Ok(()) => {
                     *count += 1;
@@ -349,9 +376,6 @@ fn demux_loop(
                         break; // keep reading — other stream flows
                     }
                     pkt = p; // channel + stash full: wait for space
-                    if drain_cmds(&cmd_rx) {
-                        break 'outer;
-                    }
                     thread::sleep(Duration::from_millis(2));
                 }
                 Err(mpsc::TrySendError::Disconnected(_)) => break 'outer,
