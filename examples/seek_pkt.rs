@@ -13,7 +13,7 @@ fn main() {
             if let Some(r) = d.poll_ready() { break r.unwrap(); }
             std::thread::sleep(std::time::Duration::from_millis(2));
         };
-        let (v_rx, _a_rx) = d.take_channels().unwrap();
+        let v_rx = d.take_channels().unwrap();
         let mut keys = Vec::new();
         for _ in 0..6 {
             match v_rx.recv_timeout(std::time::Duration::from_millis(300)) {

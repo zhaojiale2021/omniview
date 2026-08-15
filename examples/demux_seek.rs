@@ -14,7 +14,7 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_millis(2));
         };
         let probe_ms = t0.elapsed().as_millis();
-        let (v_rx, _a_rx) = d.take_channels().unwrap();
+        let v_rx = d.take_channels().unwrap();
         // read first 5 video packets, print their dts->secs via stream tb
         // we need the stream time base; reuse a fresh open to read params
         let t1 = Instant::now();
