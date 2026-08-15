@@ -25,9 +25,6 @@ struct Pipeline {
     audio: Option<AudioHandle>,
     /// The audio actor thread (owns the cpal stream).  Joined on teardown.
     audio_actor: Option<thread::JoinHandle<()>>,
-    /// Drains audio packets when there is no audio device at all
-    /// (WSL2 / no output device) so the demux doesn't block.
-    audio_discard: Option<thread::JoinHandle<()>>,
 }
 
 impl Pipeline {
@@ -52,15 +49,9 @@ impl Pipeline {
             demux.stop();
         }
 
-        // Join the audio actor: the success path exits on Stop, the drain
-        // path exits once the (now stopped) demux stops routing.
+        // Join the audio actor.
         if let Some(actor) = self.audio_actor.take() {
             let _ = actor.join();
-        }
-
-        // Join the packet-discard thread (WSL2 path).
-        if let Some(handle) = self.audio_discard.take() {
-            let _ = handle.join();
         }
     }
 }
@@ -108,44 +99,34 @@ fn build_pipeline(path: &str, pos: f64) -> Result<(Pipeline, f64), String> {
         }
     };
 
-    let (video_rx, audio_rx) = match demux.take_channels() {
-        Some(ch) => ch,
+    let video_rx = match demux.take_channels() {
+        Some(rx) => rx,
         None => return Err("Channels already taken".to_string()),
     };
 
     // ── Audio ────────────────────────────────────────────────
     // The cpal output stream is !Send, so a dedicated actor thread builds
-    // and owns it; the controller talks to it through a Send handle.
+    // and owns it.  The actor's decode thread reads the AUDIO stream from
+    // the file itself — decoupled from the demux, so video backpressure
+    // can never starve the audio.
     let host = cpal::default_host();
     let audio_device = host.default_output_device();
 
-    let (audio, audio_actor, audio_discard) = if let Some(dev) = audio_device {
-        let (cmd_tx, ready_rx, actor) =
-            spawn_audio_actor(path.to_string(), dev, audio_rx, pos);
+    let (audio, audio_actor) = if let Some(dev) = audio_device {
+        let (cmd_tx, ready_rx, actor) = spawn_audio_actor(path.to_string(), dev, pos);
         match ready_rx.recv_timeout(Duration::from_secs(3)) {
-            Ok(Ok(ready)) => {
-                let handle = AudioHandle::new(cmd_tx, ready);
-                (Some(handle), Some(actor), None)
-            }
+            Ok(Ok(ready)) => (Some(AudioHandle::new(cmd_tx, ready)), Some(actor)),
             Ok(Err(e)) => {
                 tracing::warn!("Audio pipeline failed: {e}; proceeding video-only");
-                // The actor drains packets internally until the demux stops.
-                (None, Some(actor), None)
+                (None, Some(actor))
             }
             Err(_) => {
                 tracing::warn!("Audio actor startup timed out; proceeding video-only");
-                (None, Some(actor), None)
+                (None, Some(actor))
             }
         }
     } else {
-        // WSL2 / no audio device: drain audio packets so the demux
-        // doesn't block.
-        let handle = thread::spawn(move || {
-            while audio_rx.recv().is_ok() {
-                // discard
-            }
-        });
-        (None, None, Some(handle))
+        (None, None)
     };
 
     // ── Video ────────────────────────────────────────────────
@@ -196,7 +177,6 @@ fn build_pipeline(path: &str, pos: f64) -> Result<(Pipeline, f64), String> {
             video_cmd,
             audio,
             audio_actor,
-            audio_discard,
         },
         info.duration,
     ))

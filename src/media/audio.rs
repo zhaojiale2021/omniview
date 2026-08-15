@@ -16,7 +16,6 @@ use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, StreamTrait};
 use ffmpeg_next as ffmpeg;
-use ffmpeg::codec::packet::Packet;
 use ffmpeg::{channel_layout::ChannelLayout, codec, filter, format, frame, media, software, error};
 
 /// Send handle to the audio actor thread.  The actor owns the cpal output
@@ -96,7 +95,6 @@ pub struct AudioReady {
 pub fn spawn_audio_actor(
     path: String,
     dev: cpal::Device,
-    pkt_rx: mpsc::Receiver<Packet>,
     start_pos: f64,
 ) -> (
     mpsc::Sender<AudioCmd>,
@@ -107,16 +105,10 @@ pub fn spawn_audio_actor(
     let (ready_tx, ready_rx) = mpsc::channel::<Result<AudioReady, String>>();
 
     let handle = thread::spawn(move || {
-        let pipeline = match AudioPipeline::start(&path, &dev, pkt_rx, start_pos) {
+        let pipeline = match AudioPipeline::start(&path, &dev, start_pos) {
             Ok(p) => p,
-            Err((e, rx)) => {
+            Err(e) => {
                 let _ = ready_tx.send(Err(e));
-                // Drain packets until the demux stops routing (or EOF):
-                // if the audio channel disconnects, the demux breaks its
-                // routing loop and starves the video stream too.
-                while rx.recv().is_ok() {
-                    // discard
-                }
                 return;
             }
         };
@@ -234,13 +226,9 @@ impl AudioPipeline {
     pub fn start(
         path: &str,
         dev: &cpal::Device,
-        pkt_rx: mpsc::Receiver<Packet>,
         start_pos: f64,
-    ) -> Result<Self, (String, mpsc::Receiver<Packet>)> {
+    ) -> Result<Self, String> {
         let dev_name = dev.name().unwrap_or_else(|_| "?".into());
-
-        // Wrap so we can return it on error paths.
-        let mut pkt_rx = Some(pkt_rx);
 
         // ── Shared state ──────────────────────────────────────────
         // samples_played is seeded after we determine sample_rate/channels.
@@ -328,10 +316,7 @@ impl AudioPipeline {
                     let s = match build_stream(r, c, shared.clone()) {
                         Ok(s) => s,
                         Err(e) => {
-                            return Err((
-                                format!("cpal stream: {e}"),
-                                pkt_rx.take().unwrap(),
-                            ));
+                            return Err(format!("cpal stream: {e}"));
                         }
                     };
                     (s, r, c)
@@ -361,7 +346,7 @@ impl AudioPipeline {
         // scheduling, Windows timer slop) so the cpal callback never
         // underruns — an underrun stalls the audio master clock and
         // stutters video with it.
-        let buf_cap = (sample_rate as usize) * (channels as usize) * 2400 / 1000;
+        let buf_cap = (sample_rate as usize) * (channels as usize) * 4000 / 1000;
         let sh_sink = shared.clone();
 
         // Sink closure: push interleaved f32 into ring buffer.
@@ -395,14 +380,12 @@ impl AudioPipeline {
         let spawn_rate = sample_rate;
         let spawn_channels = channels;
 
-        let rx = pkt_rx.take().unwrap();
         let decoder_thread = thread::spawn(move || {
             // Catch panics so a filter/FFI bug is logged instead of dying
             // silently (on Windows there is no console to see the panic).
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 decode_audio_packets(
                     &path_owned,
-                    rx,
                     cmd_rx,
                     spawn_rate,
                     spawn_channels,
@@ -502,7 +485,6 @@ impl AudioPipeline {
 /// be tested without a cpal device.
 fn decode_audio_packets(
     path: &str,
-    pkt_rx: mpsc::Receiver<Packet>,
     cmd_rx: mpsc::Receiver<AudioCmd>,
     sample_rate: u32,
     channels: u16,
@@ -511,25 +493,43 @@ fn decode_audio_packets(
 ) -> Result<(), String> {
     ffmpeg::init().map_err(|e| format!("ffmpeg init: {e}"))?;
 
-    // Open the file just to read the audio stream's codec parameters.
-    let input =
+    // Open the file and read the AUDIO stream directly — decoupled from the
+    // demuxer's video routing, so video backpressure can never starve audio.
+    let mut input =
         format::input(path).map_err(|e| format!("open input for audio codec: {e}"))?;
 
-    let audio_stream = input
-        .streams()
-        .best(media::Type::Audio)
-        .ok_or_else(|| "no audio stream".to_string())?;
-    tracing::info!("Audio: opened file, audio stream index={}", audio_stream.index());
-    let audio_time_base = audio_stream.time_base();
+    // Extract everything we need from the stream, then drop it so `input`
+    // can be borrowed mutably for the seek + packet iteration below.
+    let (audio_stream_index, audio_time_base, audio_params) = {
+        let s = input
+            .streams()
+            .best(media::Type::Audio)
+            .ok_or_else(|| "no audio stream".to_string())?;
+        (s.index(), s.time_base(), s.parameters())
+    };
+    tracing::info!("Audio: opened file, audio stream index={audio_stream_index}");
 
-    let ctx = codec::context::Context::from_parameters(audio_stream.parameters())
+    // Seek to the start position (the demuxer does the same for video).
+    if start_pos > 0.01 {
+        let ts = (start_pos * 1_000_000.0) as i64;
+        unsafe {
+            ffmpeg::ffi::av_seek_frame(
+                input.as_mut_ptr(),
+                -1,
+                ts,
+                ffmpeg::ffi::AVSEEK_FLAG_BACKWARD,
+            );
+        }
+    }
+
+    let ctx = codec::context::Context::from_parameters(audio_params.clone())
         .map_err(|e| format!("audio codec context: {e}"))?;
     let mut decoder = ctx
         .decoder()
         .audio()
         .map_err(|e| format!("audio decoder: {e}"))?;
     decoder
-        .set_parameters(audio_stream.parameters())
+        .set_parameters(audio_params.clone())
         .map_err(|e| format!("set audio decoder params: {e}"))?;
 
     // Swr resampler: created lazily from the FIRST real frame's parameters
@@ -599,7 +599,12 @@ fn decode_audio_packets(
     // allocations (previously a fresh ~4 KB Vec per 10 ms block).
     let mut sample_buf: Vec<f32> = Vec::new();
 
-    loop {
+    for (stream, packet) in input.packets() {
+        // Skip non-audio packets (we read our own stream from the file).
+        if stream.index() != audio_stream_index {
+            continue;
+        }
+
         // (1) Drain commands (non-blocking).
         loop {
             match cmd_rx.try_recv() {
@@ -669,23 +674,13 @@ fn decode_audio_packets(
             }
         }
 
-        // (2) Get the next packet from the demuxer.
-        let packet = match pkt_rx.recv() {
-            Ok(p) => {
-                if first_packet {
-                    first_packet = false;
-                    tracing::info!(
-                        "Audio: first packet received ({} bytes)",
-                        p.data().map(|d| d.len()).unwrap_or(0)
-                    );
-                }
-                p
-            }
-            Err(_) => {
-                tracing::warn!("Audio: packet channel closed (demux stopped or EOF)");
-                break;
-            }
-        };
+        if first_packet {
+            first_packet = false;
+            tracing::info!(
+                "Audio: first packet received ({} bytes)",
+                packet.data().map(|d| d.len()).unwrap_or(0)
+            );
+        }
 
         // (3) Send packet to decoder.  A single bad packet must not kill
         // the thread (that would silence the stream and freeze the master
@@ -923,103 +918,43 @@ fn valid_f32_samples(frame: &ffmpeg::frame::Audio, out: &mut Vec<f32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::media::demux::Demux;
 
     #[test]
     fn decodes_audio_pcm() {
-        // Open the test file via Demux to get the audio packet channel.
-        let mut demux = Demux::open("/tmp/test_av.mp4", 0.0);
-
-        // Wait for probe to complete.
-        let info = loop {
-            if let Some(r) = demux.poll_ready() {
-                break r.unwrap();
-            }
-            thread::sleep(Duration::from_millis(20));
-        };
-        assert!(info.has_audio, "test file must have an audio stream");
-
-        // Take the channels; we only need audio.  The video receiver MUST be
-        // drained: the demux's video channel (cap 64) otherwise fills, the
-        // demux enters its hold-and-retry loop and never reaches EOF, the
-        // audio thread parks on pkt_rx.recv(), and the Stop command below is
-        // never processed — handle.join() hangs forever.  A background drain
-        // lets the demux route both streams to EOF so the audio thread
-        // decodes a real chunk and exits on EOF.
-        let (video_rx, audio_rx) = demux.take_channels().unwrap();
-        let _video_drain = thread::spawn(move || while video_rx.recv().is_ok() {});
-
         let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCmd>();
         let collected: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
         let collected_clone = collected.clone();
-
-        // Sink: just accumulate all decoded samples.
         let sink = move |samples: &[f32]| {
             if let Ok(mut v) = collected_clone.lock() {
                 v.extend_from_slice(samples);
             }
         };
 
-        // Spawn the decode thread.
         let handle = thread::spawn(move || {
-            let _ = decode_audio_packets(
-                "/tmp/test_av.mp4",
-                audio_rx,
-                cmd_rx,
-                48000,
-                2,
-                0.0,
-                sink,
-            );
+            let _ = decode_audio_packets("/tmp/test_av.mp4", cmd_rx, 48000, 2, 0.0, sink);
         });
 
-        // Wait for at least some samples (deadline 5 s, poll every 20 ms).
+        // Wait for at least some samples.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             if std::time::Instant::now() > deadline {
                 panic!("timeout waiting for decoded audio samples");
             }
-            let len = collected.lock().unwrap().len();
-            if len > 0 {
+            if !collected.lock().unwrap().is_empty() {
                 break;
             }
             thread::sleep(Duration::from_millis(20));
         }
+        assert!(!collected.lock().unwrap().is_empty(), "decoded audio samples must be non-empty");
 
-        // Assert we got PCM data.
-        let final_samples = collected.lock().unwrap().len();
-        assert!(final_samples > 0, "decoded audio samples must be non-empty");
-
-        // Send Stop so the decode thread exits cleanly.
         let _ = cmd_tx.send(AudioCmd::Stop);
         let _ = handle.join();
     }
 
     #[test]
     fn atempo_doubles_sample_output() {
-        // Direct rate check: feed ALL packets of the 20s fixture and let the
-        // decoder run to EOF with speed=2 engaged from the start.  A working
-        // atempo halves the output sample count (~960k vs ~1.92M).
-        let mut demux = Demux::open("/tmp/test_av20.mp4", 0.0);
-        loop {
-            if let Some(r) = demux.poll_ready() {
-                r.unwrap();
-                break;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        let (video_rx, audio_rx) = demux.take_channels().unwrap();
-        let _video_drain = thread::spawn(move || while video_rx.recv().is_ok() {});
-
-        let (pkt_tx, pkt_rx) = mpsc::channel::<ffmpeg::codec::packet::Packet>();
-        let _feed = thread::spawn(move || {
-            while let Ok(p) = audio_rx.recv() {
-                if pkt_tx.send(p).is_err() {
-                    break;
-                }
-            }
-        });
-
+        // Direct rate check: read the whole 20s fixture at 2x from the start.
+        // A working atempo halves the output sample count (~960k vs ~1.92M).
         let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCmd>();
         let produced: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
         let produced_sink = produced.clone();
@@ -1027,9 +962,8 @@ mod tests {
             *produced_sink.lock().unwrap() += samples.len() as u64;
         };
         let handle = thread::spawn(move || {
-            let _ = decode_audio_packets("/tmp/test_av20.mp4", pkt_rx, cmd_rx, 48000, 2, 0.0, sink);
+            let _ = decode_audio_packets("/tmp/test_av20.mp4", cmd_rx, 48000, 2, 0.0, sink);
         });
-        // Engage 2x immediately so the whole stream is processed at tempo.
         let _ = cmd_tx.send(AudioCmd::Speed(2.0));
 
         let dl = std::time::Instant::now() + Duration::from_secs(15);
@@ -1037,10 +971,9 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
         }
         let total = *produced.lock().unwrap();
-        // 20s @ 48kHz stereo = 1,920,000 samples; atempo=2 -> ~960,000.
         assert!(
             total < 1_400_000,
-            "atempo=2 should roughly halve output (got {total} samples, ~1.92M expected at 1x)"
+            "atempo=2 should roughly halve output (got {total} samples)"
         );
         assert!(
             total > 500_000,
@@ -1056,35 +989,10 @@ mod tests {
             .with_max_level(tracing::Level::INFO)
             .try_init();
 
-        // Reproduces the Windows regression: applying a speed change
-        // (atempo filter) killed the audio thread silently.  Verifies the
-        // thread stays alive and produces samples at ~2x the 1x rate.
-        //
-        // All audio packets are collected into an unbounded channel first,
-        // so the demux reaching EOF cannot starve the decoder mid-test.
-        let mut demux = Demux::open("/tmp/test_av20.mp4", 0.0);
-        let _info = loop {
-            if let Some(r) = demux.poll_ready() {
-                break r.unwrap();
-            }
-            thread::sleep(Duration::from_millis(20));
-        };
-        let (video_rx, audio_rx) = demux.take_channels().unwrap();
-        let _video_drain = thread::spawn(move || while video_rx.recv().is_ok() {});
-
-        let (pkt_tx, pkt_rx) = mpsc::channel::<ffmpeg::codec::packet::Packet>();
-        let _feed = thread::spawn(move || {
-            while let Ok(p) = audio_rx.recv() {
-                if pkt_tx.send(p).is_err() {
-                    break;
-                }
-            }
-        });
-
+        // Reproduces the Windows regression: a speed change (atempo filter)
+        // killed the audio thread silently.  Verifies it stays alive and
+        // produces samples at ~2x the 1x rate.
         let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCmd>();
-        // Simulate the production ring buffer: the sink blocks when the
-        // queue is full (1.2s), a consumer drains it at device rate
-        // (960 samples per 10ms at 48 kHz / 2 ch).
         let ring: Arc<Mutex<std::collections::VecDeque<f32>>> =
             Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let produced: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
@@ -1116,7 +1024,7 @@ mod tests {
 
         let handle = thread::spawn(move || {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                decode_audio_packets("/tmp/test_av20.mp4", pkt_rx, cmd_rx, 48000, 2, 0.0, sink)
+                decode_audio_packets("/tmp/test_av20.mp4", cmd_rx, 48000, 2, 0.0, sink)
             }));
             match r {
                 Ok(Ok(())) => None,
@@ -1145,7 +1053,6 @@ mod tests {
         let _ = cmd_tx.send(AudioCmd::Speed(2.0));
         thread::sleep(Duration::from_millis(500)); // let atempo engage
 
-        // The thread must still be alive and producing after the change.
         let t0 = *produced.lock().unwrap();
         thread::sleep(Duration::from_secs(1));
         let after = *produced.lock().unwrap() - t0;

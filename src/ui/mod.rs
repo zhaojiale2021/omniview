@@ -217,21 +217,6 @@ impl PlayerUI {
             audit_glyphs(&self.ctx);
         }
 
-        // Invisible full-screen click layer: double-click toggles
-        // fullscreen (skipped in 360 mode where drag rotates the camera).
-        if !self.is_360 {
-            let bg_id = egui::Id::new("video_bg_click");
-            let resp = egui::Area::new(bg_id)
-                .order(egui::Order::Background)
-                .show(&self.ctx, |ui| {
-                    ui.allocate_rect(self.ctx.screen_rect(), egui::Sense::click())
-                })
-                .inner;
-            if resp.double_clicked() {
-                self.fullscreen_clicked = true;
-            }
-        }
-
         // Process a pending mute toggle before borrowing ctx.
         if self.mute_clicked {
             self.mute_clicked = false;
