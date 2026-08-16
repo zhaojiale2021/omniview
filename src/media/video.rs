@@ -35,6 +35,12 @@ pub struct VideoQueue {
     space: Condvar,
 }
 
+impl Default for VideoQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VideoQueue {
     pub fn new() -> Self {
         Self {
@@ -60,6 +66,12 @@ impl VideoQueue {
     /// Number of frames currently buffered ahead of the clock.
     pub fn len(&self) -> usize {
         self.frames.lock().unwrap().len()
+    }
+
+    /// True when no frames are buffered ahead of the clock.
+    #[allow(dead_code)] // used by library consumers; binary never calls it directly
+    pub fn is_empty(&self) -> bool {
+        self.frames.lock().unwrap().is_empty()
     }
 
     /// Pop every frame whose PTS is at/before `clock` and return the newest

@@ -1,7 +1,8 @@
 // Same binding layout as equirect shader so we can reuse bind groups.
-// @group(0) = camera (unused by quad, but needed for layout compatibility)
+// @group(0) = camera/quad transform matrix (perspective for 360°, aspect-fit
+//             scale for 2D letterboxing)
 // @group(1) = texture + sampler
-@group(0) @binding(0) var<uniform> _unused: mat4x4<f32>;
+@group(0) @binding(0) var<uniform> view_proj: mat4x4<f32>;
 @group(1) @binding(0) var y_texture: texture_2d<f32>;
 @group(1) @binding(1) var uv_texture: texture_2d<f32>;
 @group(1) @binding(2) var video_sampler: sampler;
@@ -19,7 +20,7 @@ struct VertexOutput {
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    out.position = vec4(input.position, 0.0, 1.0);
+    out.position = view_proj * vec4(input.position, 0.0, 1.0);
     out.uv = input.uv;
     return out;
 }

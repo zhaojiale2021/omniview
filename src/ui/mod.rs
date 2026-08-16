@@ -1,4 +1,17 @@
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
 use egui::Context;
+
+/// Thumbnail buckets are one second wide; the preview image shows the
+/// nearest decoded frame for the hovered position.
+const THUMB_STEP: f64 = 1.0;
+/// How long to wait before re-requesting the same thumbnail bucket if the
+/// background decoder hasn't returned it yet.
+const THUMB_RETRY: Duration = Duration::from_millis(800);
+/// Keep at most this many decoded preview textures.  A 160x90 RGBA frame
+/// is ~57 KB of GPU texture, so 128 entries are only a few MB.
+const THUMB_CACHE_MAX: usize = 128;
 
 /// Install a system CJK font as a fallback so Chinese UI text ("缓冲中…",
 /// "续播") renders instead of tofu boxes.  egui's default fonts have no
@@ -35,7 +48,7 @@ pub fn install_cjk_font(ctx: &egui::Context) -> Option<std::path::PathBuf> {
         if magic == b"ttcf" || magic == b"wOFF" || magic == b"wOF2" {
             continue;
         }
-        if magic != &[0x00, 0x01, 0x00, 0x00]
+        if magic != [0x00, 0x01, 0x00, 0x00]
             && magic != b"OTTO"
             && magic != b"true"
             && magic != b"typ1"
@@ -132,6 +145,15 @@ pub struct PlayerUI {
     /// open/seek, or a transient stall).  Shown as a hint over the video.
     pub buffering: bool,
     file_name: String,
+    /// Full path of the current media file, used for thumbnail requests.
+    file_path: String,
+    /// Set during `update` when the seek preview needs a thumbnail at the
+    /// given position.  The app consumes it and sends a background request.
+    pub thumbnail_request: Option<f64>,
+    /// Decoded seek-preview images, keyed by one-second bucket.
+    thumb_cache: HashMap<u64, egui::TextureHandle>,
+    /// Last thumbnail request sent, for retry throttling.
+    thumb_last_req: Option<(String, u64, Instant)>,
     /// Glyph audit has run once (fonts only exist after the first pass).
     audited: bool,
     /// Position saved at drag start, used to detect actual changes.
@@ -172,6 +194,10 @@ impl PlayerUI {
             resume_clicked: false,
             audited: false,
             file_name: String::new(),
+            file_path: String::new(),
+            thumbnail_request: None,
+            thumb_cache: HashMap::new(),
+            thumb_last_req: None,
             drag_start_pos: 0.0,
             muted: false,
             last_volume: 0.8,
@@ -181,6 +207,39 @@ impl PlayerUI {
     /// Set the media file name shown in the top bar.
     pub fn set_file_name(&mut self, name: String) {
         self.file_name = name;
+    }
+
+    /// Set the full path of the current media file.  When it changes, the
+    /// thumbnail cache is invalidated because previews belong to the old
+    /// file.
+    pub fn set_file_path(&mut self, path: String) {
+        if self.file_path != path {
+            self.file_path = path;
+            self.clear_thumbnails();
+        }
+    }
+
+    /// Drop all decoded seek-preview textures (e.g. when opening a new file).
+    pub fn clear_thumbnails(&mut self) {
+        self.thumb_cache.clear();
+        self.thumb_last_req = None;
+        self.thumbnail_request = None;
+    }
+
+    /// Store a decoded thumbnail from the background service as an egui
+    /// texture.  Called by the app on the render thread before `update`.
+    pub fn store_thumbnail(&mut self, pos: f64, rgba: Vec<u8>, width: u32, height: u32) {
+        let bucket = (pos.max(0.0) / THUMB_STEP).floor() as u64;
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [width as usize, height as usize],
+            &rgba,
+        );
+        let name = format!("thumb_{bucket}");
+        if self.thumb_cache.len() >= THUMB_CACHE_MAX && !self.thumb_cache.contains_key(&bucket) {
+            self.thumb_cache.clear();
+        }
+        let handle = self.ctx.load_texture(name, image, egui::TextureOptions::LINEAR);
+        self.thumb_cache.insert(bucket, handle);
     }
 
     fn fmt_time(secs: f64) -> String {
@@ -334,20 +393,34 @@ impl PlayerUI {
                     self.seeking = true;
                     self.drag_start_pos = self.position; // pre-drag position
                 }
-                if self.seeking {
-                    if let Some(p) = seek_response.interact_pointer_pos() {
-                        target_frac = ((p.x - bar_rect.left())
-                            / bar_rect.width().max(1.0))
-                        .clamp(0.0, 1.0);
-                        // Live-update the time display during the drag.
-                        self.position = target_frac as f64 * dur;
-                    }
+                if self.seeking
+                    && let Some(p) = seek_response.interact_pointer_pos()
+                {
+                    target_frac = ((p.x - bar_rect.left())
+                        / bar_rect.width().max(1.0))
+                    .clamp(0.0, 1.0);
+                    // Live-update the time display during the drag.
+                    self.position = target_frac as f64 * dur;
                 }
                 if seek_response.drag_stopped() {
                     self.seeking = false;
                     // Compare against the pre-drag position.
                     if (self.position - self.drag_start_pos).abs() > 0.2 {
                         self.seek_to = Some(self.position);
+                    }
+                }
+
+                // Plain click (press/release without dragging) seeks
+                // immediately to the clicked position.
+                if seek_response.clicked()
+                    && let Some(p) = seek_response.interact_pointer_pos()
+                {
+                    let frac = ((p.x - bar_rect.left())
+                        / bar_rect.width().max(1.0))
+                    .clamp(0.0, 1.0);
+                    let t = frac as f64 * dur;
+                    if (t - self.position).abs() > 0.2 {
+                        self.seek_to = Some(t);
                     }
                 }
 
@@ -379,8 +452,10 @@ impl PlayerUI {
                     );
                 }
 
-                // ── Seek time bubble (hover + drag) ───────────────
-                // Follows the pointer above the bar with the target time.
+                // ── Seek time bubble + thumbnail preview ────────
+                // Follows the pointer above the bar with the target time and
+                // (once the background decoder has caught up) a frame from
+                // that part of the video.
                 let show_preview = self.seeking || seek_response.hovered();
                 if show_preview {
                     let pointer = seek_response
@@ -395,10 +470,53 @@ impl PlayerUI {
                             self.position
                         } else {
                             frac as f64 * dur
-                        };
-                        let bubble_pos = egui::pos2(p.x, rect.top() - 46.0);
+                        }
+                        .clamp(0.0, dur);
+                        let bucket = (t / THUMB_STEP).floor() as u64;
+
+                        // Ask the app for a thumbnail if this bucket hasn't
+                        // been decoded yet.  Retry stale requests after a
+                        // short delay (the service coalesces anyway, so
+                        // rapid mouse movement only decodes the last one).
+                        if !self.file_path.is_empty()
+                            && !self.thumb_cache.contains_key(&bucket)
+                        {
+                            let should_request = match &self.thumb_last_req {
+                                Some((path, b, at)) => {
+                                    path != &self.file_path
+                                        || *b != bucket
+                                        || at.elapsed() >= THUMB_RETRY
+                                }
+                                None => true,
+                            };
+                            if should_request {
+                                self.thumb_last_req = Some((
+                                    self.file_path.clone(),
+                                    bucket,
+                                    Instant::now(),
+                                ));
+                                self.thumbnail_request = Some(t);
+                            }
+                        }
+
+                        let thumb = self.thumb_cache.get(&bucket).cloned();
+
+                        // Anchor the popup ABOVE the pointer with its bottom
+                        // edge just clear of the seek bar.  If it overlaps
+                        // the bar, the Area steals hover from the seek bar,
+                        // the preview disappears, hover returns, and the
+                        // thumbnail flashes on/off at every frame.
+                        let popup_half_w = 88.0;
+                        let screen = ctx.screen_rect();
+                        let bubble_x = p
+                            .x
+                            .max(screen.left() + popup_half_w + 4.0)
+                            .min(screen.right() - popup_half_w - 4.0);
+                        let bubble_pos = egui::pos2(bubble_x, rect.top() - 6.0);
+                        let thumb_size = egui::vec2(160.0, 90.0);
                         egui::Area::new(egui::Id::new("seek_preview"))
                             .fixed_pos(bubble_pos)
+                            .pivot(egui::Align2::CENTER_BOTTOM)
                             .order(egui::Order::Foreground)
                             .show(ctx, |ui| {
                                 egui::Frame::popup(ui.style())
@@ -411,6 +529,29 @@ impl PlayerUI {
                                                 .family(egui::FontFamily::Monospace)
                                                 .size(12.0),
                                         );
+                                        ui.add_space(4.0);
+                                        // Always allocate the same thumbnail
+                                        // rect so the popup size never
+                                        // changes when the image arrives.
+                                        let (thumb_rect, _) = ui
+                                            .allocate_exact_size(
+                                                thumb_size,
+                                                egui::Sense::hover(),
+                                            );
+                                        if let Some(tex) = &thumb {
+                                            ui.put(
+                                                thumb_rect,
+                                                egui::Image::new(tex)
+                                                    .fit_to_exact_size(thumb_size)
+                                                    .rounding(egui::Rounding::same(3.0)),
+                                            );
+                                        } else {
+                                            ui.painter().rect_filled(
+                                                thumb_rect,
+                                                egui::Rounding::same(3.0),
+                                                egui::Color32::from_black_alpha(60),
+                                            );
+                                        }
                                     });
                             });
                     }

@@ -23,7 +23,7 @@ fn main() {
         }
     };
 
-    ctl.apply(Command::Open(path.into())).unwrap();
+    ctl.apply(Command::Open(path)).unwrap();
     ctl.apply(Command::Play).unwrap();
     settle(&mut ctl);
     println!("state after open: {:?} pos={:.3}", ctl.state(), ctl.position());

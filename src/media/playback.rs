@@ -182,6 +182,10 @@ fn build_pipeline(path: &str, pos: f64) -> Result<(Pipeline, f64), String> {
     ))
 }
 
+/// Receiving end of an in-flight pipeline build: the worker generation
+/// guards against superseded open/seek results.
+type PipelineBuildRx = mpsc::Receiver<(u64, Result<(Pipeline, f64), String>)>;
+
 pub struct PlaybackController {
     state: PlaybackState,
     volume: f32,
@@ -212,7 +216,7 @@ pub struct PlaybackController {
     // ── Async pipeline build (open/seek run on a worker thread so the
     //    render thread never blocks on file I/O or device probing) ──
     /// Handoff channel from the in-flight build worker.
-    pending: Option<mpsc::Receiver<(u64, Result<(Pipeline, f64), String>)>>,
+    pending: Option<PipelineBuildRx>,
     /// Bumped on every teardown/stop: results from superseded workers are
     /// discarded (their `Pipeline` Drop tears the discarded pipeline down).
     generation: u64,
@@ -220,6 +224,12 @@ pub struct PlaybackController {
     pending_play: bool,
     /// Position the pending pipeline is built for (0.0 on open, target on seek).
     pending_pos: f64,
+}
+
+impl Default for PlaybackController {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PlaybackController {

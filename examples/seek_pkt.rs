@@ -1,7 +1,6 @@
 //! Final check: after PRODUCTION Demux::open seek, are the first packets
 //! keyframes? Does the decoder emit unflagged garbage frames?
 
-use std::sync::mpsc;
 use ffmpeg_next as ffmpeg;
 
 fn main() {

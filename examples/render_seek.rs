@@ -51,7 +51,7 @@ impl ApplicationHandler for Harness {
         self.renderer = Some(renderer);
 
         let f = self.file.clone();
-        self.ctl.apply(Command::Open(f.into())).unwrap();
+        self.ctl.apply(Command::Open(f)).unwrap();
         self.ctl.apply(Command::Play).unwrap();
         println!("PHASE 0: open+play at t=0");
         self.phase_start = Instant::now();

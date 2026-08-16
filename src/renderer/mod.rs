@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use glam::Mat4;
 use wgpu::{PresentMode, TextureUsages};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -24,6 +25,9 @@ pub struct Renderer {
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
     pub size: (u32, u32),
+    /// Size of the currently uploaded video frame (0,0 before the first
+    /// frame).  Used for aspect-ratio-correct 2D rendering and screenshots.
+    video_size: (u32, u32),
     pub sphere: Sphere,
     pub render_pipeline: wgpu::RenderPipeline,
     pub quad: Quad,
@@ -390,6 +394,7 @@ impl Renderer {
 
         Self {
             surface, device, queue, config, size: (size.width, size.height),
+            video_size: (0, 0),
             sphere, render_pipeline, quad, quad_pipeline, is_360: false,
             camera_buffer, camera_bind_group,
             texture_sampler, texture_bind_group_layout: texture_bgl,
@@ -427,14 +432,37 @@ impl Renderer {
     pub fn update_camera_uniform(&mut self) {
         // Skip the per-frame `write_buffer` when nothing moved: the render
         // loop calls this every frame, but the uniform only changes when
-        // the camera or the window aspect ratio changes.
+        // the camera, the window aspect ratio, the rendering mode, or the
+        // video size changes.
         if !self.camera.dirty {
             return;
         }
         self.camera.dirty = false;
-        let aspect = self.size.0 as f32 / self.size.1.max(1) as f32;
-        let vp = self.camera.view_proj_matrix(aspect);
+        let window_aspect = self.size.0 as f32 / self.size.1.max(1) as f32;
+        let vp = if self.is_360 {
+            self.camera.view_proj_matrix(window_aspect)
+        } else {
+            self.quad_view_proj(window_aspect)
+        };
         self.update_camera(&vp);
+    }
+
+    /// Matrix for non-360 playback: scales the fullscreen quad so the video
+    /// keeps its native aspect ratio and is letterboxed/pillarboxed instead
+    /// of stretched to the window.  Videos of any resolution adapt
+    /// automatically; 360° mode uses the perspective camera instead.
+    fn quad_view_proj(&self, window_aspect: f32) -> [[f32; 4]; 4] {
+        let (vw, vh) = self.video_size;
+        if vw == 0 || vh == 0 {
+            return Mat4::IDENTITY.to_cols_array_2d();
+        }
+        let video_aspect = vw as f32 / vh as f32;
+        // Scale factors in NDC.  When the window is wider than the video,
+        // fit by height (scale x down); when it is narrower, fit by width
+        // (scale y down).
+        let sx = (video_aspect / window_aspect).min(1.0);
+        let sy = (window_aspect / video_aspect).min(1.0);
+        Mat4::from_scale(glam::Vec3::new(sx, sy, 1.0)).to_cols_array_2d()
     }
 
     /// Estimated seconds until the next vsync.  A texture uploaded now is
@@ -456,6 +484,12 @@ impl Renderer {
         let (width, height) = (frame.width, frame.height);
         if width == 0 || height == 0 {
             return;
+        }
+        if self.video_size != (width, height) {
+            self.video_size = (width, height);
+            // The 2D aspect-fit matrix depends on the video size; make
+            // sure the uniform is re-uploaded before the next draw.
+            self.camera.dirty = true;
         }
         let uv_w = width.div_ceil(2);
         let uv_h = height.div_ceil(2);
@@ -589,7 +623,6 @@ impl Renderer {
         pixels_per_point: f32,
         frame: Option<VideoFrame>,
     ) -> Result<(), wgpu::SurfaceError> {
-        self.update_camera_uniform();
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device
@@ -601,33 +634,37 @@ impl Renderer {
         // reference conversion, independent of the GPU shader.  Downscaled
         // 4x so the PNG encode doesn't distort the render timing.
         let mut src_dump: Option<(Vec<u8>, u32, u32)> = None;
-        if let Some(frame) = &frame {
-            if self.capture_path.is_some() {
-                let (w, h) = (frame.width as usize, frame.height as usize);
-                let (dw, dh) = (w / 4, h / 4);
-                let y_stride = frame.y_stride as usize;
-                let uv_stride = frame.uv_stride as usize;
-                let mut rgba = Vec::with_capacity(dw * dh * 4);
-                for row in 0..dh {
-                    for col in 0..dw {
-                        let yv = frame.y[row * 4 * y_stride + col * 4] as f32 / 255.0;
-                        let u = frame.uv[(row * 2) * uv_stride + (col * 2) * 2] as f32 / 255.0;
-                        let v = frame.uv[(row * 2) * uv_stride + (col * 2) * 2 + 1] as f32 / 255.0;
-                        let y2 = (yv - 16.0 / 255.0) * (255.0 / 219.0);
-                        let u2 = (u - 128.0 / 255.0) * (255.0 / 224.0);
-                        let v2 = (v - 128.0 / 255.0) * (255.0 / 224.0);
-                        let r = (y2 + 1.5748 * v2).clamp(0.0, 1.0) * 255.0;
-                        let g = (y2 - 0.1873 * u2 - 0.4681 * v2).clamp(0.0, 1.0) * 255.0;
-                        let b = (y2 + 1.8556 * u2).clamp(0.0, 1.0) * 255.0;
-                        rgba.extend_from_slice(&[r as u8, g as u8, b as u8, 255]);
-                    }
+        if let Some(frame) = &frame
+            && self.capture_path.is_some()
+        {
+            let (w, h) = (frame.width as usize, frame.height as usize);
+            let (dw, dh) = (w / 4, h / 4);
+            let y_stride = frame.y_stride as usize;
+            let uv_stride = frame.uv_stride as usize;
+            let mut rgba = Vec::with_capacity(dw * dh * 4);
+            for row in 0..dh {
+                for col in 0..dw {
+                    let yv = frame.y[row * 4 * y_stride + col * 4] as f32 / 255.0;
+                    let u = frame.uv[(row * 2) * uv_stride + (col * 2) * 2] as f32 / 255.0;
+                    let v = frame.uv[(row * 2) * uv_stride + (col * 2) * 2 + 1] as f32 / 255.0;
+                    let y2 = (yv - 16.0 / 255.0) * (255.0 / 219.0);
+                    let u2 = (u - 128.0 / 255.0) * (255.0 / 224.0);
+                    let v2 = (v - 128.0 / 255.0) * (255.0 / 224.0);
+                    let r = (y2 + 1.5748 * v2).clamp(0.0, 1.0) * 255.0;
+                    let g = (y2 - 0.1873 * u2 - 0.4681 * v2).clamp(0.0, 1.0) * 255.0;
+                    let b = (y2 + 1.8556 * u2).clamp(0.0, 1.0) * 255.0;
+                    rgba.extend_from_slice(&[r as u8, g as u8, b as u8, 255]);
                 }
-                src_dump = Some((rgba, dw as u32, dh as u32));
             }
+            src_dump = Some((rgba, dw as u32, dh as u32));
         }
         if let Some(frame) = frame {
             self.upload_video_frame(&frame);
         }
+        // Upload the camera/quad matrix AFTER the video frame: the first
+        // frame of a new resolution then renders with the correct aspect
+        // fit on the very same frame instead of one frame late.
+        self.update_camera_uniform();
 
         // Upload egui textures
         for (id, image_delta) in &textures_delta.set {
@@ -772,7 +809,7 @@ impl Renderer {
                     let _ = std::fs::write(&p, ppm);
                     if let Some((rgba, dw, dh)) = &src_dump {
                         let _ = image::save_buffer(
-                            &format!("{p}.src.png"),
+                            format!("{p}.src.png"),
                             rgba,
                             *dw,
                             *dh,
@@ -817,11 +854,16 @@ impl Renderer {
             return false;
         };
         let (w, h) = (y_tex.width(), y_tex.height());
+        let uv_w = uv_tex.width();
         let uv_h = uv_tex.height();
+        // The Y texture is R8; the UV texture is Rgba8 (we expand NV12's
+        // 2-byte CbCr pairs into 4-byte RGBA texels for driver
+        // compatibility).  Both copies need a buffer row pitch that is a
+        // multiple of 256 bytes.
         let y_stride = self.y_stride.max(w.div_ceil(256) * 256);
-        let uv_stride = self.uv_stride.max((uv_tex.width() * 2).div_ceil(256) * 256);
+        let uv_rgba_stride = ((uv_w * 4).div_ceil(256) * 256).max(uv_w * 4);
         let y_size = y_stride as u64 * h as u64;
-        let uv_size = uv_stride as u64 * uv_h as u64;
+        let uv_size = uv_rgba_stride as u64 * uv_h as u64;
         let total = y_size + uv_size;
 
         if self.png_staging.as_ref().map(|b| b.size() != total).unwrap_or(true) {
@@ -865,7 +907,7 @@ impl Renderer {
                 buffer: staging,
                 layout: wgpu::ImageDataLayout {
                     offset: y_size,
-                    bytes_per_row: Some(uv_stride),
+                    bytes_per_row: Some(uv_rgba_stride),
                     rows_per_image: Some(uv_h),
                 },
             },
@@ -882,16 +924,16 @@ impl Renderer {
         }
         let data = slice.get_mapped_range();
         let y = &data[..y_size as usize];
+        // UV texture texels are [Cb, Cr, 0, 255] in Rgba8; read directly.
         let uv = &data[y_size as usize..];
         let mut rgba = Vec::with_capacity((w as usize) * (h as usize) * 4);
         for row in 0..h {
             for col in 0..w {
                 let yv = y[row as usize * y_stride as usize + col as usize] as f32 / 255.0;
-                let u = uv[(row / 2) as usize * uv_stride as usize + (col / 2) as usize * 2] as f32
-                    / 255.0;
-                let v = uv[(row / 2) as usize * uv_stride as usize + (col / 2) as usize * 2 + 1]
-                    as f32
-                    / 255.0;
+                let uv_idx = (row / 2) as usize * uv_rgba_stride as usize
+                    + (col / 2) as usize * 4;
+                let u = uv[uv_idx] as f32 / 255.0;
+                let v = uv[uv_idx + 1] as f32 / 255.0;
                 let y2 = (yv - 16.0 / 255.0) * (255.0 / 219.0);
                 let u2 = (u - 128.0 / 255.0) * (255.0 / 224.0);
                 let v2 = (v - 128.0 / 255.0) * (255.0 / 224.0);

@@ -10,7 +10,7 @@ fn main() {
         .try_init();
     let path = std::env::args().nth(1).expect("usage: long_probe <file>");
     let mut ctl = PlaybackController::new();
-    ctl.apply(Command::Open(path.into())).unwrap();
+    ctl.apply(Command::Open(path)).unwrap();
     ctl.apply(Command::Play).unwrap();
     let dl = Instant::now() + std::time::Duration::from_secs(10);
     while matches!(

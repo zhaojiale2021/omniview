@@ -296,32 +296,42 @@ impl AudioPipeline {
                 .map_err(|e| format!("cpal stream: {e}"))
             };
 
-        // Prefer 48 kHz / 2 ch; fall back to device native config.
-        let (stream, sample_rate, channels) =
-            match build_stream(48000u32, 2u16, shared.clone()) {
-                Ok(s) => {
-                    tracing::info!("Audio output: {dev_name} — 48 kHz / 2 ch");
-                    (s, 48000u32, 2u16)
+        // Adaptive output format: prefer the device's current native
+        // configuration (sample rate + channel count) so the OS mixer
+        // doesn't have to resample behind our back.  Fall back to the
+        // ubiquitous 48 kHz stereo if the native config can't be opened,
+        // then to 44.1 kHz stereo as a last resort.
+        let native_cfg = dev
+            .default_output_config()
+            .map(|cfg| (cfg.sample_rate().0, cfg.channels()))
+            .ok();
+
+        let mut chosen: Option<(u32, u16, cpal::Stream)> = None;
+        let mut attempts: Vec<(u32, u16, &str)> = Vec::new();
+        if let Some((r, c)) = native_cfg {
+            attempts.push((r, c, "native"));
+        }
+        attempts.push((48000, 2, "48 kHz / 2 ch"));
+        attempts.push((44100, 2, "44.1 kHz / 2 ch"));
+
+        for (r, c, label) in attempts {
+            match build_stream(r, c, shared.clone()) {
+                Ok(stream) => {
+                    tracing::info!(
+                        "Audio output: {dev_name} — {r} Hz / {c} ch ({label})"
+                    );
+                    chosen = Some((r, c, stream));
+                    break;
                 }
                 Err(e) => {
-                    tracing::warn!("48 kHz/2ch failed ({e}); trying device native config");
-                    let (r, c) = match dev.default_output_config() {
-                        Ok(cfg) => (cfg.sample_rate().0, cfg.channels()),
-                        Err(e2) => {
-                            tracing::warn!("no native config ({e2}); using 48 kHz/2ch");
-                            (48000u32, 2u16)
-                        }
-                    };
-                    tracing::info!("Audio output: {dev_name} — {r} Hz / {c} ch (native)");
-                    let s = match build_stream(r, c, shared.clone()) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return Err(format!("cpal stream: {e}"));
-                        }
-                    };
-                    (s, r, c)
+                    tracing::warn!("Audio output {r} Hz/{c} ch failed: {e}");
                 }
-            };
+            }
+        }
+
+        let Some((sample_rate, channels, stream)) = chosen else {
+            return Err("no usable cpal output format".to_string());
+        };
 
         // Seed the audio master clock so position() starts at `start_pos`.
         // speed is 1.0 at construction time.
@@ -341,12 +351,16 @@ impl AudioPipeline {
         // ── Command channel ───────────────────────────────────────
         let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCmd>();
 
-        // ── Ring buffer backpressure: 1200ms cap ──────────────────
-        // A large buffer absorbs decode-thread hiccups (demux I/O, thread
+        // ── Ring buffer backpressure: 400ms cap ──────────────────
+        // A buffer absorbs decode-thread hiccups (demux I/O, thread
         // scheduling, Windows timer slop) so the cpal callback never
         // underruns — an underrun stalls the audio master clock and
-        // stutters video with it.
-        let buf_cap = (sample_rate as usize) * (channels as usize) * 4000 / 1000;
+        // stutters video with it.  The cap is also the worst-case speed
+        // change latency: old-speed samples already queued must play out
+        // before new-speed samples become audible.  400ms keeps that
+        // switch comfortably under the 500ms target while still leaving
+        // enough cushion for normal scheduling jitter.
+        let buf_cap = (sample_rate as usize) * (channels as usize) * 400 / 1000;
         let sh_sink = shared.clone();
 
         // Sink closure: push interleaved f32 into ring buffer.
@@ -903,7 +917,7 @@ fn new_resampler(
 /// over-production → ring full → sink blocked → demux stall → freeze).
 /// Only the first `samples() * channels` samples are valid.
 fn valid_f32_samples(frame: &ffmpeg::frame::Audio, out: &mut Vec<f32>) {
-    let valid = frame.samples() as usize * frame.channels() as usize * 4;
+    let valid = frame.samples() * frame.channels() as usize * 4;
     let bytes = frame.data(0);
     out.clear();
     out.extend(

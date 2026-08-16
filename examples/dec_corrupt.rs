@@ -33,7 +33,6 @@ fn main() {
         software::scaling::Flags::BILINEAR,
     ).unwrap();
     let mut nv12 = frame::Video::empty();
-    let mut out_frame: Option<frame::Video> = None;
 
     let mut count = 0u64;
     let mut corrupt = 0u64;
@@ -58,8 +57,10 @@ fn main() {
             let pts = decoded.timestamp().or(decoded.pts());
             match pts {
                 Some(p) => {
-                    if let Some(lp) = last_pts {
-                        if p < lp { pts_out_of_order += 1; }
+                    if let Some(lp) = last_pts
+                        && p < lp
+                    {
+                        pts_out_of_order += 1;
                     }
                     last_pts = Some(p);
                     let pts_secs = p as f64 * time_base.numerator() as f64 / time_base.denominator() as f64;
@@ -74,9 +75,7 @@ fn main() {
                 None => missing_pts += 1,
             }
             // scale it to force decode completion
-            if scaler.run(&decoded, &mut nv12).is_ok() {
-                out_frame = Some(std::mem::replace(&mut nv12, frame::Video::empty()));
-            }
+            let _ = scaler.run(&decoded, &mut nv12);
             if count >= 100 { break; }
         }
         if count >= 100 { break; }

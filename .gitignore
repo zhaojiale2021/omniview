@@ -2,3 +2,8 @@
 /third_party/
 /rust_out
 /.reasonix/
+/.superpowers/
+/.dsh-vision-router/
+/player.log
+/player_state.json
+/screenshot_*.png

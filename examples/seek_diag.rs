@@ -14,7 +14,7 @@ fn main() {
 
     // ── Open timing ────────────────────────────────────────────────
     let t0 = Instant::now();
-    ctl.apply(Command::Open(path.clone().into())).unwrap();
+    ctl.apply(Command::Open(path.clone())).unwrap();
     println!("OPEN took {:.1} ms (state={:?})", t0.elapsed().as_millis(), ctl.state());
     println!("duration={:.1}s", ctl.duration());
 
@@ -46,22 +46,19 @@ fn main() {
         let mut first_after: Option<f64> = None;
         let mut pts_seen: Vec<f64> = Vec::new();
         while t2.elapsed().as_secs() < 10 {
-            match ctl.next_video_frame(0.0) {
-                Some(f) => {
-                    if first_after.is_none() && f.pts_secs >= target - 0.1 {
-                        first_after = Some(f.pts_secs);
-                        println!(
-                            "  seek->{target:>5.1}s: apply={seek_ms} ms, first frame pts={:.3}s after {:.1} ms",
-                            f.pts_secs,
-                            t2.elapsed().as_millis()
-                        );
-                    }
-                    pts_seen.push(f.pts_secs);
-                    if pts_seen.len() > 4 {
-                        break;
-                    }
+            if let Some(f) = ctl.next_video_frame(0.0) {
+                if first_after.is_none() && f.pts_secs >= target - 0.1 {
+                    first_after = Some(f.pts_secs);
+                    println!(
+                        "  seek->{target:>5.1}s: apply={seek_ms} ms, first frame pts={:.3}s after {:.1} ms",
+                        f.pts_secs,
+                        t2.elapsed().as_millis()
+                    );
                 }
-                None => {}
+                pts_seen.push(f.pts_secs);
+                if pts_seen.len() > 4 {
+                    break;
+                }
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }

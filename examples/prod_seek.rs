@@ -9,20 +9,18 @@ use omniview::media::types::Command;
 fn main() {
     let path = std::env::args().nth(1).expect("usage: prod_seek <file>");
     let mut ctl = PlaybackController::new();
-    ctl.apply(Command::Open(path.into())).unwrap();
+    ctl.apply(Command::Open(path)).unwrap();
     ctl.apply(Command::Play).unwrap();
 
     // Let it run 1s
     let t0 = Instant::now();
     let mut first_pts = None;
-    let mut prev_pts: Option<f64> = None;
     while t0.elapsed() < Duration::from_secs(1) {
-        if let Some(f) = ctl.next_video_frame(0.0) {
-            if first_pts.is_none() {
-                first_pts = Some(f.pts_secs);
-                println!("start: first pts={:.3}s", f.pts_secs);
-            }
-            prev_pts = Some(f.pts_secs);
+        if let Some(f) = ctl.next_video_frame(0.0)
+            && first_pts.is_none()
+        {
+            first_pts = Some(f.pts_secs);
+            println!("start: first pts={:.3}s", f.pts_secs);
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -53,10 +51,10 @@ fn main() {
                 if f.pts_secs < target - 0.05 {
                     before_target += 1;
                 }
-                if let Some(l) = last {
-                    if (f.pts_secs - l).abs() > 0.05 {
-                        jumps += 1;
-                    }
+                if let Some(l) = last
+                    && (f.pts_secs - l).abs() > 0.05
+                {
+                    jumps += 1;
                 }
                 last = Some(f.pts_secs);
             }

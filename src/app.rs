@@ -12,6 +12,7 @@ use winit::{
 };
 
 use crate::media::playback::PlaybackController;
+use crate::media::thumb::{ThumbnailService, THUMB_MAX_H, THUMB_MAX_W};
 use crate::media::types::{Command, PlaybackState, VideoFrame};
 use crate::renderer::Renderer;
 use crate::ui::PlayerUI;
@@ -37,6 +38,15 @@ pub struct App {
     input_seen: bool,
     /// Time of the last user input — drives fullscreen auto-hide.
     last_input: Instant,
+    /// While fullscreen transition is in flight, keep polling and
+    /// re-syncing the surface size every frame so the old window image
+    /// never lingers as a fullscreen "window print".
+    fullscreen_sync_until: Option<Instant>,
+    /// Desired fullscreen state after the latest toggle; if the platform
+    /// hasn't reached it yet, `sync_fullscreen_state` retries the request.
+    fullscreen_pending: Option<bool>,
+    /// When the fullscreen request was last (re)issued.
+    last_fullscreen_retry: Option<Instant>,
     /// File to open once the window is ready.
     pending_file: Option<String>,
     /// Whether the OS cursor is currently visible.
@@ -59,6 +69,9 @@ pub struct App {
     // ── Screenshots ────────────────────────────────────────────
     shot_dir: PathBuf,
 
+    // ── Seek-preview thumbnails ────────────────────────────────
+    thumb_service: ThumbnailService,
+
     // ── One-shot error logging ─────────────────────────────────
     error_logged: bool,
 }
@@ -74,6 +87,9 @@ impl App {
             last_cursor: None,
             input_seen: false,
             last_input: Instant::now(),
+            fullscreen_sync_until: None,
+            fullscreen_pending: None,
+            last_fullscreen_retry: None,
             pending_file: initial_file,
             cursor_visible: true,
             state: HashMap::new(),
@@ -83,6 +99,7 @@ impl App {
             last_diag_log: Instant::now(),
             last_underruns: 0,
             shot_dir: PathBuf::from("."),
+            thumb_service: ThumbnailService::new(),
             error_logged: false,
         }
     }
@@ -96,17 +113,92 @@ impl App {
         // Playback always starts at 0; the saved position is available via
         // the resume button in the transport bar.
         let _ = self.ctl.apply(Command::Play);
+        // Thumbnails belong to the previous file; drop them immediately.
+        if let Some(ui) = &mut self.ui {
+            ui.clear_thumbnails();
+        }
     }
 
     fn toggle_fullscreen(&mut self) {
         if let Some(w) = &self.window {
-            if w.fullscreen().is_some() {
-                w.set_fullscreen(None);
+            // If a previous toggle hasn't been applied by the compositor
+            // yet, base the new target on the PENDING state, not on
+            // `w.fullscreen()` (which may still report the old state).
+            let want_fullscreen = match self.fullscreen_pending {
+                Some(desired) => !desired,
+                None => w.fullscreen().is_none(),
+            };
+            if want_fullscreen {
+                // Prefer the window's current monitor explicitly; some
+                // compositors treat Borderless(None) as a no-op.
+                w.set_fullscreen(Some(winit::window::Fullscreen::Borderless(
+                    w.current_monitor(),
+                )));
             } else {
-                w.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                w.set_fullscreen(None);
+            }
+            // Remember the desired state so `sync_fullscreen_state` can
+            // retry if the platform ignores/loses the first request, and
+            // keep Polling for a short while until the OS applies it.
+            self.fullscreen_pending = Some(want_fullscreen);
+            self.last_fullscreen_retry = Some(Instant::now());
+            w.request_redraw();
+        }
+        self.fullscreen_sync_until = Some(Instant::now() + Duration::from_millis(800));
+        self.last_input = Instant::now();
+    }
+
+    /// Reconfigure the renderer to the window's actual current size.
+    /// Called every frame; cheap when the size already matches.  This is
+    /// what makes fullscreen transitions robust: even if the platform never
+    /// sends a `Resized` event for `set_fullscreen`, the next frame still
+    /// picks up the new size and clears/redraws at fullscreen dimensions.
+    fn sync_renderer_size(&mut self) {
+        if let (Some(w), Some(r)) = (&self.window, &mut self.renderer) {
+            let s = w.inner_size();
+            let new_size = (s.width.max(1), s.height.max(1));
+            if r.size != new_size {
+                r.resize(new_size.0, new_size.1);
+                r.camera.dirty = true;
+                r.update_camera_uniform();
             }
         }
-        self.last_input = Instant::now();
+    }
+
+    /// If `set_fullscreen` was requested but the window hasn't reached the
+    /// desired state yet (some WSLg/Wayland compositors apply the request
+    /// late or drop it), re-issue the request a few times instead of
+    /// leaving the window in a half-windowed "window print" state.
+    fn sync_fullscreen_state(&mut self) {
+        let Some(desired) = self.fullscreen_pending else {
+            return;
+        };
+        let Some(w) = &self.window else {
+            return;
+        };
+        let actual = w.fullscreen().is_some();
+        if actual == desired {
+            self.fullscreen_pending = None;
+            self.last_fullscreen_retry = None;
+            return;
+        }
+        let should_retry = self
+            .last_fullscreen_retry
+            .map(|t| t.elapsed() >= Duration::from_millis(250))
+            .unwrap_or(true);
+        if should_retry {
+            tracing::debug!(
+                "fullscreen state not reached (desired={desired}, actual={actual}); retrying"
+            );
+            if desired {
+                w.set_fullscreen(Some(winit::window::Fullscreen::Borderless(
+                    w.current_monitor(),
+                )));
+            } else {
+                w.set_fullscreen(None);
+            }
+            self.last_fullscreen_retry = Some(Instant::now());
+        }
     }
 
     fn screenshot(&mut self) {
@@ -343,6 +435,12 @@ impl ApplicationHandler for App {
     fn device_event(&mut self, _el: &ActiveEventLoop, _id: winit::event::DeviceId, _event: winit::event::DeviceEvent) {}
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // Re-sync the surface size before doing anything else.  This is
+        // cheap when nothing changed and is the safety net for fullscreen
+        // transitions whose `Resized` event may arrive late or not at all.
+        self.sync_renderer_size();
+        self.sync_fullscreen_state();
+
         // ── Receive latest video frame ──────────────────────────
         // The upload happens inside render() (after surface acquire),
         // so a failing surface can't leak staging buffers.  The lookahead
@@ -406,6 +504,31 @@ impl ApplicationHandler for App {
         // Treat Ended like paused for UI purposes: playback is over, the
         // transport shows stopped, and the control bars stay visible.
         let ended = matches!(self.ctl.state(), PlaybackState::Ended);
+
+        // ── Thumbnail service results ─────────────────────────────
+        // The service runs on a background thread; this is the only place
+        // where its results enter egui (load_texture must happen on the
+        // render thread).
+        while let Some(result) = self.thumb_service.poll() {
+            match result {
+                Ok(thumb) => {
+                    // A slow decode from the previously open file may
+                    // arrive after the user has opened another one.
+                    if self.ctl.file_path() == Some(thumb.path.as_str())
+                        && let Some(ref mut ui) = self.ui
+                    {
+                        ui.store_thumbnail(
+                            thumb.pos,
+                            thumb.rgba,
+                            thumb.width,
+                            thumb.height,
+                        );
+                    }
+                }
+                Err(e) => tracing::debug!("thumbnail decode failed: {e}"),
+            }
+        }
+
         if let Some(ref mut ui) = self.ui {
             if !seeking {
                 ui.position = self.ctl.position();
@@ -423,6 +546,7 @@ impl ApplicationHandler for App {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default(),
             );
+            ui.set_file_path(self.ctl.file_path().unwrap_or("").to_string());
 
             // Buffering: only right after open/seek (startup grace) while
             // the frame queue is still empty.  During steady playback the
@@ -481,10 +605,17 @@ impl ApplicationHandler for App {
         let mut volume_action: Option<f32> = None;
         let mut fullscreen_action = false;
         let mut resume_action = false;
+        let mut thumb_request: Option<f64> = None;
 
         let renderer = &mut self.renderer;
         if let (Some(w), Some(r), Some(ui)) = (&self.window, renderer, &mut self.ui) {
+            let mode_changed = r.is_360 != ui.is_360;
             r.is_360 = ui.is_360;
+            if mode_changed {
+                // The quad/sphere transform is uploaded lazily; force a
+                // re-upload so the new mode renders with the right matrix.
+                r.camera.dirty = true;
+            }
             ui.is_fullscreen = fullscreen;
             ui.ui_visible = ui_visible;
 
@@ -511,6 +642,7 @@ impl ApplicationHandler for App {
                 ui.volume_changed = false;
                 volume_action = Some(ui.volume);
             }
+            thumb_request = ui.thumbnail_request.take();
             if ui.playing == paused {
                 pause_action = true;
             }
@@ -520,9 +652,18 @@ impl ApplicationHandler for App {
             // repaint, or a fresh frame all keep the loop at Poll; a
             // static paused screen drops to Wait and renders on
             // demand (near-zero CPU).
+            let fullscreen_syncing = self
+                .fullscreen_sync_until
+                .map(|t| t > Instant::now())
+                .unwrap_or(false)
+                || self.fullscreen_pending.is_some();
+            if self.fullscreen_sync_until.is_none_or(|t| t <= Instant::now()) {
+                self.fullscreen_sync_until = None;
+            }
             let interactive = self.input_seen
                 || self.dragging
                 || ui.seeking
+                || fullscreen_syncing
                 || r.egui_state.egui_ctx().has_requested_repaint();
             // Ended (like paused) drops the loop to Wait.  The old
             // position-based `at_end` heuristic is gone — the controller
@@ -587,6 +728,16 @@ impl ApplicationHandler for App {
         }
         if let Some(vol) = volume_action {
             let _ = self.ctl.apply(Command::SetVolume(vol));
+        }
+        if let Some(pos) = thumb_request
+            && let Some(path) = self.ctl.file_path()
+        {
+            self.thumb_service.request(
+                path.to_string(),
+                pos,
+                THUMB_MAX_W,
+                THUMB_MAX_H,
+            );
         }
 
         // ── Persist resume position + periodic diagnostics ──────

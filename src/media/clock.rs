@@ -32,6 +32,12 @@ pub struct MediaClock {
     audio_base_pos: f64,
 }
 
+impl Default for MediaClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MediaClock {
     pub fn new() -> Self {
         Self {

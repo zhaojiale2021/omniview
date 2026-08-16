@@ -10,6 +10,12 @@ pub struct OrbitCamera {
     pub dirty: bool,
 }
 
+impl Default for OrbitCamera {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OrbitCamera {
     pub fn new() -> Self {
         Self { yaw: 0.0, pitch: 0.0, fov: 90.0, dirty: true }
