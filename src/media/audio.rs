@@ -573,7 +573,15 @@ fn decode_audio_packets(
             // options and setting them after graph.add() fails with warnings.
             // atempo passes the input format through, and the swr resampler is
             // built from the actual frames, so no sink configuration is needed.
-            let spec = format!("atempo={speed}");
+            //
+            // FFmpeg's atempo accepts tempo in [0.5, 100].  For slower speeds
+            // (0.25×) chain two equal factors, each >= 0.5.
+            let spec = if speed < 0.5 {
+                let f = speed.sqrt();
+                format!("atempo={f:.6},atempo={f:.6}")
+            } else {
+                format!("atempo={speed}")
+            };
             graph
                 .output("in", 0)
                 .map_err(|e| format!("output in: {e}"))?
@@ -960,6 +968,34 @@ mod tests {
         );
 
         let _ = cmd_tx.send(AudioCmd::Stop);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn atempo_quarter_speed_stretches_audio() {
+        // FFmpeg's atempo min is 0.5; 0.25x is implemented by chaining two
+        // 0.5 factors.  Verify the graph builds and output is stretched ~4x
+        // (3s of stereo 48kHz -> ~1.15M samples instead of ~288k).
+        let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCmd>();
+        let _ = cmd_tx.send(AudioCmd::Speed(0.25));
+        let produced: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+        let produced_sink = produced.clone();
+        let sink = move |samples: &[f32]| {
+            *produced_sink.lock().unwrap() += samples.len() as u64;
+        };
+        let handle = thread::spawn(move || {
+            let _ = decode_audio_packets("/tmp/test_av.mp4", cmd_rx, 48000, 2, 0.0, sink);
+        });
+        let dl = std::time::Instant::now() + Duration::from_secs(10);
+        while !handle.is_finished() && std::time::Instant::now() < dl {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let total = *produced.lock().unwrap();
+        assert!(
+            total > 600_000,
+            "0.25x tempo should stretch 3s audio to ~12s (got {total} samples)"
+        );
+        drop(cmd_tx);
         let _ = handle.join();
     }
 
