@@ -9,7 +9,9 @@ fn main() {
         let t0 = Instant::now();
         let mut d = omniview::media::demux::Demux::open(&path, pos);
         let _info = loop {
-            if let Some(r) = d.poll_ready() { break r.unwrap(); }
+            if let Some(r) = d.poll_ready() {
+                break r.unwrap();
+            }
             std::thread::sleep(std::time::Duration::from_millis(2));
         };
         let probe_ms = t0.elapsed().as_millis();
@@ -22,18 +24,25 @@ fn main() {
         let deadline = Instant::now() + std::time::Duration::from_secs(3);
         while got < 3 && Instant::now() < deadline {
             match v_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                Ok(p) => { first_pkts.push(p); got += 1; }
+                Ok(p) => {
+                    first_pkts.push(p);
+                    got += 1;
+                }
                 Err(_) => break,
             }
         }
         // decode the time base from stream best guess: compute from dts if available
-        let secs: Vec<String> = first_pkts.iter().map(|p| {
-            match p.dts() {
+        let secs: Vec<String> = first_pkts
+            .iter()
+            .map(|p| match p.dts() {
                 Some(dts) => format!("{dts}"),
                 None => "none".into(),
-            }
-        }).collect();
-        println!("seek {pos:>5.1}s: probe={probe_ms} ms, first video pkts dts={secs:?} (got={got}, read={} ms)", t1.elapsed().as_millis());
+            })
+            .collect();
+        println!(
+            "seek {pos:>5.1}s: probe={probe_ms} ms, first video pkts dts={secs:?} (got={got}, read={} ms)",
+            t1.elapsed().as_millis()
+        );
         d.stop();
     }
 }

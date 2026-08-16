@@ -76,14 +76,7 @@ impl Demux {
 
         let p = path.to_string();
         let handle = thread::spawn(move || {
-            demux_loop(
-                &p,
-                start_pos,
-                ready_tx,
-                video_pkt_tx,
-                cmd_rx,
-                eof_tx,
-            );
+            demux_loop(&p, start_pos, ready_tx, video_pkt_tx, cmd_rx, eof_tx);
         });
 
         Demux {
@@ -168,9 +161,8 @@ fn demux_loop(
         } else {
             0.0
         };
-        let dur = vs.duration() as f64
-            * time_base.numerator() as f64
-            / time_base.denominator() as f64;
+        let dur =
+            vs.duration() as f64 * time_base.numerator() as f64 / time_base.denominator() as f64;
 
         // Open decoder briefly to get width/height.
         let ctx = match ffmpeg::codec::context::Context::from_parameters(vs.parameters()) {
@@ -282,11 +274,8 @@ fn demux_loop(
         }
         routed_video += 1;
 
-
         if route_log.elapsed().as_secs() >= 5 {
-            tracing::info!(
-                "Demux routing: video={routed_video} (read_errors={read_errors})"
-            );
+            tracing::info!("Demux routing: video={routed_video} (read_errors={read_errors})");
             route_log = std::time::Instant::now();
         }
     }

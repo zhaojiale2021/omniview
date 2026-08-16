@@ -12,7 +12,7 @@ use winit::{
 };
 
 use crate::media::playback::PlaybackController;
-use crate::media::thumb::{ThumbnailService, THUMB_MAX_H, THUMB_MAX_W};
+use crate::media::thumb::{THUMB_MAX_H, THUMB_MAX_W, ThumbnailService};
 use crate::media::types::{Command, PlaybackState, VideoFrame};
 use crate::renderer::Renderer;
 use crate::ui::PlayerUI;
@@ -218,10 +218,11 @@ impl App {
 
     fn load_state(&mut self) {
         if let Ok(s) = std::fs::read_to_string(&self.state_path)
-            && let Ok(map) = serde_json::from_str::<HashMap<String, f64>>(&s) {
-                self.state = map;
-                tracing::info!("Loaded {} resume positions", self.state.len());
-            }
+            && let Ok(map) = serde_json::from_str::<HashMap<String, f64>>(&s)
+        {
+            self.state = map;
+            tracing::info!("Loaded {} resume positions", self.state.len());
+        }
     }
 
     /// Persist the current playback position so the next session can
@@ -305,15 +306,21 @@ impl ApplicationHandler for App {
 
         // ── Resize ─────────────────────────────────────────────
         if let WindowEvent::Resized(s) = &event
-            && let Some(r) = &mut self.renderer {
-                r.resize(s.width, s.height);
-                // Aspect ratio changed — force a uniform refresh.
-                r.camera.dirty = true;
-                r.update_camera_uniform();
-            }
+            && let Some(r) = &mut self.renderer
+        {
+            r.resize(s.width, s.height);
+            // Aspect ratio changed — force a uniform refresh.
+            r.camera.dirty = true;
+            r.update_camera_uniform();
+        }
 
         // ── Mouse input BEFORE egui (so drag works even over UI) ──
-        if let WindowEvent::MouseInput { state, button: MouseButton::Left, .. } = &event {
+        if let WindowEvent::MouseInput {
+            state,
+            button: MouseButton::Left,
+            ..
+        } = &event
+        {
             self.dragging = *state == ElementState::Pressed;
             if !self.dragging {
                 self.last_cursor = None;
@@ -324,32 +331,35 @@ impl ApplicationHandler for App {
         if let WindowEvent::CursorMoved { position, .. } = &event {
             if self.dragging
                 && let Some(r) = &mut self.renderer
-                    && r.is_360 {
-                        let dx = position.x - self.last_cursor.map(|p| p.x).unwrap_or(position.x);
-                        let dy = position.y - self.last_cursor.map(|p| p.y).unwrap_or(position.y);
-                        r.camera.handle_mouse(dx, dy, r.size.0 as f64);
-                        r.update_camera_uniform();
-                    }
+                && r.is_360
+            {
+                let dx = position.x - self.last_cursor.map(|p| p.x).unwrap_or(position.x);
+                let dy = position.y - self.last_cursor.map(|p| p.y).unwrap_or(position.y);
+                r.camera.handle_mouse(dx, dy, r.size.0 as f64);
+                r.update_camera_uniform();
+            }
             self.last_cursor = Some(*position);
         }
 
         // ── Mouse wheel = zoom (360 mode) ──────────────────────
         if let WindowEvent::MouseWheel { delta, .. } = &event
             && let Some(r) = &mut self.renderer
-                && r.is_360 {
-                    let d = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => *y,
-                        MouseScrollDelta::PixelDelta(p) => p.y as f32 / 50.0,
-                    };
-                    r.camera.handle_scroll(d);
-                    r.update_camera_uniform();
-                }
+            && r.is_360
+        {
+            let d = match delta {
+                MouseScrollDelta::LineDelta(_, y) => *y,
+                MouseScrollDelta::PixelDelta(p) => p.y as f32 / 50.0,
+            };
+            r.camera.handle_scroll(d);
+            r.update_camera_uniform();
+        }
 
         // ── Drag & drop a video file onto the window ───────────
         if let WindowEvent::DroppedFile(p) = &event
-            && let Some(s) = p.to_str() {
-                self.open_file(s);
-            }
+            && let Some(s) = p.to_str()
+        {
+            self.open_file(s);
+        }
 
         // ── egui input ─────────────────────────────────────────
         let consumed = if let (Some(w), Some(r)) = (&self.window, &mut self.renderer) {
@@ -364,75 +374,98 @@ impl ApplicationHandler for App {
 
         // ── Keyboard shortcuts ─────────────────────────────────
         if let WindowEvent::KeyboardInput {
-                event: KeyEvent { physical_key: PhysicalKey::Code(kc), state: ElementState::Pressed, .. },
-                ..
-            } = event { match kc {
-            KeyCode::KeyO => {
-                if let Some(p) = rfd::FileDialog::new()
-                    .add_filter("Video", &["mp4", "webm", "mkv", "avi", "mov", "m4v"])
-                    .pick_file()
-                {
-                    self.open_file(&p.to_string_lossy());
+            event:
+                KeyEvent {
+                    physical_key: PhysicalKey::Code(kc),
+                    state: ElementState::Pressed,
+                    ..
+                },
+            ..
+        } = event
+        {
+            match kc {
+                KeyCode::KeyO => {
+                    if let Some(p) = rfd::FileDialog::new()
+                        .add_filter("Video", &["mp4", "webm", "mkv", "avi", "mov", "m4v"])
+                        .pick_file()
+                    {
+                        self.open_file(&p.to_string_lossy());
+                    }
                 }
-            }
-            KeyCode::Space => {
-                let _ = self.ctl.apply(Command::Toggle);
-            }
-            KeyCode::KeyF => {
-                self.toggle_fullscreen();
-            }
-            KeyCode::KeyR => {
-                if let Some(r) = &mut self.renderer {
-                    r.camera.reset();
-                    r.update_camera_uniform();
+                KeyCode::Space => {
+                    let _ = self.ctl.apply(Command::Toggle);
                 }
-            }
-            KeyCode::KeyS => {
-                self.screenshot();
-            }
-            KeyCode::KeyM => {
-                if let Some(ref mut ui) = self.ui {
-                    ui.mute_clicked = true;
-                }
-            }
-            KeyCode::ArrowLeft => {
-                let pos = (self.ctl.position() - SEEK_STEP).clamp(0.0, self.ctl.duration());
-                let _ = self.ctl.apply(Command::Seek(pos));
-            }
-            KeyCode::ArrowRight => {
-                let pos = (self.ctl.position() + SEEK_STEP).clamp(0.0, self.ctl.duration());
-                let _ = self.ctl.apply(Command::Seek(pos));
-            }
-            KeyCode::ArrowUp => {
-                let v = (self.ctl.volume() + VOLUME_STEP).min(1.0);
-                let _ = self.ctl.apply(Command::SetVolume(v));
-                if let Some(ref mut ui) = self.ui {
-                    ui.volume = v;
-                    if v > 0.0 { ui.muted = false; }
-                }
-            }
-            KeyCode::ArrowDown => {
-                let v = (self.ctl.volume() - VOLUME_STEP).max(0.0);
-                let _ = self.ctl.apply(Command::SetVolume(v));
-                if let Some(ref mut ui) = self.ui {
-                    ui.volume = v;
-                    if v <= 0.001 { ui.muted = true; }
-                }
-            }
-            KeyCode::Escape => {
-                // Exit fullscreen first; a second Escape quits.
-                if self.window.as_ref().map(|w| w.fullscreen().is_some()).unwrap_or(false) {
+                KeyCode::KeyF => {
                     self.toggle_fullscreen();
-                } else {
-                    self.save_state();
-                    event_loop.exit();
                 }
+                KeyCode::KeyR => {
+                    if let Some(r) = &mut self.renderer {
+                        r.camera.reset();
+                        r.update_camera_uniform();
+                    }
+                }
+                KeyCode::KeyS => {
+                    self.screenshot();
+                }
+                KeyCode::KeyM => {
+                    if let Some(ref mut ui) = self.ui {
+                        ui.mute_clicked = true;
+                    }
+                }
+                KeyCode::ArrowLeft => {
+                    let pos = (self.ctl.position() - SEEK_STEP).clamp(0.0, self.ctl.duration());
+                    let _ = self.ctl.apply(Command::Seek(pos));
+                }
+                KeyCode::ArrowRight => {
+                    let pos = (self.ctl.position() + SEEK_STEP).clamp(0.0, self.ctl.duration());
+                    let _ = self.ctl.apply(Command::Seek(pos));
+                }
+                KeyCode::ArrowUp => {
+                    let v = (self.ctl.volume() + VOLUME_STEP).min(1.0);
+                    let _ = self.ctl.apply(Command::SetVolume(v));
+                    if let Some(ref mut ui) = self.ui {
+                        ui.volume = v;
+                        if v > 0.0 {
+                            ui.muted = false;
+                        }
+                    }
+                }
+                KeyCode::ArrowDown => {
+                    let v = (self.ctl.volume() - VOLUME_STEP).max(0.0);
+                    let _ = self.ctl.apply(Command::SetVolume(v));
+                    if let Some(ref mut ui) = self.ui {
+                        ui.volume = v;
+                        if v <= 0.001 {
+                            ui.muted = true;
+                        }
+                    }
+                }
+                KeyCode::Escape => {
+                    // Exit fullscreen first; a second Escape quits.
+                    if self
+                        .window
+                        .as_ref()
+                        .map(|w| w.fullscreen().is_some())
+                        .unwrap_or(false)
+                    {
+                        self.toggle_fullscreen();
+                    } else {
+                        self.save_state();
+                        event_loop.exit();
+                    }
+                }
+                _ => {}
             }
-            _ => {}
-        } }
+        }
     }
 
-    fn device_event(&mut self, _el: &ActiveEventLoop, _id: winit::event::DeviceId, _event: winit::event::DeviceEvent) {}
+    fn device_event(
+        &mut self,
+        _el: &ActiveEventLoop,
+        _id: winit::event::DeviceId,
+        _event: winit::event::DeviceEvent,
+    ) {
+    }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         // Re-sync the surface size before doing anything else.  This is
@@ -451,9 +484,8 @@ impl ApplicationHandler for App {
             .as_ref()
             .map(|r| r.next_vsync_in())
             .unwrap_or(1.0 / 60.0);
-        let mut frame: Option<VideoFrame> = self
-            .ctl
-            .next_video_frame(vsync_ahead * self.ctl.speed());
+        let mut frame: Option<VideoFrame> =
+            self.ctl.next_video_frame(vsync_ahead * self.ctl.speed());
         let frame_uploaded = frame.is_some();
 
         // ── Stutter diagnostics (periodic, throttled) ─────────────
@@ -488,9 +520,7 @@ impl ApplicationHandler for App {
             && !self.ctl.startup_grace()
             && self.last_diag_log.elapsed() > Duration::from_secs(10)
         {
-            tracing::warn!(
-                "video starvation: no frame and empty queue while playing"
-            );
+            tracing::warn!("video starvation: no frame and empty queue while playing");
             self.last_diag_log = Instant::now();
         }
 
@@ -517,12 +547,7 @@ impl ApplicationHandler for App {
                     if self.ctl.file_path() == Some(thumb.path.as_str())
                         && let Some(ref mut ui) = self.ui
                     {
-                        ui.store_thumbnail(
-                            thumb.pos,
-                            thumb.rgba,
-                            thumb.width,
-                            thumb.height,
-                        );
+                        ui.store_thumbnail(thumb.pos, thumb.rgba, thumb.width, thumb.height);
                     }
                 }
                 Err(e) => tracing::debug!("thumbnail decode failed: {e}"),
@@ -622,8 +647,10 @@ impl ApplicationHandler for App {
             let raw = r.egui_state.take_egui_input(w);
             r.egui_state.egui_ctx().begin_pass(raw);
             let out = ui.update();
-            r.egui_state.handle_platform_output(w, out.platform_output.clone());
-            let prims = r.egui_state
+            r.egui_state
+                .handle_platform_output(w, out.platform_output.clone());
+            let prims = r
+                .egui_state
                 .egui_ctx()
                 .tessellate(out.shapes.clone(), out.pixels_per_point);
 
@@ -657,7 +684,10 @@ impl ApplicationHandler for App {
                 .map(|t| t > Instant::now())
                 .unwrap_or(false)
                 || self.fullscreen_pending.is_some();
-            if self.fullscreen_sync_until.is_none_or(|t| t <= Instant::now()) {
+            if self
+                .fullscreen_sync_until
+                .is_none_or(|t| t <= Instant::now())
+            {
                 self.fullscreen_sync_until = None;
             }
             let interactive = self.input_seen
@@ -670,7 +700,12 @@ impl ApplicationHandler for App {
             // now reports Ended itself when the demuxer reaches EOF.
             if !paused || interactive || frame_uploaded {
                 _event_loop.set_control_flow(ControlFlow::Poll);
-                if let Err(e) = r.render(&prims, &out.textures_delta, out.pixels_per_point, frame.take()) {
+                if let Err(e) = r.render(
+                    &prims,
+                    &out.textures_delta,
+                    out.pixels_per_point,
+                    frame.take(),
+                ) {
                     match e {
                         wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
                             let s = r.size;
@@ -684,16 +719,17 @@ impl ApplicationHandler for App {
                 _event_loop.set_control_flow(ControlFlow::Wait);
             }
         } else if let Some(r) = &mut self.renderer
-            && let Err(e) = r.render(&[], &egui::TexturesDelta::default(), 1.0, None) {
-                match e {
-                    wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
-                        let s = r.size;
-                        r.resize(s.0, s.1);
-                    }
-                    wgpu::SurfaceError::OutOfMemory => {}
-                    wgpu::SurfaceError::Timeout => {}
+            && let Err(e) = r.render(&[], &egui::TexturesDelta::default(), 1.0, None)
+        {
+            match e {
+                wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
+                    let s = r.size;
+                    r.resize(s.0, s.1);
                 }
+                wgpu::SurfaceError::OutOfMemory => {}
+                wgpu::SurfaceError::Timeout => {}
             }
+        }
 
         self.input_seen = false;
 
@@ -702,9 +738,9 @@ impl ApplicationHandler for App {
             && let Some(p) = rfd::FileDialog::new()
                 .add_filter("Video", &["mp4", "webm", "mkv", "avi", "mov", "m4v"])
                 .pick_file()
-            {
-                self.open_file(&p.to_string_lossy());
-            }
+        {
+            self.open_file(&p.to_string_lossy());
+        }
         if fullscreen_action {
             self.toggle_fullscreen();
         }
@@ -713,10 +749,10 @@ impl ApplicationHandler for App {
                 .ctl
                 .file_path()
                 .and_then(|p| self.state.get(p).copied())
-            {
-                let _ = self.ctl.apply(Command::Seek(pos));
-                let _ = self.ctl.apply(Command::Play);
-            }
+        {
+            let _ = self.ctl.apply(Command::Seek(pos));
+            let _ = self.ctl.apply(Command::Play);
+        }
         if let Some(pos) = seek_action {
             let _ = self.ctl.apply(Command::Seek(pos));
         }
@@ -732,12 +768,8 @@ impl ApplicationHandler for App {
         if let Some(pos) = thumb_request
             && let Some(path) = self.ctl.file_path()
         {
-            self.thumb_service.request(
-                path.to_string(),
-                pos,
-                THUMB_MAX_W,
-                THUMB_MAX_H,
-            );
+            self.thumb_service
+                .request(path.to_string(), pos, THUMB_MAX_W, THUMB_MAX_H);
         }
 
         // ── Persist resume position + periodic diagnostics ──────

@@ -20,10 +20,9 @@ fn main() {
         .unwrap_or_else(|| std::path::PathBuf::from("player.log"));
     // Default filter: our own info logs, but keep wgpu/egui internals at
     // warn so the log file isn't flooded with per-frame maintain noise.
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| {
-            "info,omniview=info,wgpu_core=warn,wgpu_hal=warn,egui_wgpu=warn".into()
-        });
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        "info,omniview=info,wgpu_core=warn,wgpu_hal=warn,egui_wgpu=warn".into()
+    });
     match std::fs::File::create(&log_path) {
         Ok(f) => {
             tracing_subscriber::registry()
@@ -38,9 +37,7 @@ fn main() {
         }
         Err(e) => {
             eprintln!("warning: cannot open player.log: {e}");
-            tracing_subscriber::fmt()
-                .with_env_filter(env_filter)
-                .init();
+            tracing_subscriber::fmt().with_env_filter(env_filter).init();
         }
     }
 

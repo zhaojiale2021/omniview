@@ -17,9 +17,26 @@ if [ -z "$FFBUILD" ]; then
 fi
 BIN="$FFBUILD/bin"
 
+# Auto-detect the MinGW header directories for bindgen.  GitHub Actions
+# runners may have a different gcc version than a local WSL install, so do
+# not hardcode "13-posix".
+MINGW_GCC_DIR="$(ls -d /usr/lib/gcc/x86_64-w64-mingw32/*posix 2>/dev/null | sort -V | tail -1 || true)"
+MINGW_SYS_INCLUDE="/usr/x86_64-w64-mingw32/include"
+BINDGEN_INCLUDES=""
+if [ -n "$MINGW_GCC_DIR" ] && [ -d "$MINGW_GCC_DIR/include" ]; then
+    BINDGEN_INCLUDES="$BINDGEN_INCLUDES -I$MINGW_GCC_DIR/include"
+fi
+if [ -d "$MINGW_SYS_INCLUDE" ]; then
+    BINDGEN_INCLUDES="$BINDGEN_INCLUDES -I$MINGW_SYS_INCLUDE"
+fi
+if [ -z "$BINDGEN_INCLUDES" ]; then
+    echo "ERROR: could not detect MinGW header directories" >&2
+    exit 1
+fi
+
 # Link against the BtbN mingw FFmpeg import libs.
 FFMPEG_DIR="$PWD/$FFBUILD" \
-BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu="-I/usr/lib/gcc/x86_64-w64-mingw32/13-posix/include" \
+BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu="$BINDGEN_INCLUDES" \
 cargo build --release --target x86_64-pc-windows-gnu
 
 REL="target/x86_64-pc-windows-gnu/release"
@@ -32,4 +49,3 @@ echo "Staged $(ls "$BIN"/*.dll | wc -l) runtime FFmpeg DLLs from $BIN"
 
 echo
 echo "Built: $REL/omniview.exe ($(du -h "$REL/omniview.exe" | cut -f1))"
-

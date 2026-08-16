@@ -18,12 +18,22 @@ impl Default for OrbitCamera {
 
 impl OrbitCamera {
     pub fn new() -> Self {
-        Self { yaw: 0.0, pitch: 0.0, fov: 90.0, dirty: true }
+        Self {
+            yaw: 0.0,
+            pitch: 0.0,
+            fov: 90.0,
+            dirty: true,
+        }
     }
 
     pub fn view_proj_matrix(&self, aspect: f32) -> [[f32; 4]; 4] {
         let proj = Mat4::perspective_rh(self.fov.to_radians(), aspect, 0.1, 100.0);
-        let view = Mat4::from_euler(glam::EulerRot::YXZ, self.yaw.to_radians(), self.pitch.to_radians(), 0.0);
+        let view = Mat4::from_euler(
+            glam::EulerRot::YXZ,
+            self.yaw.to_radians(),
+            self.pitch.to_radians(),
+            0.0,
+        );
         (proj * view).to_cols_array_2d()
     }
 

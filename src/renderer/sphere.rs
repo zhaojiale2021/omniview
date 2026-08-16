@@ -62,8 +62,12 @@ impl Sphere {
                 let first = i * (sectors + 1) + j;
                 let second = first + sectors + 1;
                 indices.extend_from_slice(&[
-                    first, second, (first + 1),
-                    second, (second + 1), (first + 1),
+                    first,
+                    second,
+                    (first + 1),
+                    second,
+                    (second + 1),
+                    (first + 1),
                 ]);
             }
         }
@@ -78,6 +82,10 @@ impl Sphere {
             contents: bytemuck::cast_slice(&indices),
             usage: wgpu::BufferUsages::INDEX,
         });
-        Self { vertex_buffer, index_buffer, index_count: indices.len() as u32 }
+        Self {
+            vertex_buffer,
+            index_buffer,
+            index_count: indices.len() as u32,
+        }
     }
 }

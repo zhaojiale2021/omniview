@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use cpal::traits::HostTrait;
 
-use crate::media::audio::{spawn_audio_actor, AudioHandle};
+use crate::media::audio::{AudioHandle, spawn_audio_actor};
 use crate::media::clock::MediaClock;
 use crate::media::demux::Demux;
 use crate::media::types::{Command, PlaybackState, VideoFrame};
@@ -345,8 +345,7 @@ impl PlaybackController {
                 Err(TryRecvError::Disconnected) => {
                     self.pending = None;
                     if matches!(self.state, PlaybackState::Loading | PlaybackState::Seeking) {
-                        self.state =
-                            PlaybackState::Error("pipeline worker died".to_string());
+                        self.state = PlaybackState::Error("pipeline worker died".to_string());
                     }
                     return;
                 }
@@ -546,7 +545,7 @@ impl PlaybackController {
         }
         if let Some(pipeline) = &self.pipeline
             && let Some(demux) = &pipeline.demux
-                && demux.poll_eof()
+            && demux.poll_eof()
         {
             self.eof_seen = true;
         }
@@ -588,9 +587,7 @@ impl PlaybackController {
                 self.pending_play = true;
                 return Ok(());
             }
-            PlaybackState::Ready
-            | PlaybackState::Paused
-            | PlaybackState::Playing => {} // Playing: re-anchor clock, no-op otherwise
+            PlaybackState::Ready | PlaybackState::Paused | PlaybackState::Playing => {} // Playing: re-anchor clock, no-op otherwise
             PlaybackState::Ended => {
                 // Play after EOF restarts the media from the beginning.
                 let path = self
@@ -836,7 +833,10 @@ mod tests {
                 thread::sleep(Duration::from_millis(20));
             }
         }
-        assert!(frame.is_some(), "must receive at least one video frame within 5s");
+        assert!(
+            frame.is_some(),
+            "must receive at least one video frame within 5s"
+        );
 
         // ── Pause → position freezes ──────────────────────────────
         ctl.apply(Command::Pause).unwrap();

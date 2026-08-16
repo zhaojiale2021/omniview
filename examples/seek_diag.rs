@@ -15,7 +15,11 @@ fn main() {
     // ── Open timing ────────────────────────────────────────────────
     let t0 = Instant::now();
     ctl.apply(Command::Open(path.clone())).unwrap();
-    println!("OPEN took {:.1} ms (state={:?})", t0.elapsed().as_millis(), ctl.state());
+    println!(
+        "OPEN took {:.1} ms (state={:?})",
+        t0.elapsed().as_millis(),
+        ctl.state()
+    );
     println!("duration={:.1}s", ctl.duration());
 
     // ── First frame latency after Play ─────────────────────────────
@@ -25,7 +29,11 @@ fn main() {
     while first.is_none() && t1.elapsed().as_secs() < 10 {
         if let Some(f) = ctl.next_video_frame(1.0 / 60.0) {
             first = Some(f.pts_secs);
-            println!("FIRST frame after play: pts={:.3}s, latency={:.1} ms", f.pts_secs, t1.elapsed().as_millis());
+            println!(
+                "FIRST frame after play: pts={:.3}s, latency={:.1} ms",
+                f.pts_secs,
+                t1.elapsed().as_millis()
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }

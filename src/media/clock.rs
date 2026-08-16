@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Lightweight handle to the audio output's monotonic sample counter.
@@ -63,7 +63,11 @@ impl MediaClock {
     ) {
         let base_samples = samples_played.load(Ordering::Relaxed);
         let base_pos = self.position();
-        self.audio_clock = Some(AudioClockRef { samples_played, sample_rate, channels });
+        self.audio_clock = Some(AudioClockRef {
+            samples_played,
+            sample_rate,
+            channels,
+        });
         self.audio_base_samples = base_samples;
         self.audio_base_pos = base_pos;
     }

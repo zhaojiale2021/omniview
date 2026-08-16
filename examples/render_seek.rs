@@ -92,7 +92,9 @@ impl ApplicationHandler for Harness {
             _ => {}
         }
 
-        let (Some(r), Some(_w)) = (&mut self.renderer, &self.window) else { return };
+        let (Some(r), Some(_w)) = (&mut self.renderer, &self.window) else {
+            return;
+        };
         let lookahead = r.next_vsync_in();
         let frame = self.ctl.next_video_frame(lookahead * self.ctl.speed());
 

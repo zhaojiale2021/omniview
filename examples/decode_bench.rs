@@ -35,9 +35,8 @@ fn main() {
     } else {
         30.0
     };
-    let duration = stream.duration() as f64
-        * time_base.numerator() as f64
-        / time_base.denominator() as f64;
+    let duration =
+        stream.duration() as f64 * time_base.numerator() as f64 / time_base.denominator() as f64;
 
     let ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
         .expect("codec context");
@@ -84,11 +83,12 @@ fn main() {
         let mut decoded = frame::Video::empty();
         while decoder.receive_frame(&mut decoded).is_ok() {
             if let Some(sc) = scaler.as_mut()
-                && sc.run(&decoded, &mut out).is_ok() {
-                    for p in 0..out.planes() {
-                        bytes += out.data(p).len() as u64;
-                    }
+                && sc.run(&decoded, &mut out).is_ok()
+            {
+                for p in 0..out.planes() {
+                    bytes += out.data(p).len() as u64;
                 }
+            }
             frames += 1;
         }
 
@@ -107,11 +107,12 @@ fn main() {
     let mut decoded = frame::Video::empty();
     while decoder.receive_frame(&mut decoded).is_ok() {
         if let Some(sc) = scaler.as_mut()
-            && sc.run(&decoded, &mut out).is_ok() {
-                for p in 0..out.planes() {
-                    bytes += out.data(p).len() as u64;
-                }
+            && sc.run(&decoded, &mut out).is_ok()
+        {
+            for p in 0..out.planes() {
+                bytes += out.data(p).len() as u64;
             }
+        }
         frames += 1;
     }
 

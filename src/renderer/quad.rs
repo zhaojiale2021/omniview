@@ -38,10 +38,22 @@ impl Quad {
     /// Fullscreen quad in NDC space (-1..1).
     pub fn new(device: &wgpu::Device) -> Self {
         let vertices = vec![
-            QuadVertex { position: [-1.0, -1.0], uv: [0.0, 1.0] }, // bottom-left
-            QuadVertex { position: [1.0, -1.0], uv: [1.0, 1.0] },   // bottom-right
-            QuadVertex { position: [-1.0, 1.0], uv: [0.0, 0.0] },   // top-left
-            QuadVertex { position: [1.0, 1.0], uv: [1.0, 0.0] },     // top-right
+            QuadVertex {
+                position: [-1.0, -1.0],
+                uv: [0.0, 1.0],
+            }, // bottom-left
+            QuadVertex {
+                position: [1.0, -1.0],
+                uv: [1.0, 1.0],
+            }, // bottom-right
+            QuadVertex {
+                position: [-1.0, 1.0],
+                uv: [0.0, 0.0],
+            }, // top-left
+            QuadVertex {
+                position: [1.0, 1.0],
+                uv: [1.0, 0.0],
+            }, // top-right
         ];
         let indices: [u32; 6] = [0, 1, 2, 1, 3, 2];
 
@@ -55,6 +67,10 @@ impl Quad {
             contents: bytemuck::cast_slice(&indices),
             usage: wgpu::BufferUsages::INDEX,
         });
-        Self { vertex_buffer, index_buffer, index_count: indices.len() as u32 }
+        Self {
+            vertex_buffer,
+            index_buffer,
+            index_count: indices.len() as u32,
+        }
     }
 }

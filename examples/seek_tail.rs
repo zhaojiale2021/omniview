@@ -1,6 +1,6 @@
-use std::time::Instant;
 use omniview::media::playback::PlaybackController;
 use omniview::media::types::Command;
+use std::time::Instant;
 
 fn main() {
     let path = std::env::args().nth(1).expect("usage: seek_tail <file>");

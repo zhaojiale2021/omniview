@@ -8,15 +8,15 @@
 //! Volume is applied in the cpal output callback via shared state.
 
 use std::collections::VecDeque;
-use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, StreamTrait};
+use ffmpeg::{channel_layout::ChannelLayout, codec, error, filter, format, frame, media, software};
 use ffmpeg_next as ffmpeg;
-use ffmpeg::{channel_layout::ChannelLayout, codec, filter, format, frame, media, software, error};
 
 /// Send handle to the audio actor thread.  The actor owns the cpal output
 /// stream (cpal streams are !Send, so they live on the thread that built
@@ -148,10 +148,7 @@ pub fn spawn_audio_actor(
 
 impl AudioHandle {
     /// Wrap the pieces returned by a successful `spawn_audio_actor`.
-    pub fn new(
-        cmd_tx: mpsc::Sender<AudioCmd>,
-        ready: AudioReady,
-    ) -> Self {
+    pub fn new(cmd_tx: mpsc::Sender<AudioCmd>, ready: AudioReady) -> Self {
         let ring = ready.shared.buffer.clone();
         Self {
             samples_played: ready.samples_played,
@@ -223,11 +220,7 @@ impl AudioPipeline {
     ///
     /// Returns the packet receiver back on failure so the caller can keep the
     /// demux alive (e.g. by spawning a discard-drain thread for video-only).
-    pub fn start(
-        path: &str,
-        dev: &cpal::Device,
-        start_pos: f64,
-    ) -> Result<Self, String> {
+    pub fn start(path: &str, dev: &cpal::Device, start_pos: f64) -> Result<Self, String> {
         let dev_name = dev.name().unwrap_or_else(|_| "?".into());
 
         // ── Shared state ──────────────────────────────────────────
@@ -243,58 +236,57 @@ impl AudioPipeline {
         });
 
         // ── cpal output stream ────────────────────────────────────
-        let build_stream =
-            |rate: u32, ch: u16, sh: Arc<Shared>| -> Result<cpal::Stream, String> {
-                let cfg = cpal::StreamConfig {
-                    channels: ch,
-                    sample_rate: cpal::SampleRate(rate),
-                    buffer_size: cpal::BufferSize::Default,
-                };
-                dev.build_output_stream(
-                    &cfg,
-                    move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
-                        // NEVER panic in the callback.
-                        if sh.paused.load(Ordering::Relaxed) {
-                            data.fill(0.0);
-                            return; // do NOT advance samples_played — pause freezes the master clock
-                        }
-                        let vol = sh.volume.lock().map(|v| *v).unwrap_or(1.0);
-                        match sh.buffer.lock() {
-                            Ok(mut buf) => {
-                                // Advance the master clock only for REAL
-                                // samples popped from the ring buffer, NOT
-                                // for zero-fill silence played while the
-                                // buffer is still filling (startup underflow)
-                                // or mid-stream.  Counting `data.len()` makes
-                                // the clock run ahead of the audible track by
-                                // the buffer latency, permanently.
-                                //
-                                // Pop available samples in one batch and
-                                // apply volume in a single pass instead of a
-                                // per-sample lock-and-pop loop.
-                                let take = data.len().min(buf.len());
-                                for (i, s) in buf.drain(..take).enumerate() {
-                                    data[i] = s * vol;
-                                }
-                                let real = take as u64;
-                                for s in &mut data[take..] {
-                                    *s = 0.0;
-                                }
-                                if real > 0 {
-                                    sh.samples_played.fetch_add(real, Ordering::Relaxed);
-                                }
-                                if real < data.len() as u64 {
-                                    sh.underruns.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                            Err(_) => data.fill(0.0),
-                        }
-                    },
-                    |e| tracing::error!("cpal audio: {e}"),
-                    None,
-                )
-                .map_err(|e| format!("cpal stream: {e}"))
+        let build_stream = |rate: u32, ch: u16, sh: Arc<Shared>| -> Result<cpal::Stream, String> {
+            let cfg = cpal::StreamConfig {
+                channels: ch,
+                sample_rate: cpal::SampleRate(rate),
+                buffer_size: cpal::BufferSize::Default,
             };
+            dev.build_output_stream(
+                &cfg,
+                move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+                    // NEVER panic in the callback.
+                    if sh.paused.load(Ordering::Relaxed) {
+                        data.fill(0.0);
+                        return; // do NOT advance samples_played — pause freezes the master clock
+                    }
+                    let vol = sh.volume.lock().map(|v| *v).unwrap_or(1.0);
+                    match sh.buffer.lock() {
+                        Ok(mut buf) => {
+                            // Advance the master clock only for REAL
+                            // samples popped from the ring buffer, NOT
+                            // for zero-fill silence played while the
+                            // buffer is still filling (startup underflow)
+                            // or mid-stream.  Counting `data.len()` makes
+                            // the clock run ahead of the audible track by
+                            // the buffer latency, permanently.
+                            //
+                            // Pop available samples in one batch and
+                            // apply volume in a single pass instead of a
+                            // per-sample lock-and-pop loop.
+                            let take = data.len().min(buf.len());
+                            for (i, s) in buf.drain(..take).enumerate() {
+                                data[i] = s * vol;
+                            }
+                            let real = take as u64;
+                            for s in &mut data[take..] {
+                                *s = 0.0;
+                            }
+                            if real > 0 {
+                                sh.samples_played.fetch_add(real, Ordering::Relaxed);
+                            }
+                            if real < data.len() as u64 {
+                                sh.underruns.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        Err(_) => data.fill(0.0),
+                    }
+                },
+                |e| tracing::error!("cpal audio: {e}"),
+                None,
+            )
+            .map_err(|e| format!("cpal stream: {e}"))
+        };
 
         // Adaptive output format: prefer the device's current native
         // configuration (sample rate + channel count) so the OS mixer
@@ -317,9 +309,7 @@ impl AudioPipeline {
         for (r, c, label) in attempts {
             match build_stream(r, c, shared.clone()) {
                 Ok(stream) => {
-                    tracing::info!(
-                        "Audio output: {dev_name} — {r} Hz / {c} ch ({label})"
-                    );
+                    tracing::info!("Audio output: {dev_name} — {r} Hz / {c} ch ({label})");
                     chosen = Some((r, c, stream));
                     break;
                 }
@@ -335,8 +325,7 @@ impl AudioPipeline {
 
         // Seed the audio master clock so position() starts at `start_pos`.
         // speed is 1.0 at construction time.
-        let initial_offset =
-            (start_pos * sample_rate as f64 * channels as f64) as u64;
+        let initial_offset = (start_pos * sample_rate as f64 * channels as f64) as u64;
         samples_played.store(initial_offset, Ordering::Relaxed);
 
         // Build paused: the ring fills with post-seek samples while the
@@ -481,7 +470,6 @@ impl AudioPipeline {
         }
         self.samples_played.store(target, Ordering::Relaxed);
     }
-
 }
 
 // ── Decode thread (unit-testable without a device) ───────────────────
@@ -509,8 +497,7 @@ fn decode_audio_packets(
 
     // Open the file and read the AUDIO stream directly — decoupled from the
     // demuxer's video routing, so video backpressure can never starve audio.
-    let mut input =
-        format::input(path).map_err(|e| format!("open input for audio codec: {e}"))?;
+    let mut input = format::input(path).map_err(|e| format!("open input for audio codec: {e}"))?;
 
     // Extract everything we need from the stream, then drop it so `input`
     // can be borrowed mutably for the seek + packet iteration below.
@@ -555,52 +542,51 @@ fn decode_audio_packets(
     // ── Atempo filter graph (None when speed == 1.0) ──────────────
     let mut atempo: Option<filter::Graph> = None;
 
-    let build_atempo = |decoder: &codec::decoder::Audio,
-                        speed: f64|
-     -> Result<filter::Graph, String> {
-        let mut graph = filter::Graph::new();
+    let build_atempo =
+        |decoder: &codec::decoder::Audio, speed: f64| -> Result<filter::Graph, String> {
+            let mut graph = filter::Graph::new();
 
-        let args = format!(
-            "time_base={}:sample_rate={}:sample_fmt={}:channel_layout=0x{:x}",
-            decoder.time_base(),
-            decoder.rate(),
-            decoder.format().name(),
-            decoder.channel_layout().bits()
-        );
+            let args = format!(
+                "time_base={}:sample_rate={}:sample_fmt={}:channel_layout=0x{:x}",
+                decoder.time_base(),
+                decoder.rate(),
+                decoder.format().name(),
+                decoder.channel_layout().bits()
+            );
 
-        graph
-            .add(
-                &filter::find("abuffer").ok_or("abuffer not found")?,
-                "in",
-                &args,
-            )
-            .map_err(|e| format!("add abuffer: {e}"))?;
-        graph
-            .add(
-                &filter::find("abuffersink").ok_or("abuffersink not found")?,
-                "out",
-                "",
-            )
-            .map_err(|e| format!("add abuffersink: {e}"))?;
+            graph
+                .add(
+                    &filter::find("abuffer").ok_or("abuffer not found")?,
+                    "in",
+                    &args,
+                )
+                .map_err(|e| format!("add abuffer: {e}"))?;
+            graph
+                .add(
+                    &filter::find("abuffersink").ok_or("abuffersink not found")?,
+                    "out",
+                    "",
+                )
+                .map_err(|e| format!("add abuffersink: {e}"))?;
 
-        // Note: abuffersink options are NOT set here — they are non-runtime
-        // options and setting them after graph.add() fails with warnings.
-        // atempo passes the input format through, and the swr resampler is
-        // built from the actual frames, so no sink configuration is needed.
-        let spec = format!("atempo={speed}");
-        graph
-            .output("in", 0)
-            .map_err(|e| format!("output in: {e}"))?
-            .input("out", 0)
-            .map_err(|e| format!("input out: {e}"))?
-            .parse(&spec)
-            .map_err(|e| format!("parse atempo: {e}"))?;
-        graph
-            .validate()
-            .map_err(|e| format!("validate atempo: {e}"))?;
+            // Note: abuffersink options are NOT set here — they are non-runtime
+            // options and setting them after graph.add() fails with warnings.
+            // atempo passes the input format through, and the swr resampler is
+            // built from the actual frames, so no sink configuration is needed.
+            let spec = format!("atempo={speed}");
+            graph
+                .output("in", 0)
+                .map_err(|e| format!("output in: {e}"))?
+                .input("out", 0)
+                .map_err(|e| format!("input out: {e}"))?
+                .parse(&spec)
+                .map_err(|e| format!("parse atempo: {e}"))?;
+            graph
+                .validate()
+                .map_err(|e| format!("validate atempo: {e}"))?;
 
-        Ok(graph)
-    };
+            Ok(graph)
+        };
 
     // ── Main decode loop ──────────────────────────────────────────
     let mut decoded = frame::Audio::empty();
@@ -654,9 +640,9 @@ fn decode_audio_packets(
                                 }
                             }
                             Ok(AudioCmd::Pause(true)) => {} // already paused — no-op
-                            Ok(AudioCmd::Volume) => {} // applied in cpal callback
+                            Ok(AudioCmd::Volume) => {}      // applied in cpal callback
                             Ok(AudioCmd::StartStream) => {} // handled by the actor
-                            Ok(AudioCmd::Trim(_)) => {} // handled by the actor
+                            Ok(AudioCmd::Trim(_)) => {}     // handled by the actor
                             Err(mpsc::RecvError) => return Ok(()),
                         }
                     }
@@ -679,9 +665,9 @@ fn decode_audio_packets(
                         }
                     }
                 }
-                Ok(AudioCmd::Volume) => {} // applied in cpal callback
+                Ok(AudioCmd::Volume) => {}      // applied in cpal callback
                 Ok(AudioCmd::StartStream) => {} // handled by the actor
-                Ok(AudioCmd::Trim(_)) => {} // handled by the actor
+                Ok(AudioCmd::Trim(_)) => {}     // handled by the actor
                 Ok(AudioCmd::Pause(false)) => {} // already playing — no-op
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
@@ -714,14 +700,14 @@ fn decode_audio_packets(
             // pre-target audio, leaving A/V desynced by the keyframe
             // distance after every seek.
             if start_pos > 0.01
-                && let Some(pts) = decoded.pts().or_else(|| decoded.timestamp()) {
-                    let pts_secs = pts as f64
-                        * audio_time_base.numerator() as f64
-                        / audio_time_base.denominator() as f64;
-                    if pts_secs < start_pos {
-                        continue;
-                    }
+                && let Some(pts) = decoded.pts().or_else(|| decoded.timestamp())
+            {
+                let pts_secs = pts as f64 * audio_time_base.numerator() as f64
+                    / audio_time_base.denominator() as f64;
+                if pts_secs < start_pos {
+                    continue;
                 }
+            }
             // Process the decoded frame through atempo filter (if active),
             // then resample to target format.
             let frames_to_resample: Vec<frame::Audio> = if let Some(ref mut graph) = atempo {
@@ -737,11 +723,12 @@ fn decode_audio_packets(
                 let mut out_frames = Vec::new();
                 loop {
                     match graph.get("out").unwrap().sink().frame(&mut filtered) {
-                        Ok(()) => out_frames.push(std::mem::replace(
-                            &mut filtered,
-                            frame::Audio::empty(),
-                        )),
-                        Err(ffmpeg::Error::Other { errno: error::EAGAIN }) => break,
+                        Ok(()) => {
+                            out_frames.push(std::mem::replace(&mut filtered, frame::Audio::empty()))
+                        }
+                        Err(ffmpeg::Error::Other {
+                            errno: error::EAGAIN,
+                        }) => break,
                         Err(ffmpeg::Error::Eof) => break,
                         Err(e) => {
                             tracing::warn!("atempo pull: {e}");
@@ -798,9 +785,7 @@ fn decode_audio_packets(
     }
 
     // ── Flush filters on EOF ──────────────────────────────────────
-    decoder
-        .send_eof()
-        .map_err(|e| format!("send eof: {e}"))?;
+    decoder.send_eof().map_err(|e| format!("send eof: {e}"))?;
     // Receive any remaining decoded frames after EOF.
     while decoder.receive_frame(&mut decoded).is_ok() {
         if let Some(ref mut graph) = atempo {
@@ -809,7 +794,9 @@ fn decode_audio_packets(
                 match graph.get("out").unwrap().sink().frame(&mut filtered) {
                     Ok(()) => {
                         let f = std::mem::replace(&mut filtered, frame::Audio::empty());
-                        let Some(resampler) = resampler.as_mut() else { break };
+                        let Some(resampler) = resampler.as_mut() else {
+                            break;
+                        };
                         if let Err(e) = resampler.run(&f, &mut resampled) {
                             tracing::warn!("audio swr flush: {e}");
                             continue;
@@ -819,13 +806,17 @@ fn decode_audio_packets(
                             sink(&sample_buf);
                         }
                     }
-                    Err(ffmpeg::Error::Other { errno: error::EAGAIN }) => break,
+                    Err(ffmpeg::Error::Other {
+                        errno: error::EAGAIN,
+                    }) => break,
                     Err(ffmpeg::Error::Eof) => break,
                     Err(_) => break,
                 }
             }
         } else {
-            let Some(resampler) = resampler.as_mut() else { continue };
+            let Some(resampler) = resampler.as_mut() else {
+                continue;
+            };
             if let Err(e) = resampler.run(&decoded, &mut resampled) {
                 tracing::warn!("audio swr flush: {e}");
                 continue;
@@ -844,7 +835,9 @@ fn decode_audio_packets(
             match graph.get("out").unwrap().sink().frame(&mut filtered) {
                 Ok(()) => {
                     let f = std::mem::replace(&mut filtered, frame::Audio::empty());
-                    let Some(resampler) = resampler.as_mut() else { break };
+                    let Some(resampler) = resampler.as_mut() else {
+                        break;
+                    };
                     if let Err(e) = resampler.run(&f, &mut resampled) {
                         tracing::warn!("audio swr flush: {e}");
                         continue;
@@ -854,7 +847,9 @@ fn decode_audio_packets(
                         sink(&sample_buf);
                     }
                 }
-                Err(ffmpeg::Error::Other { errno: error::EAGAIN }) => break,
+                Err(ffmpeg::Error::Other {
+                    errno: error::EAGAIN,
+                }) => break,
                 Err(ffmpeg::Error::Eof) => break,
                 Err(_) => break,
             }
@@ -959,7 +954,10 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(20));
         }
-        assert!(!collected.lock().unwrap().is_empty(), "decoded audio samples must be non-empty");
+        assert!(
+            !collected.lock().unwrap().is_empty(),
+            "decoded audio samples must be non-empty"
+        );
 
         let _ = cmd_tx.send(AudioCmd::Stop);
         let _ = handle.join();

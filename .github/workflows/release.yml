@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config clang libclang-dev \
+            libasound2-dev \
+            libx11-dev libxi-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libegl1-mesa-dev libgl1-mesa-dev \
+            libavcodec-dev libavformat-dev libavfilter-dev libavutil-dev libswscale-dev libswresample-dev
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Package
+        run: |
+          mkdir -p dist/omniview-linux-x86_64
+          cp target/release/omniview dist/omniview-linux-x86_64/
+          cp README.md LICENSE dist/omniview-linux-x86_64/
+          tar -czf omniview-linux-x86_64.tar.gz -C dist omniview-linux-x86_64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: omniview-linux-x86_64
+          path: omniview-linux-x86_64.tar.gz
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: omniview-linux-x86_64.tar.gz
+
+  windows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Install cross-compile dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 clang unzip zip
+
+      - name: Download BtbN FFmpeg
+        run: |
+          mkdir -p third_party/btbn
+          curl -L --fail -o /tmp/ffmpeg.zip \
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip"
+          unzip -q /tmp/ffmpeg.zip -d third_party/btbn
+
+      - name: Build Windows exe + stage DLLs
+        run: bash build-win.sh
+
+      - name: Package
+        run: |
+          REL="target/x86_64-pc-windows-gnu/release"
+          mkdir -p dist/omniview-windows-x86_64
+          cp "$REL"/omniview.exe dist/omniview-windows-x86_64/
+          cp "$REL"/*.dll dist/omniview-windows-x86_64/
+          cp README.md LICENSE dist/omniview-windows-x86_64/
+          (cd dist && zip -r ../omniview-windows-x86_64.zip omniview-windows-x86_64)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: omniview-windows-x86_64
+          path: omniview-windows-x86_64.zip
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: omniview-windows-x86_64.zip

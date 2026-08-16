@@ -2,7 +2,13 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlaybackState {
-    Idle, Loading, Ready, Playing, Paused, Seeking, Ended,
+    Idle,
+    Loading,
+    Ready,
+    Playing,
+    Paused,
+    Seeking,
+    Ended,
     Error(String),
 }
 

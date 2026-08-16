@@ -9,7 +9,9 @@ fn main() {
     for pos in [1.0f64, 5.0, 30.0, 90.0, 150.0] {
         let mut d = omniview::media::demux::Demux::open(&path, pos);
         let _info = loop {
-            if let Some(r) = d.poll_ready() { break r.unwrap(); }
+            if let Some(r) = d.poll_ready() {
+                break r.unwrap();
+            }
             std::thread::sleep(std::time::Duration::from_millis(2));
         };
         let v_rx = d.take_channels().unwrap();

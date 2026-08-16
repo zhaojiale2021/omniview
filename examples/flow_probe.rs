@@ -1,6 +1,6 @@
-use std::time::Instant;
 use omniview::media::playback::PlaybackController;
 use omniview::media::types::Command;
+use std::time::Instant;
 
 /// Headless frame-flow probe: open, play, then seek several times and
 /// measure (a) wall gaps between delivered frames and (b) clock continuity.
@@ -14,9 +14,11 @@ fn main() {
 
     let settle = |ctl: &mut PlaybackController| {
         let dl = Instant::now() + std::time::Duration::from_secs(10);
-        while matches!(ctl.state(), omniview::media::types::PlaybackState::Loading
-            | omniview::media::types::PlaybackState::Seeking)
-            && Instant::now() < dl
+        while matches!(
+            ctl.state(),
+            omniview::media::types::PlaybackState::Loading
+                | omniview::media::types::PlaybackState::Seeking
+        ) && Instant::now() < dl
         {
             ctl.poll_pending();
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -26,7 +28,11 @@ fn main() {
     ctl.apply(Command::Open(path)).unwrap();
     ctl.apply(Command::Play).unwrap();
     settle(&mut ctl);
-    println!("state after open: {:?} pos={:.3}", ctl.state(), ctl.position());
+    println!(
+        "state after open: {:?} pos={:.3}",
+        ctl.state(),
+        ctl.position()
+    );
 
     let run = |ctl: &mut PlaybackController, label: &str, secs: f64| {
         let t0 = Instant::now();
@@ -68,7 +74,11 @@ fn main() {
     for target in [30.0f64, 90.0, 150.0] {
         ctl.apply(Command::Seek(target)).unwrap();
         settle(&mut ctl);
-        println!("seek->{target}: state {:?} pos {:.3}", ctl.state(), ctl.position());
+        println!(
+            "seek->{target}: state {:?} pos {:.3}",
+            ctl.state(),
+            ctl.position()
+        );
         run(&mut ctl, &format!("after-seek-{target} 4s"), 4.0);
     }
 

@@ -8,7 +8,6 @@
 //! though only `desc()` is used here.
 #![allow(dead_code)]
 
-
 fn main() {
     pollster::block_on(async {
         let instance = wgpu::Instance::default();
@@ -135,7 +134,10 @@ fn main() {
 // vertex types through a tiny shim module by including the files.
 mod omniview_renderer {
     pub mod sphere {
-        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/renderer/sphere.rs"));
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/renderer/sphere.rs"
+        ));
     }
     pub mod quad {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/renderer/quad.rs"));

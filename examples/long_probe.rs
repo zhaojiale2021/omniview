@@ -1,6 +1,6 @@
-use std::time::Instant;
 use omniview::media::playback::PlaybackController;
 use omniview::media::types::Command;
+use std::time::Instant;
 
 /// 60s continuous playback (no seeks, no UI) — does the media pipeline
 /// itself degrade late in the file, or is the window/UI the trigger?
@@ -13,10 +13,8 @@ fn main() {
     ctl.apply(Command::Open(path)).unwrap();
     ctl.apply(Command::Play).unwrap();
     let dl = Instant::now() + std::time::Duration::from_secs(10);
-    while matches!(
-        ctl.state(),
-        omniview::media::types::PlaybackState::Loading
-    ) && Instant::now() < dl
+    while matches!(ctl.state(), omniview::media::types::PlaybackState::Loading)
+        && Instant::now() < dl
     {
         ctl.poll_pending();
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -53,6 +51,11 @@ fn main() {
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    println!("DONE pos={:.2} frames={} underruns={}", ctl.position(), n, ctl.audio_underruns());
+    println!(
+        "DONE pos={:.2} frames={} underruns={}",
+        ctl.position(),
+        n,
+        ctl.audio_underruns()
+    );
     ctl.apply(Command::Stop).unwrap();
 }

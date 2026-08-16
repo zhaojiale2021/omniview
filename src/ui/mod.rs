@@ -37,7 +37,9 @@ pub fn install_cjk_font(ctx: &egui::Context) -> Option<std::path::PathBuf> {
     ];
 
     for path in CANDIDATES {
-        let Ok(bytes) = std::fs::read(path) else { continue };
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
         // A real CJK font is megabytes; anything smaller is not it.
         if bytes.len() < 500_000 {
             continue;
@@ -98,11 +100,21 @@ fn apply_style(ctx: &egui::Context) {
 /// render (runs right after font installation).
 pub fn audit_glyphs(ctx: &egui::Context) {
     for s in [
-        "缓冲中…", "续播", "🎬", "📂", "⏸", "▶", "🔇", "🔉", "🔊", "⛶", "×", "360°",
+        "缓冲中…",
+        "续播",
+        "🎬",
+        "📂",
+        "⏸",
+        "▶",
+        "🔇",
+        "🔉",
+        "🔊",
+        "⛶",
+        "×",
+        "360°",
     ] {
-        let ok = ctx.fonts(|f| {
-            f.has_glyphs(&egui::FontId::new(14.0, egui::FontFamily::Proportional), s)
-        });
+        let ok = ctx
+            .fonts(|f| f.has_glyphs(&egui::FontId::new(14.0, egui::FontFamily::Proportional), s));
         tracing::info!("glyph {s:?} renderable: {ok}");
     }
 }
@@ -230,15 +242,15 @@ impl PlayerUI {
     /// texture.  Called by the app on the render thread before `update`.
     pub fn store_thumbnail(&mut self, pos: f64, rgba: Vec<u8>, width: u32, height: u32) {
         let bucket = (pos.max(0.0) / THUMB_STEP).floor() as u64;
-        let image = egui::ColorImage::from_rgba_unmultiplied(
-            [width as usize, height as usize],
-            &rgba,
-        );
+        let image =
+            egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
         let name = format!("thumb_{bucket}");
         if self.thumb_cache.len() >= THUMB_CACHE_MAX && !self.thumb_cache.contains_key(&bucket) {
             self.thumb_cache.clear();
         }
-        let handle = self.ctx.load_texture(name, image, egui::TextureOptions::LINEAR);
+        let handle = self
+            .ctx
+            .load_texture(name, image, egui::TextureOptions::LINEAR);
         self.thumb_cache.insert(bucket, handle);
     }
 
@@ -385,8 +397,7 @@ impl PlayerUI {
                 );
 
                 let accent = ui.visuals().selection.bg_fill;
-                let base_frac =
-                    ((self.position / dur).clamp(0.0, 1.0)) as f32;
+                let base_frac = ((self.position / dur).clamp(0.0, 1.0)) as f32;
                 let mut target_frac = base_frac;
 
                 if seek_response.drag_started() {
@@ -396,9 +407,8 @@ impl PlayerUI {
                 if self.seeking
                     && let Some(p) = seek_response.interact_pointer_pos()
                 {
-                    target_frac = ((p.x - bar_rect.left())
-                        / bar_rect.width().max(1.0))
-                    .clamp(0.0, 1.0);
+                    target_frac =
+                        ((p.x - bar_rect.left()) / bar_rect.width().max(1.0)).clamp(0.0, 1.0);
                     // Live-update the time display during the drag.
                     self.position = target_frac as f64 * dur;
                 }
@@ -415,9 +425,8 @@ impl PlayerUI {
                 if seek_response.clicked()
                     && let Some(p) = seek_response.interact_pointer_pos()
                 {
-                    let frac = ((p.x - bar_rect.left())
-                        / bar_rect.width().max(1.0))
-                    .clamp(0.0, 1.0);
+                    let frac =
+                        ((p.x - bar_rect.left()) / bar_rect.width().max(1.0)).clamp(0.0, 1.0);
                     let t = frac as f64 * dur;
                     if (t - self.position).abs() > 0.2 {
                         self.seek_to = Some(t);
@@ -464,8 +473,7 @@ impl PlayerUI {
                     if let Some(p) = pointer {
                         // Value at the pointer: map x across the rail.
                         let rect = seek_response.rect;
-                        let frac =
-                            ((p.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+                        let frac = ((p.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
                         let t = if self.seeking {
                             self.position
                         } else {
@@ -478,9 +486,7 @@ impl PlayerUI {
                         // been decoded yet.  Retry stale requests after a
                         // short delay (the service coalesces anyway, so
                         // rapid mouse movement only decodes the last one).
-                        if !self.file_path.is_empty()
-                            && !self.thumb_cache.contains_key(&bucket)
-                        {
+                        if !self.file_path.is_empty() && !self.thumb_cache.contains_key(&bucket) {
                             let should_request = match &self.thumb_last_req {
                                 Some((path, b, at)) => {
                                     path != &self.file_path
@@ -490,11 +496,8 @@ impl PlayerUI {
                                 None => true,
                             };
                             if should_request {
-                                self.thumb_last_req = Some((
-                                    self.file_path.clone(),
-                                    bucket,
-                                    Instant::now(),
-                                ));
+                                self.thumb_last_req =
+                                    Some((self.file_path.clone(), bucket, Instant::now()));
                                 self.thumbnail_request = Some(t);
                             }
                         }
@@ -508,10 +511,9 @@ impl PlayerUI {
                         // thumbnail flashes on/off at every frame.
                         let popup_half_w = 88.0;
                         let screen = ctx.screen_rect();
-                        let bubble_x = p
-                            .x
-                            .max(screen.left() + popup_half_w + 4.0)
-                            .min(screen.right() - popup_half_w - 4.0);
+                        let bubble_x =
+                            p.x.max(screen.left() + popup_half_w + 4.0)
+                                .min(screen.right() - popup_half_w - 4.0);
                         let bubble_pos = egui::pos2(bubble_x, rect.top() - 6.0);
                         let thumb_size = egui::vec2(160.0, 90.0);
                         egui::Area::new(egui::Id::new("seek_preview"))
@@ -534,10 +536,7 @@ impl PlayerUI {
                                         // rect so the popup size never
                                         // changes when the image arrives.
                                         let (thumb_rect, _) = ui
-                                            .allocate_exact_size(
-                                                thumb_size,
-                                                egui::Sense::hover(),
-                                            );
+                                            .allocate_exact_size(thumb_size, egui::Sense::hover());
                                         if let Some(tex) = &thumb {
                                             ui.put(
                                                 thumb_rect,
@@ -563,7 +562,16 @@ impl PlayerUI {
                 ui.horizontal(|ui| {
                     // Left transport cluster
                     let pp_icon = if self.playing { "⏸" } else { "▶" };
-                    let pp = Self::icon_button(ui, pp_icon, 16.0, if self.playing { "Pause (Space)" } else { "Play (Space)" });
+                    let pp = Self::icon_button(
+                        ui,
+                        pp_icon,
+                        16.0,
+                        if self.playing {
+                            "Pause (Space)"
+                        } else {
+                            "Play (Space)"
+                        },
+                    );
                     if pp.clicked() {
                         self.playing = !self.playing;
                     }
@@ -600,11 +608,16 @@ impl PlayerUI {
 
                         // Volume slider
                         ui.spacing_mut().slider_width = 72.0;
-                        let vol = ui.add(
-                            egui::Slider::new(&mut self.volume, 0.0..=1.0)
-                                .show_value(false)
-                                .text(""),
-                        ).on_hover_text(format!("音量 {}%", (self.volume * 100.0).round() as i32));
+                        let vol = ui
+                            .add(
+                                egui::Slider::new(&mut self.volume, 0.0..=1.0)
+                                    .show_value(false)
+                                    .text(""),
+                            )
+                            .on_hover_text(format!(
+                                "音量 {}%",
+                                (self.volume * 100.0).round() as i32
+                            ));
                         if vol.drag_started() || vol.changed() {
                             if self.volume > 0.0 {
                                 self.muted = false;
@@ -665,11 +678,7 @@ impl PlayerUI {
                             ui.horizontal(|ui| {
                                 ui.spinner();
                                 ui.add_space(10.0);
-                                ui.label(
-                                    egui::RichText::new("缓冲中…")
-                                        .size(16.0)
-                                        .strong(),
-                                );
+                                ui.label(egui::RichText::new("缓冲中…").size(16.0).strong());
                             });
                         });
                 });

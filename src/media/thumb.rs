@@ -10,8 +10,8 @@
 use std::sync::mpsc;
 use std::thread;
 
-use ffmpeg_next as ffmpeg;
 use ffmpeg::{codec, format, frame, media, software};
+use ffmpeg_next as ffmpeg;
 
 /// Thumbnail dimensions used by the UI preview.  Small enough to decode
 /// quickly and upload as an egui texture without measurable overhead.
@@ -128,12 +128,7 @@ fn thumbnail_worker(
 /// This is intentionally self-contained: it opens the file, seeks, decodes
 /// a handful of frames, and returns RGBA8 pixels.  It never touches the
 /// playback pipeline, so thumbnail requests cannot perturb A/V sync.
-fn decode_thumbnail(
-    path: &str,
-    pos: f64,
-    max_w: u32,
-    max_h: u32,
-) -> ThumbnailResult {
+fn decode_thumbnail(path: &str, pos: f64, max_w: u32, max_h: u32) -> ThumbnailResult {
     ffmpeg::init().map_err(|e| format!("ffmpeg init: {e}"))?;
 
     let mut input = format::input(path).map_err(|e| format!("open input: {e}"))?;
@@ -255,6 +250,10 @@ mod tests {
         let thumb = decode_thumbnail("/tmp/test_av.mp4", 1.5, 160, 90).unwrap();
         assert_eq!((thumb.width, thumb.height), (160, 90));
         assert_eq!(thumb.rgba.len(), 160 * 90 * 4);
-        assert!(thumb.pos >= 1.5 - 0.05, "preview frame should be at/after target, got {}", thumb.pos);
+        assert!(
+            thumb.pos >= 1.5 - 0.05,
+            "preview frame should be at/after target, got {}",
+            thumb.pos
+        );
     }
 }

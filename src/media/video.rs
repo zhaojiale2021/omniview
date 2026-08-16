@@ -10,11 +10,12 @@
 //! opening the file inside the decode thread; the demux owns all seeking
 //! and packet routing.
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    mpsc, Arc, Condvar, Mutex,
-};
 use std::collections::VecDeque;
+use std::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread;
 
 use ffmpeg_next as ffmpeg;
@@ -103,7 +104,11 @@ impl VideoQueue {
 }
 
 #[derive(Debug, Clone)]
-pub enum DecoderCmd { Pause, Resume, Stop }
+pub enum DecoderCmd {
+    Pause,
+    Resume,
+    Stop,
+}
 
 pub struct VideoDecoder {
     queue: Arc<VideoQueue>,
@@ -307,12 +312,13 @@ fn decode_packets_loop(
             // references).  Showing them produces green/blocky artifacts;
             // dropping them just skips a frame.  Some encodes (B-frame
             // heavy streams) flag these intermittently.
-            if decoded.flags().contains(ffmpeg::util::frame::flag::Flags::CORRUPT) {
+            if decoded
+                .flags()
+                .contains(ffmpeg::util::frame::flag::Flags::CORRUPT)
+            {
                 corrupt_dropped += 1;
                 if corrupt_log.elapsed().as_secs() >= 5 {
-                    tracing::warn!(
-                        "Video: dropped {corrupt_dropped} corrupt frames in last 5s"
-                    );
+                    tracing::warn!("Video: dropped {corrupt_dropped} corrupt frames in last 5s");
                     corrupt_dropped = 0;
                     corrupt_log = std::time::Instant::now();
                 }
@@ -416,7 +422,10 @@ fn pad_plane_into(
     row_bytes: usize,
     out: &mut Vec<u8>,
 ) -> u32 {
-    debug_assert!(row_bytes <= src_stride, "row_bytes {row_bytes} > src_stride {src_stride}");
+    debug_assert!(
+        row_bytes <= src_stride,
+        "row_bytes {row_bytes} > src_stride {src_stride}"
+    );
     let padded = row_bytes.div_ceil(256) * 256;
     let need = padded * height as usize;
     if out.len() < need {

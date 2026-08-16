@@ -1,5 +1,7 @@
 # Omniview — 360° 全景视频播放器
 
+[![CI](https://github.com/zhaojiale2021/omniview/actions/workflows/ci.yml/badge.svg)](https://github.com/zhaojiale2021/omniview/actions/workflows/ci.yml)
+
 基于 Rust 的桌面视频播放器：支持普通视频与 360° 全景视频，进程内解码（ffmpeg-next），GPU 渲染（wgpu + egui）。
 
 ## 功能特性
@@ -54,6 +56,13 @@ Windows 交叉编译（在 WSL 内，需 mingw + BtbN FFmpeg，见 `build-win.sh
 ```bash
 make win
 ```
+
+## CI / Release
+
+- GitHub Actions 会在 push / PR 时自动执行 `cargo check`、`cargo clippy`、`cargo test` 和 `cargo fmt --check`。
+- 推送 `v*` 标签（如 `v0.1.0`）或手动触发 Release 工作流时，会构建并上传：
+  - `omniview-linux-x86_64.tar.gz`
+  - `omniview-windows-x86_64.zip`（含运行所需 FFmpeg DLL）
 
 ## 测试
 
