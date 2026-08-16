@@ -62,6 +62,15 @@ impl Drop for Pipeline {
     }
 }
 
+/// Static stream information reported by the demux probe and needed by
+/// the UI for audio/video track switching.
+#[derive(Debug, Clone, Default)]
+struct PipelineInfo {
+    duration: f64,
+    audio_tracks: Vec<usize>,
+    video_tracks: Vec<usize>,
+}
+
 /// Seconds of decoded audio the worker pre-rolls before declaring the
 /// pipeline ready.  The cpal stream starts paused, so the ring fills with
 /// the first samples after the seek target; starting playback then plays
@@ -77,9 +86,14 @@ const PREROLL_TIMEOUT: Duration = Duration::from_millis(2000);
 /// thread and blocks until the demux probe completes and the decoders have
 /// pre-rolled data, so playback can start instantly when the controller
 /// installs the result.  Returns the pipeline and the media duration.
-fn build_pipeline(path: &str, pos: f64) -> Result<(Pipeline, f64), String> {
+fn build_pipeline(
+    path: &str,
+    pos: f64,
+    audio_track: Option<usize>,
+    video_track: Option<usize>,
+) -> Result<(Pipeline, PipelineInfo), String> {
     // ── Demux ────────────────────────────────────────────────
-    let mut demux = Demux::open(path, pos);
+    let mut demux = Demux::open(path, pos, video_track);
 
     let info = {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -113,7 +127,7 @@ fn build_pipeline(path: &str, pos: f64) -> Result<(Pipeline, f64), String> {
     let audio_device = host.default_output_device();
 
     let (audio, audio_actor) = if let Some(dev) = audio_device {
-        let (cmd_tx, ready_rx, actor) = spawn_audio_actor(path.to_string(), dev, pos);
+        let (cmd_tx, ready_rx, actor) = spawn_audio_actor(path.to_string(), dev, pos, audio_track);
         match ready_rx.recv_timeout(Duration::from_secs(3)) {
             Ok(Ok(ready)) => (Some(AudioHandle::new(cmd_tx, ready)), Some(actor)),
             Ok(Err(e)) => {
@@ -138,7 +152,7 @@ fn build_pipeline(path: &str, pos: f64) -> Result<(Pipeline, f64), String> {
     // false we keep video None — the demux never routes video packets (no
     // video stream index), so no Disconnected is ever observed.
     let (video, video_cmd) = if info.has_video {
-        let (v, c) = VideoDecoder::from_packets(path, video_rx, pos);
+        let (v, c) = VideoDecoder::from_packets(path, video_rx, pos, video_track);
         (Some(v), Some(c))
     } else {
         // Drop the (never-fed) video receiver immediately.
@@ -178,13 +192,17 @@ fn build_pipeline(path: &str, pos: f64) -> Result<(Pipeline, f64), String> {
             audio,
             audio_actor,
         },
-        info.duration,
+        PipelineInfo {
+            duration: info.duration,
+            audio_tracks: info.audio_tracks,
+            video_tracks: info.video_tracks,
+        },
     ))
 }
 
 /// Receiving end of an in-flight pipeline build: the worker generation
 /// guards against superseded open/seek results.
-type PipelineBuildRx = mpsc::Receiver<(u64, Result<(Pipeline, f64), String>)>;
+type PipelineBuildRx = mpsc::Receiver<(u64, Result<(Pipeline, PipelineInfo), String>)>;
 
 pub struct PlaybackController {
     state: PlaybackState,
@@ -195,6 +213,14 @@ pub struct PlaybackController {
     speed: f64,
     duration: f64,
     file_path: Option<String>,
+    /// Selected audio/video stream indices (`None` = best/default).
+    audio_track: Option<usize>,
+    video_track: Option<usize>,
+    /// Stream indices available in the current file.
+    audio_tracks: Vec<usize>,
+    video_tracks: Vec<usize>,
+    /// Night mode compresses loud samples in the cpal callback.
+    night_mode: bool,
     /// PTS of the last displayed frame.  Sentinel -1.0 so a first frame at
     /// pts 0.0 is displayed (the dedupe threshold is |pts - last_pts| < 0.001).
     last_pts: f64,
@@ -243,6 +269,11 @@ impl PlaybackController {
             speed: 1.0,
             duration: 0.0,
             file_path: None,
+            audio_track: None,
+            video_track: None,
+            audio_tracks: Vec::new(),
+            video_tracks: Vec::new(),
+            night_mode: false,
             last_pts: -1.0,
             eof_seen: false,
             last_frame_at: None,
@@ -283,6 +314,26 @@ impl PlaybackController {
 
     pub fn file_path(&self) -> Option<&str> {
         self.file_path.as_deref()
+    }
+
+    pub fn audio_tracks(&self) -> &[usize] {
+        &self.audio_tracks
+    }
+
+    pub fn video_tracks(&self) -> &[usize] {
+        &self.video_tracks
+    }
+
+    pub fn audio_track(&self) -> Option<usize> {
+        self.audio_track
+    }
+
+    pub fn video_track(&self) -> Option<usize> {
+        self.video_track
+    }
+
+    pub fn night_mode(&self) -> bool {
+        self.night_mode
     }
 
     /// Ring-buffer underflow count of the audio pipeline (diagnostics).
@@ -331,6 +382,9 @@ impl PlaybackController {
             Command::Seek(pos) => self.do_seek(pos),
             Command::SetSpeed(s) => self.do_set_speed(s),
             Command::SetVolume(v) => self.do_set_volume(v),
+            Command::SetNightMode(on) => self.do_set_night_mode(on),
+            Command::SetAudioTrack(idx) => self.do_set_audio_track(idx),
+            Command::SetVideoTrack(idx) => self.do_set_video_track(idx),
             Command::Stop => self.do_stop(),
         }
     }
@@ -360,7 +414,7 @@ impl PlaybackController {
             return;
         }
         match result {
-            Ok((pipeline, duration)) => self.install(pipeline, duration),
+            Ok((pipeline, info)) => self.install(pipeline, info),
             Err(e) => {
                 tracing::error!("Pipeline build failed: {e}");
                 self.state = PlaybackState::Error(format!("Pipeline: {e}"));
@@ -370,12 +424,14 @@ impl PlaybackController {
 
     /// Swap a freshly built pipeline in, re-anchor the clock to the target
     /// position, and restore the play/pause state requested at issue time.
-    fn install(&mut self, pipeline: Pipeline, duration: f64) {
+    fn install(&mut self, pipeline: Pipeline, info: PipelineInfo) {
         let pos = self.pending_pos;
         let want_play = self.pending_play;
         let was_loading = self.state == PlaybackState::Loading;
 
-        self.duration = duration;
+        self.duration = info.duration;
+        self.audio_tracks = info.audio_tracks;
+        self.video_tracks = info.video_tracks;
 
         // Attach the audio master clock before `reset` so position() derives
         // from the audio counter from the start (reset re-anchors the
@@ -407,6 +463,7 @@ impl PlaybackController {
         if let Some(a) = &pipeline.audio {
             a.set_speed(self.speed);
             a.set_volume(self.volume);
+            a.set_night_mode(self.night_mode);
         }
 
         self.pipeline = Some(pipeline);
@@ -568,6 +625,10 @@ impl PlaybackController {
         self.teardown();
 
         self.file_path = Some(path.to_string());
+        self.audio_track = None;
+        self.video_track = None;
+        self.audio_tracks.clear();
+        self.video_tracks.clear();
         self.pending_pos = 0.0;
         self.pending_play = false;
         // Freeze the clock at 0 while the worker probes/decodes.
@@ -713,6 +774,40 @@ impl PlaybackController {
         Ok(())
     }
 
+    fn do_set_night_mode(&mut self, on: bool) -> Result<(), String> {
+        self.night_mode = on;
+        if let Some(pipeline) = &self.pipeline
+            && let Some(audio) = &pipeline.audio
+        {
+            audio.set_night_mode(on);
+        }
+        Ok(())
+    }
+
+    fn do_set_audio_track(&mut self, idx: usize) -> Result<(), String> {
+        if self.audio_tracks.is_empty() {
+            return Err("no audio track list".to_string());
+        }
+        if !self.audio_tracks.contains(&idx) {
+            return Err(format!("audio track {idx} not found"));
+        }
+        self.audio_track = Some(idx);
+        let pos = self.position();
+        self.do_seek(pos)
+    }
+
+    fn do_set_video_track(&mut self, idx: usize) -> Result<(), String> {
+        if self.video_tracks.is_empty() {
+            return Err("no video track list".to_string());
+        }
+        if !self.video_tracks.contains(&idx) {
+            return Err(format!("video track {idx} not found"));
+        }
+        self.video_track = Some(idx);
+        let pos = self.position();
+        self.do_seek(pos)
+    }
+
     fn do_stop(&mut self) -> Result<(), String> {
         self.teardown();
         self.clock = MediaClock::new();
@@ -740,8 +835,10 @@ impl PlaybackController {
         let (tx, rx) = mpsc::channel();
         self.pending = Some(rx);
         let p = path.to_string();
+        let audio_track = self.audio_track;
+        let video_track = self.video_track;
         thread::spawn(move || {
-            let result = build_pipeline(&p, pos);
+            let result = build_pipeline(&p, pos, audio_track, video_track);
             let _ = tx.send((worker_gen, result));
         });
     }

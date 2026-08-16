@@ -22,6 +22,9 @@ pub enum Command {
     Seek(f64),
     SetSpeed(f64),
     SetVolume(f32),
+    SetNightMode(bool),
+    SetAudioTrack(usize),
+    SetVideoTrack(usize),
     #[allow(dead_code)] // controller-level stop; window close tears down via Drop
     Stop,
 }

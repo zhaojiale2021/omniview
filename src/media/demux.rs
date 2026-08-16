@@ -36,6 +36,8 @@ pub struct DemuxInfo {
     pub fps: f64,
     pub duration: f64,
     pub has_audio: bool,
+    pub audio_tracks: Vec<usize>,
+    pub video_tracks: Vec<usize>,
 }
 
 /// Commands sent to the demux thread.
@@ -59,7 +61,7 @@ pub struct Demux {
 impl Demux {
     /// Spawn the demux thread.  Returns immediately — the thread probes
     /// streams first and reports via `poll_ready()`.
-    pub fn open(path: &str, start_pos: f64) -> Self {
+    pub fn open(path: &str, start_pos: f64, video_track: Option<usize>) -> Self {
         let (ready_tx, ready_rx) = mpsc::channel();
         // Bounded channels (cap 64) so a paused decoder doesn't cause
         // unbounded memory growth; the demux thread uses send_timeout
@@ -76,7 +78,15 @@ impl Demux {
 
         let p = path.to_string();
         let handle = thread::spawn(move || {
-            demux_loop(&p, start_pos, ready_tx, video_pkt_tx, cmd_rx, eof_tx);
+            demux_loop(
+                &p,
+                start_pos,
+                ready_tx,
+                video_pkt_tx,
+                cmd_rx,
+                eof_tx,
+                video_track,
+            );
         });
 
         Demux {
@@ -130,6 +140,7 @@ fn demux_loop(
     video_pkt_tx: mpsc::SyncSender<ffmpeg::Packet>,
     cmd_rx: mpsc::Receiver<DemuxCmd>,
     eof_tx: mpsc::Sender<()>,
+    video_track: Option<usize>,
 ) {
     // Init ffmpeg (once per process is fine, but safe to call again).
     if let Err(e) = ffmpeg::init() {
@@ -150,7 +161,20 @@ fn demux_loop(
 
     // ── Probe streams ──────────────────────────────────────────────
 
-    let video_stream = input.streams().best(media::Type::Video);
+    let mut audio_tracks = Vec::new();
+    let mut video_tracks = Vec::new();
+    for s in input.streams() {
+        match s.parameters().medium() {
+            media::Type::Audio => audio_tracks.push(s.index()),
+            media::Type::Video => video_tracks.push(s.index()),
+            _ => {}
+        }
+    }
+
+    let video_stream = match video_track {
+        Some(idx) => input.streams().find(|s| s.index() == idx),
+        None => input.streams().best(media::Type::Video),
+    };
     let audio_stream = input.streams().best(media::Type::Audio);
 
     let (has_video, width, height, fps, duration) = if let Some(ref vs) = video_stream {
@@ -202,6 +226,8 @@ fn demux_loop(
         fps,
         duration,
         has_audio,
+        audio_tracks,
+        video_tracks,
     };
 
     tracing::info!(
@@ -296,7 +322,7 @@ mod tests {
 
     #[test]
     fn probes_streams() {
-        let d = Demux::open("/tmp/test_v.mp4", 0.0);
+        let d = Demux::open("/tmp/test_v.mp4", 0.0, None);
         let info = d
             .poll_ready()
             .unwrap_or_else(|| {

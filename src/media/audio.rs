@@ -50,6 +50,12 @@ impl AudioHandle {
         let _ = self.cmd_tx.send(AudioCmd::Volume);
     }
 
+    /// Night mode applies a soft limiter in the cpal callback so loud
+    /// passages are reduced without touching the master volume.
+    pub fn set_night_mode(&self, on: bool) {
+        self.shared.night_mode.store(on, Ordering::Relaxed);
+    }
+
     pub fn start_stream(&self) {
         let _ = self.cmd_tx.send(AudioCmd::StartStream);
     }
@@ -96,6 +102,7 @@ pub fn spawn_audio_actor(
     path: String,
     dev: cpal::Device,
     start_pos: f64,
+    audio_track: Option<usize>,
 ) -> (
     mpsc::Sender<AudioCmd>,
     mpsc::Receiver<Result<AudioReady, String>>,
@@ -105,7 +112,7 @@ pub fn spawn_audio_actor(
     let (ready_tx, ready_rx) = mpsc::channel::<Result<AudioReady, String>>();
 
     let handle = thread::spawn(move || {
-        let pipeline = match AudioPipeline::start(&path, &dev, start_pos) {
+        let pipeline = match AudioPipeline::start(&path, &dev, start_pos, audio_track) {
             Ok(p) => p,
             Err(e) => {
                 let _ = ready_tx.send(Err(e));
@@ -189,6 +196,7 @@ pub struct Shared {
     paused: AtomicBool,
     stopped: AtomicBool,
     samples_played: Arc<AtomicU64>,
+    night_mode: AtomicBool,
     /// Count of callback periods that had to zero-fill (ring underflow).
     /// Reported periodically so a "stutters every few seconds" issue can be
     /// attributed to audio starvation vs video/render starvation.
@@ -220,7 +228,12 @@ impl AudioPipeline {
     ///
     /// Returns the packet receiver back on failure so the caller can keep the
     /// demux alive (e.g. by spawning a discard-drain thread for video-only).
-    pub fn start(path: &str, dev: &cpal::Device, start_pos: f64) -> Result<Self, String> {
+    pub fn start(
+        path: &str,
+        dev: &cpal::Device,
+        start_pos: f64,
+        audio_track: Option<usize>,
+    ) -> Result<Self, String> {
         let dev_name = dev.name().unwrap_or_else(|_| "?".into());
 
         // ── Shared state ──────────────────────────────────────────
@@ -232,6 +245,7 @@ impl AudioPipeline {
             paused: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             samples_played: samples_played.clone(),
+            night_mode: AtomicBool::new(false),
             underruns: Arc::new(AtomicU64::new(0)),
         });
 
@@ -265,8 +279,18 @@ impl AudioPipeline {
                             // apply volume in a single pass instead of a
                             // per-sample lock-and-pop loop.
                             let take = data.len().min(buf.len());
+                            let night = sh.night_mode.load(Ordering::Relaxed);
                             for (i, s) in buf.drain(..take).enumerate() {
-                                data[i] = s * vol;
+                                let mut v = s * vol;
+                                if night {
+                                    // Soft-knee limiter: keep loud passages
+                                    // under control for late-night listening.
+                                    let a = v.abs();
+                                    if a > 0.7 {
+                                        v = (0.7 + 0.3 * (a - 0.7).tanh()) * v.signum();
+                                    }
+                                }
+                                data[i] = v;
                             }
                             let real = take as u64;
                             for s in &mut data[take..] {
@@ -394,6 +418,7 @@ impl AudioPipeline {
                     spawn_channels,
                     start_pos,
                     sink,
+                    audio_track,
                 )
             }));
             match result {
@@ -492,6 +517,7 @@ fn decode_audio_packets(
     channels: u16,
     start_pos: f64,
     mut sink: impl FnMut(&[f32]) + Send,
+    audio_track: Option<usize>,
 ) -> Result<(), String> {
     ffmpeg::init().map_err(|e| format!("ffmpeg init: {e}"))?;
 
@@ -502,10 +528,11 @@ fn decode_audio_packets(
     // Extract everything we need from the stream, then drop it so `input`
     // can be borrowed mutably for the seek + packet iteration below.
     let (audio_stream_index, audio_time_base, audio_params) = {
-        let s = input
-            .streams()
-            .best(media::Type::Audio)
-            .ok_or_else(|| "no audio stream".to_string())?;
+        let s = match audio_track {
+            Some(idx) => input.streams().find(|s| s.index() == idx),
+            None => input.streams().best(media::Type::Audio),
+        }
+        .ok_or_else(|| "no audio stream".to_string())?;
         (s.index(), s.time_base(), s.parameters())
     };
     tracing::info!("Audio: opened file, audio stream index={audio_stream_index}");
@@ -948,7 +975,7 @@ mod tests {
         };
 
         let handle = thread::spawn(move || {
-            let _ = decode_audio_packets("/tmp/test_av.mp4", cmd_rx, 48000, 2, 0.0, sink);
+            let _ = decode_audio_packets("/tmp/test_av.mp4", cmd_rx, 48000, 2, 0.0, sink, None);
         });
 
         // Wait for at least some samples.
@@ -984,7 +1011,7 @@ mod tests {
             *produced_sink.lock().unwrap() += samples.len() as u64;
         };
         let handle = thread::spawn(move || {
-            let _ = decode_audio_packets("/tmp/test_av.mp4", cmd_rx, 48000, 2, 0.0, sink);
+            let _ = decode_audio_packets("/tmp/test_av.mp4", cmd_rx, 48000, 2, 0.0, sink, None);
         });
         let dl = std::time::Instant::now() + Duration::from_secs(10);
         while !handle.is_finished() && std::time::Instant::now() < dl {
@@ -1010,7 +1037,7 @@ mod tests {
             *produced_sink.lock().unwrap() += samples.len() as u64;
         };
         let handle = thread::spawn(move || {
-            let _ = decode_audio_packets("/tmp/test_av20.mp4", cmd_rx, 48000, 2, 0.0, sink);
+            let _ = decode_audio_packets("/tmp/test_av20.mp4", cmd_rx, 48000, 2, 0.0, sink, None);
         });
         let _ = cmd_tx.send(AudioCmd::Speed(2.0));
 
@@ -1072,7 +1099,7 @@ mod tests {
 
         let handle = thread::spawn(move || {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                decode_audio_packets("/tmp/test_av20.mp4", cmd_rx, 48000, 2, 0.0, sink)
+                decode_audio_packets("/tmp/test_av20.mp4", cmd_rx, 48000, 2, 0.0, sink, None)
             }));
             match r {
                 Ok(Ok(())) => None,

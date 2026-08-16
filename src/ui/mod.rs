@@ -133,6 +133,7 @@ pub struct PlayerUI {
     pub volume: f32,
     pub seek_to: Option<f64>,
     pub open_file_clicked: bool,
+    pub open_folder_clicked: bool,
     pub is_360: bool,
     pub speed: f64,
     pub speed_changed: bool,
@@ -161,6 +162,18 @@ pub struct PlayerUI {
     /// Set when the user clicks the previous/next playlist buttons.
     pub prev_clicked: bool,
     pub next_clicked: bool,
+    /// Audio/video track selection (stream indices).
+    pub audio_tracks: Vec<usize>,
+    pub video_tracks: Vec<usize>,
+    pub audio_track: Option<usize>,
+    pub video_track: Option<usize>,
+    pub audio_track_changed: bool,
+    pub video_track_changed: bool,
+    /// Night-mode limiter toggle.
+    pub night_mode: bool,
+    pub night_mode_changed: bool,
+    /// Playlist mode label shown in the transport bar.
+    pub playlist_mode_label: String,
     file_name: String,
     /// Full path of the current media file, used for thumbnail requests.
     file_path: String,
@@ -196,6 +209,7 @@ impl PlayerUI {
             volume: 0.8,
             seek_to: None,
             open_file_clicked: false,
+            open_folder_clicked: false,
             is_360: false,
             speed: 1.0,
             speed_changed: false,
@@ -212,6 +226,15 @@ impl PlayerUI {
             subtitle_text: None,
             prev_clicked: false,
             next_clicked: false,
+            audio_tracks: Vec::new(),
+            video_tracks: Vec::new(),
+            audio_track: None,
+            video_track: None,
+            audio_track_changed: false,
+            video_track_changed: false,
+            night_mode: false,
+            night_mode_changed: false,
+            playlist_mode_label: "顺序".to_string(),
             audited: false,
             file_name: String::new(),
             file_path: String::new(),
@@ -330,6 +353,66 @@ impl PlayerUI {
                     ui.label(egui::RichText::new(&title).size(13.0));
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // ── Audio/video track combos ──────────────
+                        if self.audio_tracks.len() > 1 {
+                            let label = self
+                                .audio_track
+                                .map(|t| format!("音轨 {t}"))
+                                .unwrap_or_else(|| "音轨: 默认".to_string());
+                            egui::ComboBox::from_id_salt("audio_track")
+                                .selected_text(label)
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(self.audio_track.is_none(), "默认")
+                                        .clicked()
+                                    {
+                                        self.audio_track = None;
+                                        self.audio_track_changed = true;
+                                    }
+                                    for t in &self.audio_tracks {
+                                        if ui
+                                            .selectable_label(
+                                                self.audio_track == Some(*t),
+                                                format!("音轨 {t}"),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.audio_track = Some(*t);
+                                            self.audio_track_changed = true;
+                                        }
+                                    }
+                                });
+                        }
+                        if self.video_tracks.len() > 1 {
+                            let label = self
+                                .video_track
+                                .map(|t| format!("视频轨 {t}"))
+                                .unwrap_or_else(|| "视频轨: 默认".to_string());
+                            egui::ComboBox::from_id_salt("video_track")
+                                .selected_text(label)
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(self.video_track.is_none(), "默认")
+                                        .clicked()
+                                    {
+                                        self.video_track = None;
+                                        self.video_track_changed = true;
+                                    }
+                                    for t in &self.video_tracks {
+                                        if ui
+                                            .selectable_label(
+                                                self.video_track == Some(*t),
+                                                format!("视频轨 {t}"),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.video_track = Some(*t);
+                                            self.video_track_changed = true;
+                                        }
+                                    }
+                                });
+                        }
+
                         // ── 360° toggle ───────────────────────────
                         let (label, color) = if self.is_360 {
                             ("360° ON", egui::Color32::from_rgb(80, 200, 120))
@@ -375,10 +458,14 @@ impl PlayerUI {
                                 }
                             });
 
-                        // ── Open file (icon) ─────────────────────
-                        let open = Self::icon_button(ui, "📂", 14.0, "Open file…");
+                        // ── Open file / folder (icons) ──────────
+                        let open = Self::icon_button(ui, "📂", 14.0, "Open file(s)…");
                         if open.clicked() {
                             self.open_file_clicked = true;
+                        }
+                        let open_folder = Self::icon_button(ui, "📁", 14.0, "Open folder…");
+                        if open_folder.clicked() {
+                            self.open_folder_clicked = true;
                         }
                     });
                 });
@@ -613,6 +700,27 @@ impl PlayerUI {
 
                     // Right cluster (time · volume · fullscreen)
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Night mode limiter toggle
+                        let night_label = "🌙";
+                        let night_color = if self.night_mode {
+                            Some(egui::Color32::from_rgb(80, 200, 120))
+                        } else {
+                            None
+                        };
+                        let mut night_btn =
+                            egui::Button::new(egui::RichText::new(night_label).size(14.0))
+                                .rounding(3.0);
+                        if let Some(c) = night_color {
+                            night_btn = night_btn.fill(c);
+                        }
+                        let night = ui
+                            .add_sized([30.0, 24.0], night_btn)
+                            .on_hover_text("Night mode (N)");
+                        if night.clicked() {
+                            self.night_mode = !self.night_mode;
+                            self.night_mode_changed = true;
+                        }
+
                         // Fullscreen
                         let fs_hint = if self.is_fullscreen {
                             "Exit fullscreen (F)"
@@ -661,6 +769,17 @@ impl PlayerUI {
                         if vicon.clicked() {
                             self.mute_clicked = true;
                         }
+
+                        // Playlist mode label
+                        ui.label(
+                            egui::RichText::new(&self.playlist_mode_label)
+                                .size(11.0)
+                                .color(if is_dark {
+                                    egui::Color32::LIGHT_GRAY
+                                } else {
+                                    egui::Color32::DARK_GRAY
+                                }),
+                        );
 
                         // Time display
                         ui.label(

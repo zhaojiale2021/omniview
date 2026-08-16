@@ -7,7 +7,7 @@ fn main() {
     let path = std::env::args().nth(1).expect("usage: demux_seek <file>");
     for pos in [1.0f64, 5.0, 30.0, 90.0, 150.0] {
         let t0 = Instant::now();
-        let mut d = omniview::media::demux::Demux::open(&path, pos);
+        let mut d = omniview::media::demux::Demux::open(&path, pos, None);
         let _info = loop {
             if let Some(r) = d.poll_ready() {
                 break r.unwrap();

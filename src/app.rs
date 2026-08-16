@@ -41,6 +41,34 @@ struct WindowState {
     height: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaylistMode {
+    Normal,
+    RepeatAll,
+    RepeatOne,
+    Shuffle,
+}
+
+impl PlaylistMode {
+    fn next(self) -> Self {
+        match self {
+            Self::Normal => Self::RepeatAll,
+            Self::RepeatAll => Self::RepeatOne,
+            Self::RepeatOne => Self::Shuffle,
+            Self::Shuffle => Self::Normal,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "顺序",
+            Self::RepeatAll => "列表循环",
+            Self::RepeatOne => "单曲循环",
+            Self::Shuffle => "随机",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PlayerState {
     resume: HashMap<String, f64>,
@@ -84,6 +112,7 @@ pub struct App {
     // ── Playlist ────────────────────────────────────────────────
     playlist: Vec<String>,
     playlist_index: usize,
+    playlist_mode: PlaylistMode,
     /// Guards the automatic "play next" transition so Ended is handled once.
     end_handled: bool,
 
@@ -135,6 +164,7 @@ impl App {
             last_state_save: Instant::now(),
             playlist: Vec::new(),
             playlist_index: 0,
+            playlist_mode: PlaylistMode::Normal,
             end_handled: true,
             arrow_left_held: false,
             arrow_right_held: false,
@@ -207,17 +237,54 @@ impl App {
         self.open_file(&prev);
     }
 
+    fn cycle_playlist_mode(&mut self) {
+        self.playlist_mode = self.playlist_mode.next();
+        tracing::info!("playlist mode: {}", self.playlist_mode.label());
+    }
+
+    fn open_folder(&mut self, folder: &str) {
+        let Ok(entries) = std::fs::read_dir(folder) else {
+            tracing::warn!("Cannot open folder: {folder}");
+            return;
+        };
+        let exts = ["mp4", "webm", "mkv", "avi", "mov", "m4v"];
+        let mut files = Vec::new();
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.is_file()
+                && path
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| exts.contains(&x.to_ascii_lowercase().as_str()))
+                    .unwrap_or(false)
+            {
+                files.push(path.to_string_lossy().into_owned());
+            }
+        }
+        files.sort();
+        if files.is_empty() {
+            tracing::warn!("No video files in folder: {folder}");
+            return;
+        }
+        self.open_files(files);
+    }
+
     /// Load an external `.srt` subtitle file with the same stem as the
     /// video (e.g. `movie.mp4` -> `movie.srt`).  Missing file is not an
     /// error: the player simply runs without subtitles.
     fn load_subtitle_for(&mut self, video_path: &str) {
-        let srt = PathBuf::from(video_path).with_extension("srt");
-        self.subtitles = std::fs::read_to_string(&srt)
-            .ok()
-            .map(|s| SubtitleFile::parse(&s));
-        if self.subtitles.is_some() {
+        let path = PathBuf::from(video_path);
+        let srt = path.with_extension("srt");
+        let ass = path.with_extension("ass");
+        self.subtitles = if let Ok(s) = std::fs::read_to_string(&srt) {
             tracing::info!("Loaded subtitle file: {}", srt.display());
-        }
+            Some(SubtitleFile::parse(&s))
+        } else if let Ok(s) = std::fs::read_to_string(&ass) {
+            tracing::info!("Loaded subtitle file: {}", ass.display());
+            Some(SubtitleFile::parse_ass(&s))
+        } else {
+            None
+        };
     }
 
     /// While the left/right arrow key is held, keep seeking after a short
@@ -596,6 +663,16 @@ impl ApplicationHandler for App {
                         ui.mute_clicked = true;
                     }
                 }
+                KeyCode::KeyN if pressed => {
+                    let on = !self.ctl.night_mode();
+                    let _ = self.ctl.apply(Command::SetNightMode(on));
+                    if let Some(ref mut ui) = self.ui {
+                        ui.night_mode = on;
+                    }
+                }
+                KeyCode::KeyL if pressed => {
+                    self.cycle_playlist_mode();
+                }
                 KeyCode::ArrowLeft => {
                     self.arrow_left_held = pressed;
                     if pressed {
@@ -680,8 +757,51 @@ impl ApplicationHandler for App {
         // ── Auto-advance playlist at end of file ───────────────
         if matches!(self.ctl.state(), PlaybackState::Ended) && !self.end_handled {
             self.end_handled = true;
-            if self.playlist_index + 1 < self.playlist.len() {
-                self.play_next();
+            if self.playlist.is_empty() {
+                // nothing to do
+            } else {
+                match self.playlist_mode {
+                    PlaylistMode::Normal => {
+                        if self.playlist_index + 1 < self.playlist.len() {
+                            self.play_next();
+                        }
+                    }
+                    PlaylistMode::RepeatAll => {
+                        if self.playlist_index + 1 < self.playlist.len() {
+                            self.play_next();
+                        } else {
+                            self.playlist_index = 0;
+                            let first = self.playlist[0].clone();
+                            self.end_handled = true;
+                            self.open_file(&first);
+                        }
+                    }
+                    PlaylistMode::RepeatOne => {
+                        let cur = self.playlist[self.playlist_index].clone();
+                        self.end_handled = true;
+                        self.open_file(&cur);
+                    }
+                    PlaylistMode::Shuffle => {
+                        if self.playlist.len() == 1 {
+                            let cur = self.playlist[0].clone();
+                            self.end_handled = true;
+                            self.open_file(&cur);
+                        } else {
+                            let mut idx = self.playlist_index;
+                            while idx == self.playlist_index {
+                                let nanos = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.subsec_nanos() as usize)
+                                    .unwrap_or(0);
+                                idx = nanos % self.playlist.len();
+                            }
+                            self.playlist_index = idx;
+                            let next = self.playlist[idx].clone();
+                            self.end_handled = true;
+                            self.open_file(&next);
+                        }
+                    }
+                }
             }
         }
 
@@ -788,6 +908,12 @@ impl ApplicationHandler for App {
                 .as_ref()
                 .and_then(|subs| subs.for_time(self.ctl.position()))
                 .map(|s| s.to_string());
+            ui.audio_tracks = self.ctl.audio_tracks().to_vec();
+            ui.video_tracks = self.ctl.video_tracks().to_vec();
+            ui.audio_track = self.ctl.audio_track();
+            ui.video_track = self.ctl.video_track();
+            ui.night_mode = self.ctl.night_mode();
+            ui.playlist_mode_label = self.playlist_mode.label().to_string();
 
             // Buffering: only right after open/seek (startup grace) while
             // the frame queue is still empty.  During steady playback the
@@ -840,6 +966,7 @@ impl ApplicationHandler for App {
 
         // ── Gather UI actions ────────────────────────────────────
         let mut open_action = false;
+        let mut open_folder_action = false;
         let mut seek_action: Option<f64> = None;
         let mut pause_action = false;
         let mut speed_action: Option<f64> = None;
@@ -848,6 +975,9 @@ impl ApplicationHandler for App {
         let mut resume_action = false;
         let mut prev_action = false;
         let mut next_action = false;
+        let mut night_mode_action: Option<bool> = None;
+        let mut audio_track_action: Option<usize> = None;
+        let mut video_track_action: Option<usize> = None;
         let mut thumb_request: Option<f64> = None;
 
         let renderer = &mut self.renderer;
@@ -874,6 +1004,8 @@ impl ApplicationHandler for App {
 
             open_action = ui.open_file_clicked;
             ui.open_file_clicked = false;
+            open_folder_action = ui.open_folder_clicked;
+            ui.open_folder_clicked = false;
             fullscreen_action = ui.fullscreen_clicked;
             ui.fullscreen_clicked = false;
             resume_action = ui.resume_clicked;
@@ -888,6 +1020,22 @@ impl ApplicationHandler for App {
                 volume_action = Some(ui.volume);
             }
             thumb_request = ui.thumbnail_request.take();
+            if ui.night_mode_changed {
+                ui.night_mode_changed = false;
+                night_mode_action = Some(ui.night_mode);
+            }
+            if ui.audio_track_changed {
+                ui.audio_track_changed = false;
+                if let Some(t) = ui.audio_track {
+                    audio_track_action = Some(t);
+                }
+            }
+            if ui.video_track_changed {
+                ui.video_track_changed = false;
+                if let Some(t) = ui.video_track {
+                    video_track_action = Some(t);
+                }
+            }
             prev_action = ui.prev_clicked;
             ui.prev_clicked = false;
             next_action = ui.next_clicked;
@@ -967,6 +1115,9 @@ impl ApplicationHandler for App {
                 .collect::<Vec<_>>();
             self.open_files(files);
         }
+        if open_folder_action && let Some(folder) = rfd::FileDialog::new().pick_folder() {
+            self.open_folder(&folder.to_string_lossy());
+        }
         if fullscreen_action {
             self.toggle_fullscreen();
         }
@@ -996,6 +1147,15 @@ impl ApplicationHandler for App {
         }
         if let Some(vol) = volume_action {
             let _ = self.ctl.apply(Command::SetVolume(vol));
+        }
+        if let Some(on) = night_mode_action {
+            let _ = self.ctl.apply(Command::SetNightMode(on));
+        }
+        if let Some(t) = audio_track_action {
+            let _ = self.ctl.apply(Command::SetAudioTrack(t));
+        }
+        if let Some(t) = video_track_action {
+            let _ = self.ctl.apply(Command::SetVideoTrack(t));
         }
         if let Some(pos) = thumb_request
             && let Some(path) = self.ctl.file_path()

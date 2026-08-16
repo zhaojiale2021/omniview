@@ -16,6 +16,37 @@ struct Cue {
 }
 
 impl SubtitleFile {
+    pub fn parse_ass(ass: &str) -> Self {
+        let mut cues = Vec::new();
+        for line in ass.lines() {
+            let line = line.trim();
+            if !line.starts_with("Dialogue:") {
+                continue;
+            }
+            // Dialogue: layer,start,end,style,name,marginL,marginR,marginV,effect,text
+            let fields = line.splitn(10, ',').collect::<Vec<_>>();
+            if fields.len() < 10 {
+                continue;
+            }
+            let Some(start) = parse_time_ass(fields[1].trim()) else {
+                continue;
+            };
+            let Some(end) = parse_time_ass(fields[2].trim()) else {
+                continue;
+            };
+            let text = strip_ass_tags(fields[9].trim());
+            if !text.is_empty() {
+                cues.push(Cue { start, end, text });
+            }
+        }
+        cues.sort_by(|a, b| {
+            a.start
+                .partial_cmp(&b.start)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Self { cues }
+    }
+
     pub fn parse(srt: &str) -> Self {
         let mut cues = Vec::new();
         for block in srt.split("\n\n") {
@@ -47,6 +78,37 @@ impl SubtitleFile {
             .find(|c| pos_secs >= c.start && pos_secs <= c.end)
             .map(|c| c.text.as_str())
     }
+}
+
+/// Parse an ASS timestamp `H:MM:SS.cc`.
+fn parse_time_ass(s: &str) -> Option<f64> {
+    let mut parts = s.split(':');
+    let h: f64 = parts.next()?.parse().ok()?;
+    let m: f64 = parts.next()?.parse().ok()?;
+    let secs: f64 = parts.next()?.parse().ok()?;
+    Some(h * 3600.0 + m * 60.0 + secs)
+}
+
+/// Remove `{\...}` override blocks and convert `\N` to a newline.
+fn strip_ass_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            while let Some(&n) = chars.peek() {
+                chars.next();
+                if n == '}' {
+                    break;
+                }
+            }
+        } else if c == '\\' && chars.peek() == Some(&'N') {
+            chars.next();
+            out.push('\n');
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn parse_time_range(s: &str) -> Option<(f64, f64)> {

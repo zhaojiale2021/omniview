@@ -124,6 +124,7 @@ impl VideoDecoder {
         path: &str,
         pkt_rx: mpsc::Receiver<ffmpeg::codec::packet::Packet>,
         start_pos: f64,
+        video_track: Option<usize>,
     ) -> (Self, mpsc::Sender<DecoderCmd>) {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let paused = Arc::new(AtomicBool::new(false));
@@ -137,7 +138,7 @@ impl VideoDecoder {
         let q = queue.clone();
 
         thread::spawn(move || {
-            decode_packets_loop(&p, start_pos, pkt_rx, q, cmd_rx, st, pa);
+            decode_packets_loop(&p, start_pos, pkt_rx, q, cmd_rx, st, pa, video_track);
         });
 
         (Self { queue }, ct)
@@ -161,6 +162,7 @@ impl VideoDecoder {
 
 // ── Decode-from-packet-channel loop (driven by Demux) ─────────────
 
+#[allow(clippy::too_many_arguments)]
 fn decode_packets_loop(
     path: &str,
     start_pos: f64,
@@ -169,6 +171,7 @@ fn decode_packets_loop(
     command_rx: mpsc::Receiver<DecoderCmd>,
     stopped: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    video_track: Option<usize>,
 ) {
     if let Err(e) = ffmpeg::init() {
         tracing::error!("ffmpeg init: {e}");
@@ -185,12 +188,13 @@ fn decode_packets_loop(
         }
     };
 
-    let stream = match input.streams().best(media::Type::Video) {
-        Some(s) => s,
-        None => {
-            tracing::error!("No video stream");
-            return;
-        }
+    let stream = match video_track {
+        Some(idx) => input.streams().find(|s| s.index() == idx),
+        None => input.streams().best(media::Type::Video),
+    };
+    let Some(stream) = stream else {
+        tracing::error!("No video stream");
+        return;
     };
     let time_base = stream.time_base();
 
