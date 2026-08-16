@@ -41,6 +41,32 @@ fn main() {
         }
     }
 
+    // Panics should always leave a trace next to the executable even on
+    // Windows where a console window is not available.  The same file is
+    // used by the tracing subscriber below.
+    let panic_log = log_path.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_string());
+        let mut line = format!("PANIC: {msg}");
+        if let Some(loc) = info.location() {
+            line.push_str(&format!(" ({}:{})", loc.file(), loc.line()));
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&panic_log)
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "{line}");
+        }
+        eprintln!("{line}");
+    }));
+
     // Optional: open a file from command line
     let initial_file = std::env::args().nth(1);
 

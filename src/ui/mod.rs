@@ -156,6 +156,11 @@ pub struct PlayerUI {
     /// True while playing with an empty frame queue (buffering after
     /// open/seek, or a transient stall).  Shown as a hint over the video.
     pub buffering: bool,
+    /// Current subtitle text to draw over the video.
+    pub subtitle_text: Option<String>,
+    /// Set when the user clicks the previous/next playlist buttons.
+    pub prev_clicked: bool,
+    pub next_clicked: bool,
     file_name: String,
     /// Full path of the current media file, used for thumbnail requests.
     file_path: String,
@@ -204,6 +209,9 @@ impl PlayerUI {
             resume_available: false,
             resume_position: 0.0,
             resume_clicked: false,
+            subtitle_text: None,
+            prev_clicked: false,
+            next_clicked: false,
             audited: false,
             file_name: String::new(),
             file_path: String::new(),
@@ -349,7 +357,9 @@ impl PlayerUI {
                         egui::ComboBox::from_id_salt("speed")
                             .selected_text(speed_label)
                             .show_ui(ui, |ui| {
-                                for s in [0.5f64, 1.0, 1.5, 2.0] {
+                                for s in
+                                    [0.25f64, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0]
+                                {
                                     let label = if (s - 1.0).abs() < 0.01 {
                                         "1×".to_string()
                                     } else {
@@ -561,6 +571,10 @@ impl PlayerUI {
                 // ── Transport row ────────────────────────────────
                 ui.horizontal(|ui| {
                     // Left transport cluster
+                    let prev = Self::icon_button(ui, "|<", 12.0, "Previous in playlist ([)");
+                    if prev.clicked() {
+                        self.prev_clicked = true;
+                    }
                     let pp_icon = if self.playing { "⏸" } else { "▶" };
                     let pp = Self::icon_button(
                         ui,
@@ -574,6 +588,10 @@ impl PlayerUI {
                     );
                     if pp.clicked() {
                         self.playing = !self.playing;
+                    }
+                    let next = Self::icon_button(ui, ">|", 12.0, "Next in playlist (])");
+                    if next.clicked() {
+                        self.next_clicked = true;
                     }
 
                     // Resume from the saved position — shown only when a
@@ -662,6 +680,30 @@ impl PlayerUI {
                     });
                 });
             });
+
+        // ── Subtitle overlay ───────────────────────────────────
+        // Plain text above the bottom controls (external .srt).
+        if let Some(text) = &self.subtitle_text
+            && !text.is_empty()
+        {
+            egui::Area::new(egui::Id::new("subtitle_overlay"))
+                .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -96.0))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style())
+                        .fill(egui::Color32::from_black_alpha(110))
+                        .rounding(egui::Rounding::same(4.0))
+                        .inner_margin(egui::Margin::symmetric(14.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(text.clone())
+                                    .size(22.0)
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            );
+                        });
+                });
+        }
 
         // ── Buffering hint: centered over the video ────────────
         // Drawn on a dark rounded panel so it stays readable over any

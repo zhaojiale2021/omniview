@@ -2212,6 +2212,7 @@ dependencies = [
  "image",
  "pollster",
  "rfd",
+ "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",

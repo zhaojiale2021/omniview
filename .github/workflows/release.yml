@@ -45,6 +45,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
+          generate_release_notes: true
           files: omniview-linux-x86_64.tar.gz
 
   windows:
@@ -88,4 +89,5 @@ jobs:
       - uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
+          generate_release_notes: true
           files: omniview-windows-x86_64.zip

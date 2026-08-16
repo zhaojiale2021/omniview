@@ -52,3 +52,22 @@ jobs:
 
       - name: cargo fmt --check
         run: cargo fmt --all --check
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Download BtbN FFmpeg
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force third_party/btbn | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip" -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath third_party/btbn
+
+      - name: cargo build (native Windows)
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}/third_party/btbn/ffmpeg-n8.1-latest-win64-gpl-shared-8.1
+        run: cargo build --all-targets

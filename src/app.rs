@@ -11,7 +11,10 @@ use winit::{
     window::{Window, WindowId},
 };
 
+use serde::{Deserialize, Serialize};
+
 use crate::media::playback::PlaybackController;
+use crate::media::subtitle::SubtitleFile;
 use crate::media::thumb::{THUMB_MAX_H, THUMB_MAX_W, ThumbnailService};
 use crate::media::types::{Command, PlaybackState, VideoFrame};
 use crate::renderer::Renderer;
@@ -25,6 +28,27 @@ const SEEK_STEP: f64 = 5.0;
 const VOLUME_STEP: f32 = 0.1;
 /// How often to persist the resume-position state.
 const STATE_SAVE_INTERVAL: Duration = Duration::from_secs(5);
+/// How long an arrow key must be held before continuous seek repeats.
+const SEEK_REPEAT_INTERVAL: Duration = Duration::from_millis(250);
+/// Window/saved-state version key.
+const STATE_MAX_RESUME: usize = 30;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WindowState {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PlayerState {
+    resume: HashMap<String, f64>,
+    volume: f32,
+    speed: f64,
+    is_360: bool,
+    window: Option<WindowState>,
+}
 
 pub struct App {
     window: Option<Arc<Window>>,
@@ -52,10 +76,24 @@ pub struct App {
     /// Whether the OS cursor is currently visible.
     cursor_visible: bool,
 
-    // ── Resume position (remembered across sessions) ────────────
-    state: HashMap<String, f64>,
+    // ── Resume position + player settings (remembered across sessions) ──
+    state: PlayerState,
     state_path: PathBuf,
     last_state_save: Instant,
+
+    // ── Playlist ────────────────────────────────────────────────
+    playlist: Vec<String>,
+    playlist_index: usize,
+    /// Guards the automatic "play next" transition so Ended is handled once.
+    end_handled: bool,
+
+    // ── Held-arrow continuous seek ─────────────────────────────
+    arrow_left_held: bool,
+    arrow_right_held: bool,
+    last_seek_repeat: Option<Instant>,
+
+    // ── Subtitle overlay ───────────────────────────────────────
+    subtitles: Option<SubtitleFile>,
 
     // ── Stutter diagnostics ─────────────────────────────────────
     /// Last `about_to_wait` time; a large gap while playing means the main
@@ -92,9 +130,16 @@ impl App {
             last_fullscreen_retry: None,
             pending_file: initial_file,
             cursor_visible: true,
-            state: HashMap::new(),
+            state: PlayerState::default(),
             state_path: PathBuf::from("player_state.json"),
             last_state_save: Instant::now(),
+            playlist: Vec::new(),
+            playlist_index: 0,
+            end_handled: true,
+            arrow_left_held: false,
+            arrow_right_held: false,
+            last_seek_repeat: None,
+            subtitles: None,
             last_render: None,
             last_diag_log: Instant::now(),
             last_underruns: 0,
@@ -109,6 +154,7 @@ impl App {
             tracing::error!("Open failed: {e}");
             return;
         }
+        self.add_to_playlist(path);
         // Auto-play to preserve the old UX (opening a file started playback).
         // Playback always starts at 0; the saved position is available via
         // the resume button in the transport bar.
@@ -117,6 +163,83 @@ impl App {
         if let Some(ui) = &mut self.ui {
             ui.clear_thumbnails();
         }
+        self.end_handled = false;
+        self.load_subtitle_for(path);
+    }
+
+    fn open_files(&mut self, paths: Vec<String>) {
+        if paths.is_empty() {
+            return;
+        }
+        self.playlist = paths;
+        self.playlist_index = 0;
+        self.end_handled = true;
+        self.open_file(&self.playlist[0].clone());
+    }
+
+    fn add_to_playlist(&mut self, path: &str) {
+        if self.playlist.is_empty() {
+            self.playlist = vec![path.to_string()];
+            self.playlist_index = 0;
+        } else if self.playlist.iter().position(|p| p == path).is_none() {
+            self.playlist.push(path.to_string());
+            self.playlist_index = self.playlist.len() - 1;
+        }
+    }
+
+    fn play_next(&mut self) {
+        if self.playlist.is_empty() || self.playlist_index + 1 >= self.playlist.len() {
+            return;
+        }
+        self.playlist_index += 1;
+        let next = self.playlist[self.playlist_index].clone();
+        self.end_handled = true;
+        self.open_file(&next);
+    }
+
+    fn play_prev(&mut self) {
+        if self.playlist.is_empty() || self.playlist_index == 0 {
+            return;
+        }
+        self.playlist_index -= 1;
+        let prev = self.playlist[self.playlist_index].clone();
+        self.end_handled = true;
+        self.open_file(&prev);
+    }
+
+    /// Load an external `.srt` subtitle file with the same stem as the
+    /// video (e.g. `movie.mp4` -> `movie.srt`).  Missing file is not an
+    /// error: the player simply runs without subtitles.
+    fn load_subtitle_for(&mut self, video_path: &str) {
+        let srt = PathBuf::from(video_path).with_extension("srt");
+        self.subtitles = std::fs::read_to_string(&srt)
+            .ok()
+            .map(|s| SubtitleFile::parse(&s));
+        if self.subtitles.is_some() {
+            tracing::info!("Loaded subtitle file: {}", srt.display());
+        }
+    }
+
+    /// While the left/right arrow key is held, keep seeking after a short
+    /// repeat interval instead of only on the initial key press.
+    fn maybe_repeat_seek(&mut self) {
+        if !self.arrow_left_held && !self.arrow_right_held {
+            self.last_seek_repeat = None;
+            return;
+        }
+        if let Some(t) = self.last_seek_repeat
+            && t.elapsed() < SEEK_REPEAT_INTERVAL
+        {
+            return;
+        }
+        self.last_seek_repeat = Some(Instant::now());
+        let dur = self.ctl.duration();
+        let pos = if self.arrow_left_held {
+            (self.ctl.position() - SEEK_STEP).clamp(0.0, dur)
+        } else {
+            (self.ctl.position() + SEEK_STEP).clamp(0.0, dur)
+        };
+        let _ = self.ctl.apply(Command::Seek(pos));
     }
 
     fn toggle_fullscreen(&mut self) {
@@ -217,66 +340,77 @@ impl App {
     }
 
     fn load_state(&mut self) {
-        if let Ok(s) = std::fs::read_to_string(&self.state_path)
-            && let Ok(map) = serde_json::from_str::<HashMap<String, f64>>(&s)
-        {
-            self.state = map;
-            tracing::info!("Loaded {} resume positions", self.state.len());
+        let Ok(s) = std::fs::read_to_string(&self.state_path) else {
+            return;
+        };
+        if let Ok(state) = serde_json::from_str::<PlayerState>(&s) {
+            self.state = state;
+            tracing::info!(
+                "Loaded player state ({} resume positions)",
+                self.state.resume.len()
+            );
+        } else if let Ok(map) = serde_json::from_str::<HashMap<String, f64>>(&s) {
+            // Backwards compatibility: the previous format was a plain map
+            // of path -> position.
+            self.state = PlayerState {
+                resume: map,
+                ..Default::default()
+            };
+            tracing::info!(
+                "Loaded legacy player state ({} resume positions)",
+                self.state.resume.len()
+            );
         }
     }
 
-    /// Persist the current playback position so the next session can
-    /// resume.  Skips positions near the start/end.
+    /// Persist playback position, volume, speed, 360 mode and window
+    /// bounds so the next session can restore them.
     fn save_state(&mut self) {
-        let Some(path) = self.ctl.file_path().map(|s| s.to_string()) else {
-            return;
-        };
-        let pos = self.ctl.position();
-        let dur = self.ctl.duration();
-        if pos > 5.0 && dur > 10.0 && pos < dur - 5.0 {
-            self.state.insert(path.clone(), pos);
-            if self.state.len() > 30 {
-                let cur = self.state.remove(&path);
-                self.state.clear();
-                if let Some(v) = cur {
-                    self.state.insert(path, v);
+        if let Some(path) = self.ctl.file_path().map(|s| s.to_string()) {
+            let pos = self.ctl.position();
+            let dur = self.ctl.duration();
+            if pos > 5.0 && dur > 10.0 && pos < dur - 5.0 {
+                self.state.resume.insert(path.clone(), pos);
+                if self.state.resume.len() > STATE_MAX_RESUME {
+                    let cur = self.state.resume.remove(&path);
+                    self.state.resume.clear();
+                    if let Some(v) = cur {
+                        self.state.resume.insert(path, v);
+                    }
                 }
             }
-            if let Ok(json) = serde_json::to_string(&self.state) {
-                // Write on a background thread: a synchronous file write on
-                // the render thread every STATE_SAVE_INTERVAL causes a
-                // visible periodic hitch ("plays a few seconds, stutters").
-                let path = self.state_path.clone();
-                std::thread::spawn(move || {
-                    let _ = std::fs::write(&path, json);
-                });
-            }
+        }
+        self.state.volume = self.ctl.volume();
+        self.state.speed = self.ctl.speed();
+        self.state.is_360 = self.renderer.as_ref().map(|r| r.is_360).unwrap_or(false);
+        if let Some(w) = &self.window
+            && let Ok(pos) = w.outer_position()
+        {
+            let size = w.inner_size();
+            self.state.window = Some(WindowState {
+                x: pos.x,
+                y: pos.y,
+                width: size.width.max(1),
+                height: size.height.max(1),
+            });
+        }
+
+        if let Ok(json) = serde_json::to_string(&self.state) {
+            // Write on a background thread: a synchronous file write on
+            // the render thread every STATE_SAVE_INTERVAL causes a
+            // visible periodic hitch ("plays a few seconds, stutters").
+            let path = self.state_path.clone();
+            std::thread::spawn(move || {
+                let _ = std::fs::write(&path, json);
+            });
         }
     }
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        // Window title from the command-line file.  Set at CREATION: a
-        // runtime set_title is flaky on WSLg/X11 (the property change
-        // occasionally kills the X connection and the event loop).
-        let title = self
-            .pending_file
-            .as_deref()
-            .and_then(|p| std::path::Path::new(p).file_name())
-            .map(|n| format!("{} — Omniview", n.to_string_lossy()))
-            .unwrap_or_else(|| "Omniview".to_string());
-        let attrs = Window::default_attributes()
-            .with_title(title)
-            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
-        let window = Arc::new(event_loop.create_window(attrs).unwrap());
-        let renderer = pollster::block_on(Renderer::new(window.clone()));
-        let ui = PlayerUI::new(&renderer.egui_ctx());
-        self.window = Some(window);
-        self.renderer = Some(renderer);
-        self.ui = Some(ui);
-
-        // Paths live next to the executable.
+        // Paths live next to the executable.  Load state BEFORE creating
+        // the window so saved size/position can be restored.
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
@@ -286,6 +420,51 @@ impl ApplicationHandler for App {
             .unwrap_or_else(|| PathBuf::from("player_state.json"));
         self.shot_dir = exe_dir.unwrap_or_else(|| PathBuf::from("."));
         self.load_state();
+
+        // Window title from the command-line file.  Set at CREATION: a
+        // runtime set_title is flaky on WSLg/X11 (the property change
+        // occasionally kills the X connection and the event loop).
+        let title = self
+            .pending_file
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).file_name())
+            .map(|n| format!("{} — Omniview", n.to_string_lossy()))
+            .unwrap_or_else(|| "Omniview".to_string());
+        let mut attrs = Window::default_attributes().with_title(title);
+        if let Some(ws) = &self.state.window {
+            attrs = attrs
+                .with_inner_size(winit::dpi::PhysicalSize::new(
+                    ws.width.max(1),
+                    ws.height.max(1),
+                ))
+                .with_position(winit::dpi::Position::Physical(PhysicalPosition::new(
+                    ws.x, ws.y,
+                )));
+        } else {
+            attrs = attrs.with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
+        }
+        let window = Arc::new(event_loop.create_window(attrs).unwrap());
+        let renderer = pollster::block_on(Renderer::new(window.clone()));
+        let ui = PlayerUI::new(&renderer.egui_ctx());
+        self.window = Some(window);
+        self.renderer = Some(renderer);
+        self.ui = Some(ui);
+
+        // Restore saved player settings.
+        let saved_volume = self.state.volume.clamp(0.0, 1.0);
+        let saved_speed = if self.state.speed > 0.0 {
+            self.state.speed
+        } else {
+            1.0
+        };
+        let _ = self.ctl.apply(Command::SetVolume(saved_volume));
+        let _ = self.ctl.apply(Command::SetSpeed(saved_speed));
+        if let Some(ref mut ui) = self.ui {
+            ui.volume = saved_volume;
+            ui.muted = saved_volume <= 0.001;
+            ui.speed = saved_speed;
+            ui.is_360 = self.state.is_360;
+        }
 
         // Open file from command line if provided
         if let Some(ref path) = self.pending_file.take() {
@@ -377,50 +556,67 @@ impl ApplicationHandler for App {
             event:
                 KeyEvent {
                     physical_key: PhysicalKey::Code(kc),
-                    state: ElementState::Pressed,
+                    state,
                     ..
                 },
             ..
         } = event
         {
+            let pressed = state == ElementState::Pressed;
             match kc {
-                KeyCode::KeyO => {
-                    if let Some(p) = rfd::FileDialog::new()
+                KeyCode::KeyO if pressed => {
+                    if let Some(paths) = rfd::FileDialog::new()
                         .add_filter("Video", &["mp4", "webm", "mkv", "avi", "mov", "m4v"])
-                        .pick_file()
+                        .pick_files()
                     {
-                        self.open_file(&p.to_string_lossy());
+                        let files = paths
+                            .iter()
+                            .filter_map(|p| p.to_str().map(|s| s.to_string()))
+                            .collect::<Vec<_>>();
+                        self.open_files(files);
                     }
                 }
-                KeyCode::Space => {
+                KeyCode::Space if pressed => {
                     let _ = self.ctl.apply(Command::Toggle);
                 }
-                KeyCode::KeyF => {
+                KeyCode::KeyF if pressed => {
                     self.toggle_fullscreen();
                 }
-                KeyCode::KeyR => {
+                KeyCode::KeyR if pressed => {
                     if let Some(r) = &mut self.renderer {
                         r.camera.reset();
                         r.update_camera_uniform();
                     }
                 }
-                KeyCode::KeyS => {
+                KeyCode::KeyS if pressed => {
                     self.screenshot();
                 }
-                KeyCode::KeyM => {
+                KeyCode::KeyM if pressed => {
                     if let Some(ref mut ui) = self.ui {
                         ui.mute_clicked = true;
                     }
                 }
                 KeyCode::ArrowLeft => {
-                    let pos = (self.ctl.position() - SEEK_STEP).clamp(0.0, self.ctl.duration());
-                    let _ = self.ctl.apply(Command::Seek(pos));
+                    self.arrow_left_held = pressed;
+                    if pressed {
+                        self.last_seek_repeat = Some(Instant::now());
+                        let pos = (self.ctl.position() - SEEK_STEP).clamp(0.0, self.ctl.duration());
+                        let _ = self.ctl.apply(Command::Seek(pos));
+                    } else {
+                        self.last_seek_repeat = None;
+                    }
                 }
                 KeyCode::ArrowRight => {
-                    let pos = (self.ctl.position() + SEEK_STEP).clamp(0.0, self.ctl.duration());
-                    let _ = self.ctl.apply(Command::Seek(pos));
+                    self.arrow_right_held = pressed;
+                    if pressed {
+                        self.last_seek_repeat = Some(Instant::now());
+                        let pos = (self.ctl.position() + SEEK_STEP).clamp(0.0, self.ctl.duration());
+                        let _ = self.ctl.apply(Command::Seek(pos));
+                    } else {
+                        self.last_seek_repeat = None;
+                    }
                 }
-                KeyCode::ArrowUp => {
+                KeyCode::ArrowUp if pressed => {
                     let v = (self.ctl.volume() + VOLUME_STEP).min(1.0);
                     let _ = self.ctl.apply(Command::SetVolume(v));
                     if let Some(ref mut ui) = self.ui {
@@ -430,7 +626,7 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
-                KeyCode::ArrowDown => {
+                KeyCode::ArrowDown if pressed => {
                     let v = (self.ctl.volume() - VOLUME_STEP).max(0.0);
                     let _ = self.ctl.apply(Command::SetVolume(v));
                     if let Some(ref mut ui) = self.ui {
@@ -440,7 +636,13 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
-                KeyCode::Escape => {
+                KeyCode::BracketLeft if pressed => {
+                    self.play_prev();
+                }
+                KeyCode::BracketRight if pressed => {
+                    self.play_next();
+                }
+                KeyCode::Escape if pressed => {
                     // Exit fullscreen first; a second Escape quits.
                     if self
                         .window
@@ -473,6 +675,15 @@ impl ApplicationHandler for App {
         // transitions whose `Resized` event may arrive late or not at all.
         self.sync_renderer_size();
         self.sync_fullscreen_state();
+        self.maybe_repeat_seek();
+
+        // ── Auto-advance playlist at end of file ───────────────
+        if matches!(self.ctl.state(), PlaybackState::Ended) && !self.end_handled {
+            self.end_handled = true;
+            if self.playlist_index + 1 < self.playlist.len() {
+                self.play_next();
+            }
+        }
 
         // ── Receive latest video frame ──────────────────────────
         // The upload happens inside render() (after surface acquire),
@@ -530,7 +741,7 @@ impl ApplicationHandler for App {
         let resume_pos = self
             .ctl
             .file_path()
-            .and_then(|p| self.state.get(p).copied());
+            .and_then(|p| self.state.resume.get(p).copied());
         // Treat Ended like paused for UI purposes: playback is over, the
         // transport shows stopped, and the control bars stay visible.
         let ended = matches!(self.ctl.state(), PlaybackState::Ended);
@@ -572,6 +783,11 @@ impl ApplicationHandler for App {
                     .unwrap_or_default(),
             );
             ui.set_file_path(self.ctl.file_path().unwrap_or("").to_string());
+            ui.subtitle_text = self
+                .subtitles
+                .as_ref()
+                .and_then(|subs| subs.for_time(self.ctl.position()))
+                .map(|s| s.to_string());
 
             // Buffering: only right after open/seek (startup grace) while
             // the frame queue is still empty.  During steady playback the
@@ -630,6 +846,8 @@ impl ApplicationHandler for App {
         let mut volume_action: Option<f32> = None;
         let mut fullscreen_action = false;
         let mut resume_action = false;
+        let mut prev_action = false;
+        let mut next_action = false;
         let mut thumb_request: Option<f64> = None;
 
         let renderer = &mut self.renderer;
@@ -670,6 +888,10 @@ impl ApplicationHandler for App {
                 volume_action = Some(ui.volume);
             }
             thumb_request = ui.thumbnail_request.take();
+            prev_action = ui.prev_clicked;
+            ui.prev_clicked = false;
+            next_action = ui.next_clicked;
+            ui.next_clicked = false;
             if ui.playing == paused {
                 pause_action = true;
             }
@@ -735,11 +957,15 @@ impl ApplicationHandler for App {
 
         // ── Apply actions ────────────────────────────────────────
         if open_action
-            && let Some(p) = rfd::FileDialog::new()
+            && let Some(paths) = rfd::FileDialog::new()
                 .add_filter("Video", &["mp4", "webm", "mkv", "avi", "mov", "m4v"])
-                .pick_file()
+                .pick_files()
         {
-            self.open_file(&p.to_string_lossy());
+            let files = paths
+                .iter()
+                .filter_map(|p| p.to_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>();
+            self.open_files(files);
         }
         if fullscreen_action {
             self.toggle_fullscreen();
@@ -748,10 +974,16 @@ impl ApplicationHandler for App {
             && let Some(pos) = self
                 .ctl
                 .file_path()
-                .and_then(|p| self.state.get(p).copied())
+                .and_then(|p| self.state.resume.get(p).copied())
         {
             let _ = self.ctl.apply(Command::Seek(pos));
             let _ = self.ctl.apply(Command::Play);
+        }
+        if prev_action {
+            self.play_prev();
+        }
+        if next_action {
+            self.play_next();
         }
         if let Some(pos) = seek_action {
             let _ = self.ctl.apply(Command::Seek(pos));
