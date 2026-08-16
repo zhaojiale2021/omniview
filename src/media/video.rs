@@ -11,6 +11,7 @@
 //! and packet routing.
 
 use std::collections::VecDeque;
+use std::ptr;
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -160,6 +161,75 @@ impl VideoDecoder {
     }
 }
 
+// ── Hardware-decode helpers (experimental) ───────────────────────
+
+/// Best-effort hardware device type for the current platform.  Returns
+/// `None` on unsupported platforms so the software path is used.
+fn hw_device_type() -> Option<ffmpeg::ffi::AVHWDeviceType> {
+    if cfg!(target_os = "windows") {
+        Some(ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA)
+    } else if cfg!(target_os = "linux") {
+        Some(ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI)
+    } else {
+        None
+    }
+}
+
+/// Find a decoder hardware pixel format that supports the
+/// `HW_DEVICE_CTX` setup method for the requested device type.
+unsafe fn find_hw_pix_fmt(
+    codec: *const ffmpeg::ffi::AVCodec,
+    device_type: ffmpeg::ffi::AVHWDeviceType,
+) -> Option<ffmpeg::ffi::AVPixelFormat> {
+    let mut i = 0;
+    loop {
+        let cfg = unsafe { ffmpeg::ffi::avcodec_get_hw_config(codec, i) };
+        if cfg.is_null() {
+            return None;
+        }
+        let cfg = unsafe { &*cfg };
+        if cfg.methods & (ffmpeg::ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32) != 0
+            && cfg.device_type == device_type
+        {
+            return Some(cfg.pix_fmt);
+        }
+        i += 1;
+    }
+}
+
+/// Create a hardware device context of the requested type.
+unsafe fn create_hw_device(
+    device_type: ffmpeg::ffi::AVHWDeviceType,
+) -> Option<*mut ffmpeg::ffi::AVBufferRef> {
+    let mut hw_device_ctx = ptr::null_mut();
+    let ret = unsafe {
+        ffmpeg::ffi::av_hwdevice_ctx_create(
+            &mut hw_device_ctx,
+            device_type,
+            ptr::null(),
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if ret < 0 || hw_device_ctx.is_null() {
+        tracing::debug!("av_hwdevice_ctx_create failed: {ret}");
+        None
+    } else {
+        Some(hw_device_ctx)
+    }
+}
+
+/// True when a decoded frame is stored in GPU memory and must be copied
+/// back to system memory before swscale can read it.
+fn is_hw_pixel(pixel: ffmpeg::format::Pixel) -> bool {
+    matches!(
+        pixel,
+        ffmpeg::format::Pixel::D3D11VA_VLD
+            | ffmpeg::format::Pixel::D3D11
+            | ffmpeg::format::Pixel::VAAPI
+    )
+}
+
 // ── Decode-from-packet-channel loop (driven by Demux) ─────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -197,19 +267,79 @@ fn decode_packets_loop(
         return;
     };
     let time_base = stream.time_base();
+    let params = stream.parameters();
 
-    let ctx = match ffmpeg::codec::context::Context::from_parameters(stream.parameters()) {
+    // Experimental hardware decode.  Enable with OMNIVIEW_HW=1.  The
+    // software path is always the fallback, and if any hardware step fails
+    // we log and continue with the normal software decoder.
+    let hw_enabled = std::env::var("OMNIVIEW_HW")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let mut hw_device_ctx: Option<*mut ffmpeg::ffi::AVBufferRef> = None;
+    let mut hw_pix_fmt: Option<ffmpeg::ffi::AVPixelFormat> = None;
+    if hw_enabled
+        && let Some(dev_type) = hw_device_type()
+        && let Some(codec) = ffmpeg::codec::decoder::find(params.id())
+    {
+        unsafe {
+            if let Some(pix_fmt) = find_hw_pix_fmt(codec.as_ptr(), dev_type)
+                && let Some(dev) = create_hw_device(dev_type)
+            {
+                hw_device_ctx = Some(dev);
+                hw_pix_fmt = Some(pix_fmt);
+                tracing::info!(
+                    "Video: hardware decode configured (device={:?}, pix_fmt={:?})",
+                    dev_type,
+                    pix_fmt
+                );
+            } else {
+                tracing::warn!("Video: hardware decode requested but not available for this codec");
+            }
+        }
+    }
+
+    let mut ctx = match ffmpeg::codec::context::Context::from_parameters(params.clone()) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Open decoder failed: {e}");
             return;
         }
     };
+    if let (Some(dev), Some(pix_fmt)) = (hw_device_ctx, hw_pix_fmt) {
+        unsafe {
+            (*ctx.as_mut_ptr()).hw_device_ctx = dev;
+            (*ctx.as_mut_ptr()).pix_fmt = pix_fmt;
+        }
+    }
+
     let mut decoder = match ctx.decoder().video() {
         Ok(d) => d,
         Err(e) => {
-            tracing::error!("Open video decoder failed: {e}");
-            return;
+            if hw_device_ctx.is_some() {
+                tracing::warn!("Video: hardware decoder open failed ({e}); retrying software");
+                if let Some(mut dev) = hw_device_ctx.take() {
+                    unsafe {
+                        ffmpeg::ffi::av_buffer_unref(&mut dev);
+                    }
+                }
+                let ctx2 = match ffmpeg::codec::context::Context::from_parameters(params.clone()) {
+                    Ok(c) => c,
+                    Err(e2) => {
+                        tracing::error!("Open software decoder failed: {e2}");
+                        return;
+                    }
+                };
+                match ctx2.decoder().video() {
+                    Ok(d) => d,
+                    Err(e2) => {
+                        tracing::error!("Open video decoder failed: {e2}");
+                        return;
+                    }
+                }
+            } else {
+                tracing::error!("Open video decoder failed: {e}");
+                return;
+            }
         }
     };
     let (width, height) = (decoder.width(), decoder.height());
@@ -218,29 +348,17 @@ fn decode_packets_loop(
     // the file descriptor is not held for the thread's lifetime.
     drop(input);
 
-    let mut scaler = match software::scaling::Context::get(
-        decoder.format(),
-        width,
-        height,
-        // NV12 keeps the CPU on the planar side (no RGB matrix); the GPU
-        // shader converts to RGB.  Half the upload bytes of RGBA.
-        format::Pixel::NV12,
-        width,
-        height,
-        software::scaling::Flags::BILINEAR,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("swscale init failed: {e}");
-            return;
-        }
-    };
+    // The scaler is created lazily: with hardware decoding the decoder
+    // reports a GPU pixel format, and the real software format is only
+    // known after the first frame is transferred back to system memory.
+    let mut scaler: Option<software::scaling::Context> = None;
 
     // NO av_seek_frame here — the demux already seeked BACKWARD.
     // Frames decoded before the target pts (from the earlier keyframe)
     // are discarded below.
 
     let mut nv12 = frame::Video::empty();
+    let mut hw_sw_frame = frame::Video::empty();
     let mut first_packet = true;
     let mut frames_sent = 0u64;
 
@@ -353,11 +471,6 @@ fn decode_packets_loop(
                 continue 'outer;
             }
 
-            if let Err(e) = scaler.run(&decoded, &mut nv12) {
-                tracing::debug!("scale: {e}");
-                continue;
-            }
-
             // Container pts first: best_effort_timestamp can drift
             // after a seek+stall on VFR streams (observed ~0.57s label
             // offset), while the packet pts is the ground truth.
@@ -369,6 +482,49 @@ fn decode_packets_loop(
 
             // Discard frames decoded before the seek target.
             if start_pos > 0.01 && pts_secs < start_pos {
+                continue;
+            }
+
+            // For hardware decoding the received frame is in GPU memory;
+            // copy it back to a software frame before scaling.
+            let src_frame: &frame::Video = if is_hw_pixel(decoded.format()) {
+                let ret = unsafe {
+                    ffmpeg::ffi::av_hwframe_transfer_data(
+                        hw_sw_frame.as_mut_ptr(),
+                        decoded.as_ptr(),
+                        0,
+                    )
+                };
+                if ret < 0 {
+                    tracing::debug!("hw frame transfer failed: {ret}");
+                    continue;
+                }
+                hw_sw_frame.set_pts(decoded.pts());
+                &hw_sw_frame
+            } else {
+                &decoded
+            };
+
+            if scaler.is_none() {
+                match software::scaling::Context::get(
+                    src_frame.format(),
+                    width,
+                    height,
+                    format::Pixel::NV12,
+                    width,
+                    height,
+                    software::scaling::Flags::BILINEAR,
+                ) {
+                    Ok(s) => scaler = Some(s),
+                    Err(e) => {
+                        tracing::warn!("swscale init failed: {e}");
+                        continue;
+                    }
+                }
+            }
+
+            if let Err(e) = scaler.as_mut().unwrap().run(src_frame, &mut nv12) {
+                tracing::debug!("scale: {e}");
                 continue;
             }
 
