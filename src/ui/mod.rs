@@ -457,7 +457,7 @@ impl PlayerUI {
                     ui.painter().circle_stroke(
                         handle_c,
                         handle_r + 2.0,
-                        egui::Stroke::new(1.5, egui::Color32::WHITE),
+                        egui::Stroke::new(1.5_f32, egui::Color32::WHITE),
                     );
                 }
 
