@@ -21,14 +21,16 @@ BIN="$FFBUILD/bin"
 # runners may have a different gcc version than a local WSL install, so do
 # not hardcode "13-posix".
 #
-# NOTE: do NOT add /usr/x86_64-w64-mingw32/include here.  Bindgen already
-# includes clang's builtin stddef.h, and adding the MinGW sysroot include
-# as well causes a `typedef redefinition` error for max_align_t on some
-# clang versions (observed on GitHub Actions with LLVM 18).
+# NOTE: use `-idirafter`, not `-I`, for the MinGW GCC header directory.
+# With plain `-I`, clang's builtin stddef.h/stdarg.h and GCC's copies are
+# both considered, which causes a `typedef redefinition` error for
+# max_align_t on LLVM 18 (GitHub Actions runners).  `-idirafter` keeps
+# clang's builtin headers first, and only falls back to this directory for
+# headers that are not built in (e.g. mm_malloc.h).
 MINGW_GCC_DIR="$(ls -d /usr/lib/gcc/x86_64-w64-mingw32/*posix 2>/dev/null | sort -V | tail -1 || true)"
 BINDGEN_INCLUDES=""
 if [ -n "$MINGW_GCC_DIR" ] && [ -d "$MINGW_GCC_DIR/include" ]; then
-    BINDGEN_INCLUDES="$BINDGEN_INCLUDES -I$MINGW_GCC_DIR/include"
+    BINDGEN_INCLUDES="$BINDGEN_INCLUDES -idirafter$MINGW_GCC_DIR/include"
 fi
 if [ -z "$BINDGEN_INCLUDES" ]; then
     echo "ERROR: could not detect MinGW GCC header directory" >&2
