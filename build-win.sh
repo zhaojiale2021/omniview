@@ -17,20 +17,21 @@ if [ -z "$FFBUILD" ]; then
 fi
 BIN="$FFBUILD/bin"
 
-# Auto-detect the MinGW header directories for bindgen.  GitHub Actions
+# Auto-detect the MinGW GCC header directory for bindgen.  GitHub Actions
 # runners may have a different gcc version than a local WSL install, so do
 # not hardcode "13-posix".
+#
+# NOTE: do NOT add /usr/x86_64-w64-mingw32/include here.  Bindgen already
+# includes clang's builtin stddef.h, and adding the MinGW sysroot include
+# as well causes a `typedef redefinition` error for max_align_t on some
+# clang versions (observed on GitHub Actions with LLVM 18).
 MINGW_GCC_DIR="$(ls -d /usr/lib/gcc/x86_64-w64-mingw32/*posix 2>/dev/null | sort -V | tail -1 || true)"
-MINGW_SYS_INCLUDE="/usr/x86_64-w64-mingw32/include"
 BINDGEN_INCLUDES=""
 if [ -n "$MINGW_GCC_DIR" ] && [ -d "$MINGW_GCC_DIR/include" ]; then
     BINDGEN_INCLUDES="$BINDGEN_INCLUDES -I$MINGW_GCC_DIR/include"
 fi
-if [ -d "$MINGW_SYS_INCLUDE" ]; then
-    BINDGEN_INCLUDES="$BINDGEN_INCLUDES -I$MINGW_SYS_INCLUDE"
-fi
 if [ -z "$BINDGEN_INCLUDES" ]; then
-    echo "ERROR: could not detect MinGW header directories" >&2
+    echo "ERROR: could not detect MinGW GCC header directory" >&2
     exit 1
 fi
 
