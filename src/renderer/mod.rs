@@ -647,7 +647,7 @@ impl Renderer {
         // upload to the Rgba8Unorm texture.
         self.uv_rgba.clear();
         self.uv_rgba.reserve(frame.uv.len() * 2);
-        for pair in frame.uv.chunks_exact(2) {
+        for pair in frame.uv.as_chunks::<2>().0 {
             self.uv_rgba.extend_from_slice(&[pair[0], pair[1], 0, 255]);
         }
         self.queue.write_texture(
@@ -892,7 +892,7 @@ impl Renderer {
                 let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
                 // The surface is BGRA (Bgra8Unorm*), so reorder to RGB
                 // for the P6 writer.
-                for px in data.chunks_exact(4) {
+                for px in data.as_chunks::<4>().0 {
                     ppm.extend_from_slice(&[px[2], px[1], px[0]]);
                 }
                 let p = format!("{path}_{}", self.capture_counter);
