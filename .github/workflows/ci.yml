@@ -26,9 +26,11 @@ jobs:
           components: clippy, rustfmt
 
       # 本地开发走 .cargo/config.toml 里的 rsproxy 镜像(国内快);
-      # GitHub runner 在境外,镜像偶尔会卡死,CI 里换回官方源。
+      # GitHub runner 在境外,镜像偶尔会卡死,CI 里直接用默认的 crates.io。
+      # 注意不能只把 URL 换成 index.crates.io —— 那等于把 crates-io 重定义一遍,
+      # cargo 会报 "Sources are not allowed to be defined multiple times"。
       - name: Use the official crates.io registry
-        run: sed -i 's#sparse+https://rsproxy.cn/index/#sparse+https://index.crates.io/#' .cargo/config.toml
+        run: rm .cargo/config.toml
 
       - name: Install system dependencies
         run: |
@@ -73,7 +75,7 @@ jobs:
 
       - name: Use the official crates.io registry
         shell: bash
-        run: sed -i 's#sparse+https://rsproxy.cn/index/#sparse+https://index.crates.io/#' .cargo/config.toml
+        run: rm .cargo/config.toml
 
       - name: Download BtbN FFmpeg
         shell: pwsh
